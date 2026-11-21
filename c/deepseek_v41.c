@@ -6607,6 +6607,28 @@ static void v41_e4_preload_model(Model *m) {
             }
         }
     }
+    /* the scratch (rows x widest input, rows x widest output) and one launch of each extreme now, while the card has
+     * room: a later call never allocates; a failure here turns the trunk off (all the CPU's) before the tier starts */
+    V41E4 *wi = NULL, *wo = NULL;
+    for (size_t k = 0; k < g_e4_cap; k++) {
+        V41E4 *e = &g_e4_map[k];
+        if (!e->h) continue;
+        if (!wi || e->I > wi->I) wi = e;
+        if (!wo || e->O > wo->O) wo = e;
+    }
+    if (wi) {
+        const int S = g_e4_rows;
+        float *x = calloc((size_t)S * wi->I, sizeof *x), *y = malloc((size_t)S * wo->O * sizeof *y);
+        const int ok = x && y && coli_cuda_e4m3t_mv(wi->h, y, wi->O, x, wi->I, S) && coli_cuda_e4m3t_mv(wo->h, y, wo->O, x, wo->I, S);
+        free(x); free(y);
+        if (!ok) {
+            for (size_t k = 0; k < g_e4_cap; k++)
+                if (g_e4_map[k].h) { coli_cuda_e4m3t_free(g_e4_map[k].h); g_e4_map[k].h = NULL; g_e4_map[k].no = 1; }
+            fprintf(stderr, "[v41] V41_TRUNK_GPU: the warm-up launch failed: the trunk stays on the CPU\n");
+            g_e4_on = 0; g_e4_used = 0; g_e4_mats = 0;
+            return;
+        }
+    }
     fprintf(stderr, "[v41] V41_TRUNK_GPU: %llu trunk matrices on the device, %.2f GiB, before the tier\n", g_e4_mats, g_e4_used / 1073741824.0);
 }
 #endif
