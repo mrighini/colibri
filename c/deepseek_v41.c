@@ -844,7 +844,7 @@ static void mv8_rows_cpu(float *y, int ystride, const W8 *w, const float *x, int
  * computed on the CPU too and compared byte for byte (a count on stderr at exit; any difference printed). */
 typedef struct { const void *q; int O, I, no, bf; void *h; } V41E4;   /* bf: a BF16 matrix (coli_cuda_bf16t) */
 static V41E4 *g_e4_map; static size_t g_e4_cap;
-static int g_e4_on, g_e4_rows = 32, g_e4_dev, g_b16_on;
+static int g_e4_on, g_e4_rows = 32, g_e4_dev, g_b16_on, g_e4_fp8;   /* g_e4_fp8: the FP8 trunk too (V41_TRUNK_GPU) */
 static pthread_t g_e4_thread;
 static size_t g_e4_used, g_e4_budget = (size_t)-1;
 static unsigned long long g_e4_calls, g_e4_mats, g_e4_chk_left, g_e4_chk_calls, g_e4_chk_bad;
@@ -859,8 +859,9 @@ static void v41_e4_report(void) {
     fprintf(stderr, "\n");
 }
 static void v41_e4_start(int dev) {
-    const char *e = getenv("V41_TRUNK_GPU");
-    if (!(e && atoi(e) > 0)) return;
+    const char *e = getenv("V41_TRUNK_GPU"), *bf0 = getenv("V41_BF16_GPU");
+    g_e4_fp8 = e && atoi(e) > 0;
+    if (!g_e4_fp8 && !(bf0 && atoi(bf0) > 0)) return;
     g_e4_cap = 4096; g_e4_map = calloc(g_e4_cap, sizeof *g_e4_map);
     if (!g_e4_map) return;
     const char *r = getenv("V41_TRUNK_GPU_ROWS"); if (r && atoi(r) > 0) g_e4_rows = atoi(r);
@@ -869,8 +870,8 @@ static void v41_e4_start(int dev) {
     const char *bf = getenv("V41_BF16_GPU"); g_b16_on = bf && atoi(bf) > 0;
     g_e4_dev = dev; g_e4_thread = pthread_self(); g_e4_on = 1;
     atexit(v41_e4_report);
-    fprintf(stderr, "[v41] V41_TRUNK_GPU: the FP8 trunk's matrices to device %d as they are first used (rows <= %d%s)\n",
-            dev, g_e4_rows, g_e4_chk_left ? ", checked against the CPU" : "");
+    fprintf(stderr, "[v41] trunk on device %d:%s%s (rows <= %d%s)\n", dev, g_e4_fp8 ? " FP8 (V41_TRUNK_GPU)" : "",
+            g_b16_on ? " BF16 (V41_BF16_GPU)" : "", g_e4_rows, g_e4_chk_left ? ", checked against the CPU" : "");
 }
 static V41E4 *v41_e4_find(const void *q, int O, int I, int bf) {
     size_t i = ((uintptr_t)q >> 4) * 11400714819323198485ull % g_e4_cap;
@@ -883,7 +884,7 @@ static V41E4 *v41_e4_find(const void *q, int O, int I, int bf) {
 }
 static V41E4 *v41_e4_entry(const W8 *w) { return v41_e4_find(w->q, w->O, w->I, 0); }
 static int v41_e4_mv(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
-    if (!g_e4_on || rows > g_e4_rows || (w->I & 31) || omp_in_parallel() || !pthread_equal(pthread_self(), g_e4_thread)) return 0;
+    if (!g_e4_on || !g_e4_fp8 || rows > g_e4_rows || (w->I & 31) || omp_in_parallel() || !pthread_equal(pthread_self(), g_e4_thread)) return 0;
     V41E4 *e = v41_e4_entry(w);
     if (!e || e->no) return 0;
     if (!e->h) {
@@ -912,7 +913,7 @@ static int v41_e4_mv(float *y, int ystride, const W8 *w, const float *x, int xst
 #define V41_E4(...) if (v41_e4_mv(__VA_ARGS__)) return;
 /* at start, before the tier fills the card: a matrix up now, or refused for good (counted) */
 static size_t v41_e4_preload(const W8 *w) {
-    if (!g_e4_on || !w->q || w->gx || (w->I & 31) || w->O < 1) return 0;
+    if (!g_e4_on || !g_e4_fp8 || !w->q || w->gx || (w->I & 31) || w->O < 1) return 0;
     V41E4 *e = v41_e4_entry(w);
     if (!e || e->no || e->h) return 0;
     const size_t b = (size_t)w->O * w->I + (size_t)((w->O + 31) / 32) * (w->I / 32);
