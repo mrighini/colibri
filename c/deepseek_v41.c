@@ -905,6 +905,16 @@ static int v41_e4_mv(float *y, int ystride, const W8 *w, const float *x, int xst
     return 1;
 }
 #define V41_E4(...) if (v41_e4_mv(__VA_ARGS__)) return;
+/* at start, before the tier fills the card: a matrix up now, or refused for good (counted) */
+static size_t v41_e4_preload(const W8 *w) {
+    if (!g_e4_on || !w->q || w->gx || (w->I & 31) || w->O < 1) return 0;
+    V41E4 *e = v41_e4_entry(w);
+    if (!e || e->no || e->h) return 0;
+    const size_t b = (size_t)w->O * w->I + (size_t)((w->O + 31) / 32) * (w->I / 32);
+    if (g_e4_used + b > g_e4_budget || !(e->h = coli_cuda_e4m3t_upload(g_e4_dev, w->q, w->s, w->O, w->I))) { e->no = 1; return 0; }
+    g_e4_used += b; g_e4_mats++;
+    return b;
+}
 #else
 #define V41_E4(...)
 static void v41_e4_start(int dev) { (void)dev; }
@@ -6576,6 +6586,30 @@ static size_t v41_cu_wb(const WB *w) {
     if (w->gx) return cud_float(100 + w->gt) ? v41_cu_float(w->O, w->I) : cud_bytes(100 + w->gt, w->O, w->I, 0);
     return w->w ? v41_cu_float(w->O, w->I) : 0;
 }
+#if defined(COLI_CUDA) && defined(COLI_SYCL)
+/* V41_TRUNK_GPU: every trunk matrix mv8_rows sees, up before the tier sizes itself on the card's free memory
+ * (wo_a as the group views attention's output builds); a matrix refused stays the CPU's */
+static void v41_e4_preload_model(Model *m) {
+    if (!g_e4_on) return;
+    Cfg *c = &m->c;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        const W8 *w[] = { &l->wq_a, &l->wq_b, &l->wkv, &l->wo_b, &l->idx_wq_b, &l->sh_w1, &l->sh_w3, &l->sh_w2, &l->eng_wkv };
+        for (size_t k = 0; k < sizeof w / sizeof *w; k++) v41_e4_preload(w[k]);
+        if (l->wo_a.q && !l->wo_a.gx && c->o_groups > 0) {
+            const int per_group = c->n_heads * c->head_dim / c->o_groups;
+            for (int g = 0; g < c->o_groups; g++) {
+                W8 block = l->wo_a;
+                block.q = l->wo_a.q + (size_t)g * c->o_lora * per_group;
+                block.s = l->wo_a.s + (size_t)(g * c->o_lora / FP8_TILE) * ((per_group + FP8_TILE - 1) / FP8_TILE);
+                block.O = c->o_lora; block.I = per_group;
+                v41_e4_preload(&block);
+            }
+        }
+    }
+    fprintf(stderr, "[v41] V41_TRUNK_GPU: %llu trunk matrices on the device, %.2f GiB, before the tier\n", g_e4_mats, g_e4_used / 1073741824.0);
+}
+#endif
 static size_t v41_cu_dense_bytes(const Model *m) {
     size_t b = v41_cu_wb(&m->head);
     for (int i = 0; i < m->c.n_layers; i++) {
@@ -6969,6 +7003,9 @@ int main(int argc, char **argv) {
                 xt_use_cuda(1);
                 g_v41_cud = cud_open("deepseek_v41", coli_cuda_device_at(0), v41_cu_dense_bytes(&m));
                 v41_e4_start(coli_cuda_device_at(0));   /* V41_TRUNK_GPU: before the tier, which then sizes itself on what is left */
+#ifdef COLI_SYCL
+                v41_e4_preload_model(&m);
+#endif
                 vk_tier_start(&m, snap, cap);
                 if (!cut_ready()) { xt_use_cuda(0); g_v41_cu = 0; g_cud.on = 0; }
             }
