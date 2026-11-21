@@ -6897,6 +6897,11 @@ int main(int argc, char **argv) {
 #endif
 
     if (getenv("SERVE") && atoi(getenv("SERVE"))) {
+        /* unbuffered, as qwen36/qwen38: serve_mux asks select() whether a command waits
+         * (coli_serve_stdin_ready), and select cannot see commands stdio already read
+         * ahead into its buffer -- requests sent together then waited until every active
+         * one had finished, and ran one at a time */
+        setvbuf(stdin, NULL, _IONBF, 0);
         char path[1024];
         snprintf(path, sizeof(path), "%s/tokenizer.json", snap);
         Tok tokenizer;
