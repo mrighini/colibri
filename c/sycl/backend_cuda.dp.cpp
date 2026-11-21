@@ -2655,6 +2655,121 @@ catch (sycl::exception const &exc) {
     return sycl_caught(exc, "coli_cuda_matmul_i8act");
 }
 
+/* coli_cuda_e4m3t_* (deepseek_v41's V41_TRUNK_GPU): an FP8 matrix as deepseek_v41's W8 holds it -- e4m3 bytes,
+ * O rows of I, and one ue8m0 scale a 32x32 tile ((O/32) x (I/32) bytes) -- times float activations, with the bits
+ * of deepseek_v41.c's mv8_rows on an AVX2 x86-64-v4 build. That loop, per output o and row r, per tile of 32
+ * columns: four 8-wide decodes w0..w3 (the e4m3 byte as a float, NaN for 0x7F/0xFF); acc = w0*x0 (a multiply),
+ * then acc = fma(w1,x1,acc), fma(w2,x2,acc), fma(w3,x3,acc) lane by lane; h = hsum256(acc), i.e.
+ * ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)); then sum = fma(h, tile, sum) (gcc fuses `sum += h * tile`: vfmadd213ss,
+ * checked in the built binary). Here 8 lanes of a sub-group are the 8 accumulator lanes of one output: lane j
+ * takes columns j, j+8, j+16, j+24 of each tile, the same multiply and fmas, the same pairwise additions through
+ * sub-group shifts (4, 2, 1), and the group's first lane folds the tiles in order. Nothing is reassociated
+ * (-fp-model=precise), the decode is the CPU's table, so the outputs are the CPU's to the bit; the engine's
+ * V41_E4_CHECK compares them. I a multiple of 32 (checked), O any; up to E4T_ROWS rows a pass reuse each weight. */
+#define E4T_ROWS 8
+struct ColiE4m3t { int device, O, I; uint8_t *q, *s; float *lut; };
+template <int SG>
+static void e4m3t_kernel(float *y, int ystride, const float *x, int xstride, const uint8_t *q, const uint8_t *sc,
+                         const float *lut, int S, int I, int O) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lid = item.get_local_id(2), j = lid & 7;
+    const int o = (item.get_group(2) * item.get_local_range(2) + lid) >> 3;
+    const int r0 = item.get_group(1) * E4T_ROWS;
+    const int nr = S - r0 < E4T_ROWS ? S - r0 : E4T_ROWS;
+    const bool live = o < O;   /* lanes past the end still shuffle (the whole sub-group), they write nothing */
+    const int oo = live ? o : O - 1, tiles = I >> 5;
+    const uint8_t *row = q + (size_t)oo * I;
+    const uint8_t *srow = sc + (size_t)(oo >> 5) * tiles;
+    float sum[E4T_ROWS];
+#pragma unroll
+    for (int r = 0; r < E4T_ROWS; r++) sum[r] = 0.0f;
+    for (int t = 0; t < tiles; t++) {
+        const int base = t << 5;
+        const float w0 = lut[row[base + j]], w1 = lut[row[base + 8 + j]], w2 = lut[row[base + 16 + j]], w3 = lut[row[base + 24 + j]];
+        const float tile = sycl::bit_cast<float>((uint32_t)srow[t] << 23);
+#pragma unroll
+        for (int r = 0; r < E4T_ROWS; r++) {
+            if (r < nr) {
+                const float *xr = x + (size_t)(r0 + r) * xstride + base;
+                float acc = w0 * xr[j];
+                acc = sycl::fma(w1, xr[8 + j], acc);
+                acc = sycl::fma(w2, xr[16 + j], acc);
+                acc = sycl::fma(w3, xr[24 + j], acc);
+                float a = acc + sycl::shift_group_left(sg, acc, 4);   /* lane j<4: v_j + v_{j+4} */
+                float b = a + sycl::shift_group_left(sg, a, 2);       /* lane 0: a0+a2, lane 1: a1+a3 */
+                float h = b + sycl::shift_group_left(sg, b, 1);       /* lane 0: (a0+a2)+(a1+a3) */
+                if (j == 0) sum[r] = sycl::fma(h, tile, sum[r]);
+            }
+        }
+    }
+    if (live && j == 0)
+        for (int r = 0; r < nr; r++) y[(size_t)(r0 + r) * ystride + o] = sum[r];
+}
+extern "C" void *coli_cuda_e4m3t_upload(int device, const unsigned char *q, const unsigned char *s, int O, int I) try {
+    if (fault_injected() || !q || !s || O < 1 || I < 32 || (I & 31)) return NULL;
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return NULL;
+    const size_t qb = (size_t)O * I, sb = (size_t)((O + 31) / 32) * (I / 32);
+    ColiE4m3t *t = (ColiE4m3t *)std::calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->device = device; t->O = O; t->I = I;
+    float lut[256];
+    for (int b = 0; b < 256; b++) {   /* quant.h's e4m3_decode8: bits placed, times 2^120 (exact); 0x7F/0xFF NaN */
+        const uint32_t bits = ((uint32_t)(b & 0x80) << 24) | ((uint32_t)(b & 0x7f) << 20);
+        float v; std::memcpy(&v, &bits, 4); v *= 0x1p120f;
+        lut[b] = (b & 0x7f) == 0x7f ? NAN : v;
+    }
+    if (COLI_SYCL_ALLOC(t->q, (uint8_t *)sycl::malloc_device(qb, dq()), qb) != 0 ||
+        COLI_SYCL_ALLOC(t->s, (uint8_t *)sycl::malloc_device(sb, dq()), sb) != 0 ||
+        COLI_SYCL_ALLOC(t->lut, sycl::malloc_device<float>(256, dq()), 256 * sizeof(float)) != 0 ||
+        COLI_SYCL_TRY(dq().memcpy(t->q, q, qb)) != 0 || COLI_SYCL_TRY(dq().memcpy(t->s, s, sb)) != 0 ||
+        COLI_SYCL_TRY(dq().memcpy(t->lut, lut, sizeof lut).wait()) != 0) {
+        try { dq().wait(); } catch (...) {}
+        if (t->q) sycl::free(t->q, dq()); if (t->s) sycl::free(t->s, dq()); if (t->lut) sycl::free(t->lut, dq());
+        std::free(t); return NULL;
+    }
+    return t;
+}
+catch (sycl::exception const &exc) { sycl_caught(exc, "coli_cuda_e4m3t_upload"); return NULL; }
+extern "C" void coli_cuda_e4m3t_free(void *h) {
+    ColiE4m3t *t = (ColiE4m3t *)h;
+    if (!t) return;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (ctx && select_ctx(ctx)) { try { dq().wait(); sycl::free(t->q, dq()); sycl::free(t->s, dq()); sycl::free(t->lut, dq()); } catch (...) {} }
+    std::free(t);
+}
+extern "C" int coli_cuda_e4m3t_mv(void *h, float *y, int ystride, const float *x, int xstride, int S) try {
+    ColiE4m3t *t = (ColiE4m3t *)h;
+    if (fault_injected() || !t || !y || !x || S < 1 || xstride < t->I || ystride < t->O) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    const int I = t->I, O = t->O;
+    const size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
+    if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
+    /* packed on the device (rows I and O apart); the host's strides only in the copies */
+    if (xstride == I) { if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(ctx->dx, x, xb)), "e4m3t input upload")) return 0; }
+    else for (int r = 0; r < S; r++)
+        if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(ctx->dx + (size_t)r * I, x + (size_t)r * xstride, (size_t)I * 4)), "e4m3t input upload")) return 0;
+    const int outs_per_wg = 256 / 8;
+    dpct::dim3 grid((unsigned)((O + outs_per_wg - 1) / outs_per_wg), (unsigned)((S + E4T_ROWS - 1) / E4T_ROWS));
+    float *dy = ctx->dy; const float *dx = ctx->dx;
+    const uint8_t *dq8 = t->q, *ds = t->s; const float *dl = t->lut;
+    COLI_SG_LAUNCH(dq(), ctx->sg, grid, 256, 0, e4m3t_kernel<SG>(dy, O, dx, I, dq8, ds, dl, S, I, O));
+    if (!cuda_ok(0, "e4m3t launch")) return 0;
+    if (ystride == O) { if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(y, dy, yb).wait()), "e4m3t output download")) return 0; }
+    else {
+        for (int r = 0; r < S; r++)
+            if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(y + (size_t)r * ystride, dy + (size_t)r * O, (size_t)O * 4)), "e4m3t output download")) return 0;
+        if (!cuda_ok(COLI_SYCL_TRY(dq().wait()), "e4m3t output download")) return 0;
+    }
+    return 1;
+}
+catch (sycl::exception const &exc) {
+    try { dq().wait(); } catch (...) {}
+    return sycl_caught(exc, "coli_cuda_e4m3t_mv");
+}
+
 /* coli_cuda_tuned_default (backend_cuda.h): a switch's measured default from the devices' profiles
  * (coli_sycl_tuned_default), only where every device gives the same value; the first use of each switch that
  * takes a measured value says so on stderr. The devices: the opened ones; before coli_cuda_init (an engine

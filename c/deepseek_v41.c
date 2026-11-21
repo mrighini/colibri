@@ -834,12 +834,91 @@ static int mv_block_rows(int I) {
     return block < 1 ? 1 : block;
 }
 
+static void mv8_rows_cpu(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows);
+#if defined(COLI_CUDA) && defined(COLI_SYCL)
+/* V41_TRUNK_GPU=1 (SYCL, off by default): the native FP8 trunk's matrices (W8: e4m3 with 32x32 ue8m0 tiles) on the
+ * tier's first device, each uploaded on first use and computed there by coli_cuda_e4m3t_mv with mv8_rows_cpu's
+ * bits (c/sycl/backend_cuda.dp.cpp says how). Decode-sized calls only (rows <= V41_TRUNK_GPU_ROWS, default 32),
+ * from the thread that opened the device, outside OpenMP regions; anything else, or a matrix the device refuses
+ * (V41_TRUNK_GPU_GB, default no cap, or out of memory), stays the CPU's. V41_E4_CHECK=n: the first n calls are
+ * computed on the CPU too and compared byte for byte (a count on stderr at exit; any difference printed). */
+typedef struct { const uint8_t *q; int O, I, no; void *h; } V41E4;
+static V41E4 *g_e4_map; static size_t g_e4_cap;
+static int g_e4_on, g_e4_rows = 32, g_e4_dev;
+static pthread_t g_e4_thread;
+static size_t g_e4_used, g_e4_budget = (size_t)-1;
+static unsigned long long g_e4_calls, g_e4_mats, g_e4_chk_left, g_e4_chk_calls, g_e4_chk_bad;
+static void v41_e4_report(void) {
+    if (!g_e4_on) return;
+    fprintf(stderr, "[v41] trunk on the device (V41_TRUNK_GPU): %llu matrices, %.2f GiB, %llu calls", g_e4_mats,
+            g_e4_used / 1073741824.0, g_e4_calls);
+    if (g_e4_chk_calls) fprintf(stderr, "; checked %llu calls against the CPU: %llu values differ", g_e4_chk_calls, g_e4_chk_bad);
+    fprintf(stderr, "\n");
+}
+static void v41_e4_start(int dev) {
+    const char *e = getenv("V41_TRUNK_GPU");
+    if (!(e && atoi(e) > 0)) return;
+    g_e4_cap = 4096; g_e4_map = calloc(g_e4_cap, sizeof *g_e4_map);
+    if (!g_e4_map) return;
+    const char *r = getenv("V41_TRUNK_GPU_ROWS"); if (r && atoi(r) > 0) g_e4_rows = atoi(r);
+    const char *gb = getenv("V41_TRUNK_GPU_GB"); if (gb && atof(gb) > 0) g_e4_budget = (size_t)(atof(gb) * 1073741824.0);
+    const char *ck = getenv("V41_E4_CHECK"); if (ck && atoll(ck) > 0) g_e4_chk_left = (unsigned long long)atoll(ck);
+    g_e4_dev = dev; g_e4_thread = pthread_self(); g_e4_on = 1;
+    atexit(v41_e4_report);
+    fprintf(stderr, "[v41] V41_TRUNK_GPU: the FP8 trunk's matrices to device %d as they are first used (rows <= %d%s)\n",
+            dev, g_e4_rows, g_e4_chk_left ? ", checked against the CPU" : "");
+}
+static V41E4 *v41_e4_entry(const W8 *w) {
+    size_t i = ((uintptr_t)w->q >> 4) * 11400714819323198485ull % g_e4_cap;
+    for (size_t k = 0; k < g_e4_cap; k++, i = (i + 1) % g_e4_cap) {
+        V41E4 *e = &g_e4_map[i];
+        if (!e->q) { e->q = w->q; e->O = w->O; e->I = w->I; return e; }
+        if (e->q == w->q && e->O == w->O && e->I == w->I) return e;
+    }
+    return NULL;   /* full: the CPU's */
+}
+static int v41_e4_mv(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
+    if (!g_e4_on || rows > g_e4_rows || (w->I & 31) || omp_in_parallel() || !pthread_equal(pthread_self(), g_e4_thread)) return 0;
+    V41E4 *e = v41_e4_entry(w);
+    if (!e || e->no) return 0;
+    if (!e->h) {
+        const size_t b = (size_t)w->O * w->I + (size_t)((w->O + 31) / 32) * (w->I / 32);
+        if (g_e4_used + b > g_e4_budget || !(e->h = coli_cuda_e4m3t_upload(g_e4_dev, w->q, w->s, w->O, w->I))) { e->no = 1; return 0; }
+        g_e4_used += b; g_e4_mats++;
+    }
+    if (!coli_cuda_e4m3t_mv(e->h, y, ystride, x, xstride, rows)) return 0;
+    g_e4_calls++;
+    if (g_e4_chk_left) {
+        g_e4_chk_left--; g_e4_chk_calls++;
+        float *ref = xmalloc((size_t)rows * w->O * sizeof(float), "trunk check");
+        mv8_rows_cpu(ref, w->O, w, x, xstride, rows);
+        for (int r = 0; r < rows; r++)
+            for (int o = 0; o < w->O; o++) {
+                float a = y[(size_t)r * ystride + o], c = ref[(size_t)r * w->O + o];
+                if (memcmp(&a, &c, 4)) {
+                    if (g_e4_chk_bad++ < 8) fprintf(stderr, "[v41] V41_E4_CHECK: O %d I %d row %d out %d: device %a, CPU %a\n", w->O, w->I, r, o, a, c);
+                    y[(size_t)r * ystride + o] = c;   /* the CPU's value goes on */
+                }
+            }
+        free(ref);
+    }
+    return 1;
+}
+#define V41_E4(...) if (v41_e4_mv(__VA_ARGS__)) return;
+#else
+#define V41_E4(...)
+static void v41_e4_start(int dev) { (void)dev; }
+#endif
 static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
     if (w->gx) { V41_CU(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows) v41_gx_rows(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(12, w->q, w->s, w->O, w->I, y, ystride, x, xstride, rows)) return;
     v41_dho_host(w->q);
 #endif
+    V41_E4(y, ystride, w, x, xstride, rows)
+    mv8_rows_cpu(y, ystride, w, x, xstride, rows);
+}
+static void mv8_rows_cpu(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
     int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
     int block = mv_block_rows(I);
     for (int r0 = 0; r0 < rows; r0 += block) {
@@ -6889,6 +6968,7 @@ int main(int argc, char **argv) {
                 g_v41_cu = 1;
                 xt_use_cuda(1);
                 g_v41_cud = cud_open("deepseek_v41", coli_cuda_device_at(0), v41_cu_dense_bytes(&m));
+                v41_e4_start(coli_cuda_device_at(0));   /* V41_TRUNK_GPU: before the tier, which then sizes itself on what is left */
                 vk_tier_start(&m, snap, cap);
                 if (!cut_ready()) { xt_use_cuda(0); g_v41_cu = 0; g_cud.on = 0; }
             }
