@@ -265,6 +265,9 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
 COLI_CUDA_DLLEXPORT void *coli_cuda_e4m3t_upload(int device, const unsigned char *q, const unsigned char *s, int O, int I);
 COLI_CUDA_DLLEXPORT int coli_cuda_e4m3t_mv(void *h, float *y, int ystride, const float *x, int xstride, int S);
 COLI_CUDA_DLLEXPORT void coli_cuda_e4m3t_free(void *h);
+COLI_CUDA_DLLEXPORT void *coli_cuda_bf16t_upload(int device, const unsigned short *w, int O, int I);
+COLI_CUDA_DLLEXPORT int coli_cuda_bf16t_mv(void *h, float *y, int ystride, const float *x, int xstride, int S);
+COLI_CUDA_DLLEXPORT void coli_cuda_bf16t_free(void *h);
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul_i8act(ColiCudaTensor *tensor, float *y, const signed char *xq,
                      const float *sx, int S, int I, int O);
 /* The default a platform's measurements give a switch the environment leaves unset. The SYCL backend answers from

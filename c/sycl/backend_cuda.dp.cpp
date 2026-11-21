@@ -2770,6 +2770,97 @@ catch (sycl::exception const &exc) {
     return sycl_caught(exc, "coli_cuda_e4m3t_mv");
 }
 
+/* coli_cuda_bf16t_* (deepseek_v41's V41_TRUNK_GPU, the BF16 matrices: the head, the router, the compressor and the
+ * indexer's projections): the bits of deepseek_v41.c's mvb_cpu on an AVX2 build. That loop, per output o: acc = 0;
+ * for i in steps of 8, acc = fma(bf16(w[i..i+7]), x[i..i+7], acc) lane by lane; y = hsum256(acc), i.e.
+ * ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)). Here lane j of 8 is accumulator lane j: columns j, j+8, ... in order,
+ * the same fmas from +0, the same sub-group shifts (4, 2, 1) as e4m3t. bf16 -> float is a shift (exact, NaNs
+ * kept). I a multiple of 8 (the CPU's tail loop never runs). */
+struct ColiBf16t { int device, O, I; uint16_t *w; };
+template <int SG>
+static void bf16t_kernel(float *y, int ystride, const float *x, int xstride, const uint16_t *w, int S, int I, int O) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lid = item.get_local_id(2), j = lid & 7;
+    const int o = (item.get_group(2) * item.get_local_range(2) + lid) >> 3;
+    const int r0 = item.get_group(1) * E4T_ROWS;
+    const int nr = S - r0 < E4T_ROWS ? S - r0 : E4T_ROWS;
+    const bool live = o < O;
+    const int oo = live ? o : O - 1;
+    const uint16_t *row = w + (size_t)oo * I;
+    float acc[E4T_ROWS];
+#pragma unroll
+    for (int r = 0; r < E4T_ROWS; r++) acc[r] = 0.0f;
+    for (int i = j; i < I; i += 8) {
+        const float wv = sycl::bit_cast<float>((uint32_t)row[i] << 16);
+#pragma unroll
+        for (int r = 0; r < E4T_ROWS; r++)
+            if (r < nr) acc[r] = sycl::fma(wv, x[(size_t)(r0 + r) * xstride + i], acc[r]);
+    }
+#pragma unroll
+    for (int r = 0; r < E4T_ROWS; r++) {
+        if (r < nr) {   /* nr is the same for the whole sub-group: every lane shuffles */
+            const float v = acc[r];
+            float a = v + sycl::shift_group_left(sg, v, 4);
+            float b = a + sycl::shift_group_left(sg, a, 2);
+            float h = b + sycl::shift_group_left(sg, b, 1);
+            if (live && j == 0) y[(size_t)(r0 + r) * ystride + o] = h;
+        }
+    }
+}
+extern "C" void *coli_cuda_bf16t_upload(int device, const unsigned short *w, int O, int I) try {
+    if (fault_injected() || !w || O < 1 || I < 8 || (I & 7)) return NULL;
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return NULL;
+    const size_t wb = (size_t)O * I * sizeof(uint16_t);
+    ColiBf16t *t = (ColiBf16t *)std::calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->device = device; t->O = O; t->I = I;
+    if (COLI_SYCL_ALLOC(t->w, (uint16_t *)sycl::malloc_device(wb, dq()), wb) != 0 ||
+        COLI_SYCL_TRY(dq().memcpy(t->w, w, wb).wait()) != 0) {
+        try { dq().wait(); } catch (...) {}
+        if (t->w) sycl::free(t->w, dq());
+        std::free(t); return NULL;
+    }
+    return t;
+}
+catch (sycl::exception const &exc) { sycl_caught(exc, "coli_cuda_bf16t_upload"); return NULL; }
+extern "C" void coli_cuda_bf16t_free(void *h) {
+    ColiBf16t *t = (ColiBf16t *)h;
+    if (!t) return;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (ctx && select_ctx(ctx)) { try { dq().wait(); sycl::free(t->w, dq()); } catch (...) {} }
+    std::free(t);
+}
+extern "C" int coli_cuda_bf16t_mv(void *h, float *y, int ystride, const float *x, int xstride, int S) try {
+    ColiBf16t *t = (ColiBf16t *)h;
+    if (fault_injected() || !t || !y || !x || S < 1 || xstride < t->I || ystride < t->O) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    const int I = t->I, O = t->O;
+    const size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
+    if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
+    if (xstride == I) { if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(ctx->dx, x, xb)), "bf16t input upload")) return 0; }
+    else for (int r = 0; r < S; r++)
+        if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(ctx->dx + (size_t)r * I, x + (size_t)r * xstride, (size_t)I * 4)), "bf16t input upload")) return 0;
+    const int outs_per_wg = 256 / 8;
+    dpct::dim3 grid((unsigned)((O + outs_per_wg - 1) / outs_per_wg), (unsigned)((S + E4T_ROWS - 1) / E4T_ROWS));
+    float *dy = ctx->dy; const float *dx = ctx->dx; const uint16_t *dw = t->w;
+    COLI_SG_LAUNCH(dq(), ctx->sg, grid, 256, 0, bf16t_kernel<SG>(dy, O, dx, I, dw, S, I, O));
+    if (!cuda_ok(0, "bf16t launch")) return 0;
+    if (ystride == O) { if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(y, dy, yb).wait()), "bf16t output download")) return 0; }
+    else {
+        for (int r = 0; r < S; r++)
+            if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(y + (size_t)r * ystride, dy + (size_t)r * O, (size_t)O * 4)), "bf16t output download")) return 0;
+        if (!cuda_ok(COLI_SYCL_TRY(dq().wait()), "bf16t output download")) return 0;
+    }
+    return 1;
+}
+catch (sycl::exception const &exc) {
+    try { dq().wait(); } catch (...) {}
+    return sycl_caught(exc, "coli_cuda_bf16t_mv");
+}
+
 /* coli_cuda_tuned_default (backend_cuda.h): a switch's measured default from the devices' profiles
  * (coli_sycl_tuned_default), only where every device gives the same value; the first use of each switch that
  * takes a measured value says so on stderr. The devices: the opened ones; before coli_cuda_init (an engine

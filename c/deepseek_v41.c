@@ -842,16 +842,19 @@ static void mv8_rows_cpu(float *y, int ystride, const W8 *w, const float *x, int
  * from the thread that opened the device, outside OpenMP regions; anything else, or a matrix the device refuses
  * (V41_TRUNK_GPU_GB, default no cap, or out of memory), stays the CPU's. V41_E4_CHECK=n: the first n calls are
  * computed on the CPU too and compared byte for byte (a count on stderr at exit; any difference printed). */
-typedef struct { const uint8_t *q; int O, I, no; void *h; } V41E4;
+typedef struct { const void *q; int O, I, no, bf; void *h; } V41E4;   /* bf: a BF16 matrix (coli_cuda_bf16t) */
 static V41E4 *g_e4_map; static size_t g_e4_cap;
-static int g_e4_on, g_e4_rows = 32, g_e4_dev;
+static int g_e4_on, g_e4_rows = 32, g_e4_dev, g_b16_on;
 static pthread_t g_e4_thread;
 static size_t g_e4_used, g_e4_budget = (size_t)-1;
 static unsigned long long g_e4_calls, g_e4_mats, g_e4_chk_left, g_e4_chk_calls, g_e4_chk_bad;
+static unsigned long long g_b16_calls, g_b16_mats; static size_t g_b16_used;
+static void mvb_cpu(float *y, const WB *w, const float *x);
 static void v41_e4_report(void) {
     if (!g_e4_on) return;
     fprintf(stderr, "[v41] trunk on the device (V41_TRUNK_GPU): %llu matrices, %.2f GiB, %llu calls", g_e4_mats,
             g_e4_used / 1073741824.0, g_e4_calls);
+    if (g_b16_on) fprintf(stderr, "; BF16 (V41_BF16_GPU): %llu matrices, %.2f GiB, %llu calls", g_b16_mats, g_b16_used / 1073741824.0, g_b16_calls);
     if (g_e4_chk_calls) fprintf(stderr, "; checked %llu calls against the CPU: %llu values differ", g_e4_chk_calls, g_e4_chk_bad);
     fprintf(stderr, "\n");
 }
@@ -863,20 +866,22 @@ static void v41_e4_start(int dev) {
     const char *r = getenv("V41_TRUNK_GPU_ROWS"); if (r && atoi(r) > 0) g_e4_rows = atoi(r);
     const char *gb = getenv("V41_TRUNK_GPU_GB"); if (gb && atof(gb) > 0) g_e4_budget = (size_t)(atof(gb) * 1073741824.0);
     const char *ck = getenv("V41_E4_CHECK"); if (ck && atoll(ck) > 0) g_e4_chk_left = (unsigned long long)atoll(ck);
+    const char *bf = getenv("V41_BF16_GPU"); g_b16_on = bf && atoi(bf) > 0;
     g_e4_dev = dev; g_e4_thread = pthread_self(); g_e4_on = 1;
     atexit(v41_e4_report);
     fprintf(stderr, "[v41] V41_TRUNK_GPU: the FP8 trunk's matrices to device %d as they are first used (rows <= %d%s)\n",
             dev, g_e4_rows, g_e4_chk_left ? ", checked against the CPU" : "");
 }
-static V41E4 *v41_e4_entry(const W8 *w) {
-    size_t i = ((uintptr_t)w->q >> 4) * 11400714819323198485ull % g_e4_cap;
+static V41E4 *v41_e4_find(const void *q, int O, int I, int bf) {
+    size_t i = ((uintptr_t)q >> 4) * 11400714819323198485ull % g_e4_cap;
     for (size_t k = 0; k < g_e4_cap; k++, i = (i + 1) % g_e4_cap) {
         V41E4 *e = &g_e4_map[i];
-        if (!e->q) { e->q = w->q; e->O = w->O; e->I = w->I; return e; }
-        if (e->q == w->q && e->O == w->O && e->I == w->I) return e;
+        if (!e->q) { e->q = q; e->O = O; e->I = I; e->bf = bf; return e; }
+        if (e->q == q && e->O == O && e->I == I && e->bf == bf) return e;
     }
     return NULL;   /* full: the CPU's */
 }
+static V41E4 *v41_e4_entry(const W8 *w) { return v41_e4_find(w->q, w->O, w->I, 0); }
 static int v41_e4_mv(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
     if (!g_e4_on || rows > g_e4_rows || (w->I & 31) || omp_in_parallel() || !pthread_equal(pthread_self(), g_e4_thread)) return 0;
     V41E4 *e = v41_e4_entry(w);
@@ -915,7 +920,42 @@ static size_t v41_e4_preload(const W8 *w) {
     g_e4_used += b; g_e4_mats++;
     return b;
 }
+/* V41_BF16_GPU: a BF16 matrix (mvb's) on the device, uploaded at start only (v41_b16_preload); same rules */
+static int v41_b16_mv(float *y, int ystride, const WB *w, const float *x, int xstride, int rows) {
+    if (!g_b16_on || !g_e4_on || rows > g_e4_rows || (w->I & 7) || omp_in_parallel() || !pthread_equal(pthread_self(), g_e4_thread)) return 0;
+    V41E4 *e = v41_e4_find(w->w, w->O, w->I, 1);
+    if (!e || !e->h) { if (e) e->no = 1; return 0; }
+    if (!coli_cuda_bf16t_mv(e->h, y, ystride, x, xstride, rows)) return 0;
+    g_b16_calls++;
+    if (g_e4_chk_left) {
+        g_e4_chk_left--; g_e4_chk_calls++;
+        float *ref = xmalloc((size_t)w->O * sizeof(float), "bf16 check");
+        for (int r = 0; r < rows; r++) {
+            mvb_cpu(ref, w, x + (size_t)r * xstride);
+            for (int o = 0; o < w->O; o++) {
+                float a = y[(size_t)r * ystride + o], c = ref[o];
+                if (memcmp(&a, &c, 4)) {
+                    if (g_e4_chk_bad++ < 8) fprintf(stderr, "[v41] V41_E4_CHECK (BF16): O %d I %d row %d out %d: device %a, CPU %a\n", w->O, w->I, r, o, a, c);
+                    y[(size_t)r * ystride + o] = c;
+                }
+            }
+        }
+        free(ref);
+    }
+    return 1;
+}
+static size_t v41_b16_preload(const WB *w) {
+    if (!g_b16_on || !g_e4_on || !w->w || w->gx || (w->I & 7) || w->O < 1) return 0;
+    V41E4 *e = v41_e4_find(w->w, w->O, w->I, 1);
+    if (!e || e->no || e->h) return 0;
+    const size_t b = (size_t)w->O * w->I * 2;
+    if (g_e4_used + b > g_e4_budget || !(e->h = coli_cuda_bf16t_upload(g_e4_dev, w->w, w->O, w->I))) { e->no = 1; return 0; }
+    g_e4_used += b; g_b16_used += b; g_b16_mats++;
+    return b;
+}
+#define V41_B16(...) if (v41_b16_mv(__VA_ARGS__)) return;
 #else
+#define V41_B16(...)
 #define V41_E4(...)
 static void v41_e4_start(int dev) { (void)dev; }
 #endif
@@ -1007,6 +1047,7 @@ static void mvb(float *y, const WB *w, const float *x) {
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, w->O, x, w->I, 1)) return;
     v41_dho_host(w->w);
 #endif
+    V41_B16(y, w->O, w, x, w->I, 1)
     mvb_cpu(y, w, x);
 }
 /* mvb for `rows` positions: one call on the device (an S-row GEMM instead of a GEMV
@@ -1018,6 +1059,7 @@ static void mvb_rows(float *y, int ystride, const WB *w, const float *x, int xst
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, ystride, x, xstride, rows)) return;
     v41_dho_host(w->w);
 #endif
+    V41_B16(y, ystride, w, x, xstride, rows)
     for (int r = 0; r < rows; r++) mvb_cpu(y + (size_t)r * ystride, w, x + (size_t)r * xstride);
 }
 
@@ -6596,6 +6638,8 @@ static void v41_e4_preload_model(Model *m) {
         Layer *l = &m->L[i];
         const W8 *w[] = { &l->wq_a, &l->wq_b, &l->wkv, &l->wo_b, &l->idx_wq_b, &l->sh_w1, &l->sh_w3, &l->sh_w2, &l->eng_wkv };
         for (size_t k = 0; k < sizeof w / sizeof *w; k++) v41_e4_preload(w[k]);
+        const WB *wb[] = { &l->comp_wkv, &l->comp_wgate, &l->idx_wk, &l->idx_wproj, &l->gate_w };
+        for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) v41_b16_preload(wb[k]);
         if (l->wo_a.q && !l->wo_a.gx && c->o_groups > 0) {
             const int per_group = c->n_heads * c->head_dim / c->o_groups;
             for (int g = 0; g < c->o_groups; g++) {
@@ -6607,6 +6651,7 @@ static void v41_e4_preload_model(Model *m) {
             }
         }
     }
+    v41_b16_preload(&m->head);
     /* the scratch (rows x widest input, rows x widest output) and one launch of each extreme now, while the card has
      * room: a later call never allocates; a failure here turns the trunk off (all the CPU's) before the tier starts */
     V41E4 *wi = NULL, *wo = NULL;
@@ -6619,17 +6664,19 @@ static void v41_e4_preload_model(Model *m) {
     if (wi) {
         const int S = g_e4_rows;
         float *x = calloc((size_t)S * wi->I, sizeof *x), *y = malloc((size_t)S * wo->O * sizeof *y);
-        const int ok = x && y && coli_cuda_e4m3t_mv(wi->h, y, wi->O, x, wi->I, S) && coli_cuda_e4m3t_mv(wo->h, y, wo->O, x, wo->I, S);
+        #define V41_WARM(e) ((e)->bf ? coli_cuda_bf16t_mv((e)->h, y, (e)->O, x, (e)->I, S) : coli_cuda_e4m3t_mv((e)->h, y, (e)->O, x, (e)->I, S))
+        const int ok = x && y && V41_WARM(wi) && V41_WARM(wo);
+        #undef V41_WARM
         free(x); free(y);
         if (!ok) {
             for (size_t k = 0; k < g_e4_cap; k++)
-                if (g_e4_map[k].h) { coli_cuda_e4m3t_free(g_e4_map[k].h); g_e4_map[k].h = NULL; g_e4_map[k].no = 1; }
+                if (g_e4_map[k].h) { (g_e4_map[k].bf ? coli_cuda_bf16t_free : coli_cuda_e4m3t_free)(g_e4_map[k].h); g_e4_map[k].h = NULL; g_e4_map[k].no = 1; }
             fprintf(stderr, "[v41] V41_TRUNK_GPU: the warm-up launch failed: the trunk stays on the CPU\n");
-            g_e4_on = 0; g_e4_used = 0; g_e4_mats = 0;
+            g_e4_on = 0; g_e4_used = 0; g_e4_mats = 0; g_b16_on = 0; g_b16_used = 0; g_b16_mats = 0;
             return;
         }
     }
-    fprintf(stderr, "[v41] V41_TRUNK_GPU: %llu trunk matrices on the device, %.2f GiB, before the tier\n", g_e4_mats, g_e4_used / 1073741824.0);
+    fprintf(stderr, "[v41] V41_TRUNK_GPU: %llu trunk matrices on the device, %.2f GiB (BF16 %llu, %.2f GiB), before the tier\n", g_e4_mats + g_b16_mats, g_e4_used / 1073741824.0, g_b16_mats, g_b16_used / 1073741824.0);
 }
 #endif
 static size_t v41_cu_dense_bytes(const Model *m) {
