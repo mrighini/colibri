@@ -939,8 +939,11 @@ static int cu_xb_join(const float **yrows, double *device_ms) try {
     int e = COLI_SYCL_TRY(C.e1->wait_and_throw());
     float ms = 0.f;
     if (e == 0) try {   /* the batch's bounds on a profiling queue: cudaEventElapsedTime's figure */
-        ms = (C.e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
-              C.e0->get_profiling_info<sycl::info::event_profiling::command_start>()) / 1000000.0f;
+        /* signed: the barrier's start can read after the end mark (two events), and the
+         * unsigned difference then wrapped to ~1.8e13 ms, which the tier's balance reads */
+        const long long d = (long long)(C.e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
+                                        C.e0->get_profiling_info<sycl::info::event_profiling::command_start>());
+        ms = d > 0 ? (float)d / 1000000.0f : 0.f;
     } catch (sycl::exception const &) { ms = 0.f; }
     {
         std::lock_guard<std::mutex> lk(C.mx);
@@ -962,8 +965,11 @@ static int cu_xb_join2(const float **yrows, double *device_ms) try {
     int e = COLI_SYCL_TRY(C2.e1->wait_and_throw());
     float ms = 0.f;
     if (e == 0) try {
-        ms = (C2.e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
-              C2.e0->get_profiling_info<sycl::info::event_profiling::command_start>()) / 1000000.0f;
+        /* signed: the barrier's start can read after the end mark (two events), and the
+         * unsigned difference then wrapped to ~1.8e13 ms, which the tier's balance reads */
+        const long long d = (long long)(C2.e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
+                                        C2.e0->get_profiling_info<sycl::info::event_profiling::command_start>());
+        ms = d > 0 ? (float)d / 1000000.0f : 0.f;
     } catch (sycl::exception const &) { ms = 0.f; }
     else C2.xb = 0;   /* the device stopped answering: the tier stops using it */
     {
