@@ -6873,7 +6873,18 @@ int main(int argc, char **argv) {
         const char *cu = getenv("COLI_CUDA");
         int dev = 0;
         if (cu && atoi(cu) && !vkt_ready() && c->n_routed > 0 && cut_wanted()) {
-            if (!coli_cuda_init(&dev, 1)) fprintf(stderr, "[CUDA] deepseek_v41: no CUDA device, the routed experts stay on the CPU\n");
+            /* COLI_VK_DEV2 (the tier's second device): the engine opens a second device for it,
+             * COLI_GPUS's second entry (else device 1), the primary staying device 0; when that
+             * cannot be opened, the primary alone as before */
+            const char *d2 = getenv("COLI_VK_DEV2");
+            int two[2] = { 0, 1 }, opened = 0;
+            if (d2 && *d2) {   /* COLI_VK_DEV2 here: auto or 1, the tier's second opened device (cu_xb.dp.cpp) */
+                const char *gl = getenv("COLI_GPUS"), *cm = gl ? strchr(gl, ',') : NULL;
+                if (cm) { cm++; while (*cm == ' ') cm++; if (*cm >= '0' && *cm <= '9') two[1] = atoi(cm); }
+                if (two[1] != 0) opened = coli_cuda_init(two, 2);
+                if (!opened) fprintf(stderr, "[CUDA] deepseek_v41: COLI_VK_DEV2=%s: device %d not opened, the tier on one device\n", d2, two[1]);
+            }
+            if (!opened && !coli_cuda_init(&dev, 1)) fprintf(stderr, "[CUDA] deepseek_v41: no CUDA device, the routed experts stay on the CPU\n");
             else {
                 g_v41_cu = 1;
                 xt_use_cuda(1);
