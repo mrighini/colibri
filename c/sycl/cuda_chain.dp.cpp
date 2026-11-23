@@ -3923,6 +3923,7 @@ static int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
 static int cc_preload(void) {
     return live() ? 1 : 0;
 }
+#include "cuda_dsv4c.dp.hpp"   /* DeepSeek V4.1's layer ops (cuda_dsv4c.cuh's port) */
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -3955,10 +3956,9 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_preload,
     cc_moe_cols,
     cc_matmul_hcmix,
-    /* upstream's operations for other models (DeepSeek V4.1, GLM-5.3, Kimi K3, DFlash2, Inkling) and the banked
+    cc_mhc, cc_ds_attn, cc_ds_rope, cc_ds_compress, cc_ds_score, cc_ds_cand, cc_ds_topk, cc_ds_engram,
+    /* upstream's operations for other models (GLM-5.3, Kimi K3, DFlash2, Inkling) and the banked
      * fetch: not in this module; the engine finds them empty and keeps its other path */
-    nullptr /* mhc */, nullptr /* ds_attn */, nullptr /* ds_rope */, nullptr /* ds_compress */,
-    nullptr /* ds_score */, nullptr /* ds_cand */, nullptr /* ds_topk */, nullptr /* ds_engram */,
     nullptr /* kda_conv */, nullptr /* kda_rec */, nullptr /* mla_core */, nullptr /* mla_rope */,
     nullptr /* mla_lnorm */, nullptr /* mla_hgemv */, nullptr /* dsa_pool_keys */, nullptr /* dsa_pool_select */,
     nullptr /* dsa_select */, nullptr /* mla_hgemv_q8 */, nullptr /* ares_mix */, nullptr /* situ */,
