@@ -45,7 +45,7 @@ static int v41_amx_on(void) {
             if (m > 2) m = 2;
             fprintf(stderr, "[v41] V41_AMX=%d: prompt-pass products on AMX-BF16 tiles (rows >= %d; activations %s)\n", m,
                     g_amx_min, m == 2 ? "split hi+lo bf16" : "bf16");
-            atexit(v41_amx_report);
+            static int registered; if (!registered) { registered = 1; atexit(v41_amx_report); }
         }
     }
     g_amx_mode = m;
