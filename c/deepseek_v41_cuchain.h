@@ -63,6 +63,10 @@ typedef struct {
     ColiCudaTensor **cm_gate;     /* every layer's gate [E][dim] (v41u_tb) */
     CcBuf *cm_bias, *cm_tab;      /* every layer's gate bias (E floats) and table (E CcExpert), at i * E */
     CcBuf *cm_lg, *cm_ids, *cm_w, *cm_hid, *cm_y, *cm_hy, *cm_yd;
+    CcBuf *cm_flag;
+    float *cm_mbuf;               /* the batched misses' gate/up and down rows */
+    int cm_batch;                 /* V41_CHAIN_MOE_BATCH (default 1): a layer's misses together; -1 unread */               /* DOWN: the frame's word once its routes are down (cc_signal), the host's misses start then */
+    unsigned cm_seq;
     CcExpert *cm_tabh;            /* the tables as the device holds them: g NULL, the host's miss */
     uint32_t *cm_ent;             /* one layer's tier entries (E * COLI_VK_XB_ENTRY words) */
     int *cm_chg;
@@ -70,7 +74,7 @@ typedef struct {
     float *cm_contrib, *cm_ref, *cm_sc;
     unsigned long long cm_steps, cm_layers, cm_dev_slots, cm_host_slots, cm_reads, cm_checked, cm_route_diff;
     double cm_dev_ms, cm_host_ms, cm_p2_ms, cm_err_max, cm_err_sum, cm_wdiff;
-    double cm_tab_ms, cm_cpu_ms, cm_cnt_ms;   /* within the above: the tables' refresh, the misses' CPU experts, vkt_dev_count */
+    double cm_tab_ms, cm_cpu_ms, cm_cnt_ms, cm_wait_ms;   /* cm_wait_ms: the host waiting for the frame's routes */   /* within the above: the tables' refresh, the misses' CPU experts, vkt_dev_count */
 } V41U;
 static V41U *g_v41u;
 static int g_v41u_off;   /* declined for good (set up refused, or COLI_CUDA_CHAIN=0) */
@@ -182,7 +186,8 @@ static void v41u_report(void) {   /* where a chain forward's time went (PLAN-sca
                         "parts-2+FFN frames %.2f ms; tables read %llu times\n", ch->cm_steps, ch->cm_layers, ch->cm_K,
                 ch->cm_dev_slots / ly, ch->cm_host_slots / ly, ch->cm_dev_ms / s, ch->cm_host_ms / s, ch->cm_p2_ms / s, ch->cm_reads);
         fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: within those, per step: the tables' refresh %.2f ms, the misses' CPU experts "
-                        "%.2f ms, vkt_dev_count %.2f ms\n", ch->cm_tab_ms / s, ch->cm_cpu_ms / s, ch->cm_cnt_ms / s);
+                        "%.2f ms, vkt_dev_count %.2f ms, the host waiting for the routes %.2f ms\n", ch->cm_tab_ms / s, ch->cm_cpu_ms / s,
+                ch->cm_cnt_ms / s, ch->cm_wait_ms / s);
     }
     if (ch->cm_checked)
         fprintf(stderr, "[CUDA] deepseek_v41 chain MoE check: %llu pairs, max rel err %.3g, mean %.3g (the CPU's routing differed "
@@ -203,6 +208,7 @@ static int v41u_setup(Model *m) {
     const int L = c->n_layers, D = c->dim, H = c->hc_mult, nm = (2 + H) * H, hd = c->head_dim;
     V41U *ch = (V41U *)calloc(1, sizeof *ch);
     if (!ch) return 0;
+    ch->cm_batch = -1;
     g_v41u = ch;
     const char *why = NULL;
     if (!cc_init(g_cud.dev) || !cc_ready()) why = "the chain's context did not come up";
@@ -651,7 +657,8 @@ static int v41u_cmoe_setup(V41U *ch, Model *m) {
                   cc_reserve(&ch->cm_tab, (size_t)L * E * sizeof(CcExpert), CC_DEV) && v41u_res(&ch->cm_lg, (size_t)E, CC_DEV) &&
                   cc_reserve(&ch->cm_ids, (size_t)K * sizeof(int), CC_DOWN) && v41u_res(&ch->cm_w, (size_t)K, CC_DOWN) &&
                   v41u_res(&ch->cm_hid, cc_moe_hid_floats(1, K, D, I, E), CC_DEV) && v41u_res(&ch->cm_y, (size_t)D, CC_DEV) &&
-                  v41u_res(&ch->cm_hy, (size_t)D, CC_UP) && v41u_res(&ch->cm_yd, (size_t)D, CC_DOWN)))
+                  v41u_res(&ch->cm_hy, (size_t)D, CC_UP) && v41u_res(&ch->cm_yd, (size_t)D, CC_DOWN) &&
+                  v41u_res(&ch->cm_flag, 16, CC_DOWN)))
         why = "device memory for the router and the experts' rows";
     if (!why && !(cc_begin() && cc_write(ch->cm_bias, 0, bias, (size_t)L * E * sizeof(float)) && cc_submit(1)))
         why = "the gate biases did not reach the device";
@@ -692,7 +699,9 @@ static int v41u_cmoe_dev(V41U *ch, Model *m, int i) {
     r.norm = c->norm_topk_prob && K > 1 ? 1 : 0;   /* moe_gate: by the sum + 1e-20 only with norm_topk_prob */
     r.temp = c->gate_temp; r.scale = c->route_scale; r.norm_eps = 1e-20f;
     CcMoe p = v41u_cmoe_args(ch, m, i, 1);
+    /* the routes down, then the word: the host's misses run while cc_moe parts 1 computes the resident experts */
     return cc_matmul(ch->cm_gate[i], ch->nrm, 0, ch->cm_lg, 0, 1) && cc_route(ch->cm_lg, ch->cm_bias, ch->cm_ids, ch->cm_w, &r) &&
+           cc_signal(ch->cm_flag, 0, ++ch->cm_seq) &&
            cc_moe(ch->cm_tab, ch->nrm, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_y, ch->cm_hy, &p);
 }
 /* The host's part of layer i after the device's frame: the routing it made (ids, w back to the
@@ -702,6 +711,74 @@ static int v41u_cmoe_dev(V41U *ch, Model *m, int i) {
  * copy of the same normalized FFN input. A version 1, synchronous: the frame was waited for
  * before this; later the frame's resident experts can overlap this (cc_signal after cc_route,
  * the host's misses while cc_moe parts 1 runs, cc_wait_host before parts 2). */
+/* One row of quant.h's matmul_mxfp4 (its I % 32 == 0 AVX2 branch, S = 1): the same operations in the same order, so a
+ * miss computed here is the bits the one-row matmul_mxfp4 gives (moe_vk_cpu's, for a decode step) */
+static inline float v41u_mx4_dot(const float *xs, const uint8_t *w, const uint8_t *scl, int I) {
+#ifdef __AVX2__
+    const int ng = I / 32;
+    const __m128i lut2 = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12), m4 = _mm_set1_epi8(0x0F);
+    __m256 acc = _mm256_setzero_ps();
+    for (int g = 0; g < ng; g++) {
+        __m128i by = _mm_loadu_si128((const __m128i *)(w + g * 16));
+        __m128i lo = _mm_and_si128(by, m4), hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);
+        __m128i n0 = _mm_shuffle_epi8(lut2, _mm_unpacklo_epi8(lo, hi)), n1 = _mm_shuffle_epi8(lut2, _mm_unpackhi_epi8(lo, hi));
+        const float *xg = xs + g * 32;
+        __m256 ga = _mm256_mul_ps(_mm256_loadu_ps(xg), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(n0)));
+        ga = _mm256_fmadd_ps(_mm256_loadu_ps(xg + 8), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(n0, 8))), ga);
+        ga = _mm256_fmadd_ps(_mm256_loadu_ps(xg + 16), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(n1)), ga);
+        ga = _mm256_fmadd_ps(_mm256_loadu_ps(xg + 24), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(n1, 8))), ga);
+        acc = _mm256_fmadd_ps(ga, _mm256_set1_ps(mx4_scale(scl[g]) * 0.5f), acc);
+    }
+    return hsum256(acc);
+#else
+    float y; matmul_mxfp4(&y, xs, w, scl, 1, I, 1); return y;
+#endif
+}
+/* A decode step's misses of layer i, all of them together (V41_CHAIN_MOE): the experts through the cache at once, then
+ * one parallel loop over every miss's gate and up rows, the clamped SwiGLU per miss (swiglu_into), one over every miss's
+ * down rows; contrib[k] = w[k] * down_k, the tier's notes as moe_vk_cpu's. The bits of moe_vk_cpu's one-row path (each
+ * row v41u_mx4_dot = matmul_mxfp4's), in two OpenMP regions a layer instead of three a miss. 0: not this form (a GGUF
+ * expert, an interleaved slot): the caller takes moe_vk_cpu. */
+static int v41u_cmoe_misses(V41U *ch, Model *m, int i, const float *x, const int *ids, const float *w, const uint8_t *want) {
+    const Cfg *c = &m->c;
+    const int D = c->dim, I = c->moe_inter, K = ch->cm_K;
+    int eid[CC_ROUTE_KMAX], slotk[CC_ROUTE_KMAX], nm = 0;
+    for (int k = 0; k < K; k++) if (want[k]) { eid[nm] = ids[k]; slotk[nm] = k; nm++; }
+    if (!nm) return 1;
+    if (D % 32 || I % 32) return 0;
+    Slot *sl[CC_ROUTE_KMAX];
+    expert_slots_at(m, &m->cache[i], "layers", i, eid, nm, sl);
+    for (int u = 0; u < nm; u++) if (!sl[u] || sl[u]->gt[0] >= 0 || sl[u]->gt[1] >= 0 || sl[u]->gt[2] >= 0 || vk_slot_ilv(sl[u])) return 0;
+    if (!ch->cm_mbuf && !(ch->cm_mbuf = (float *)malloc((size_t)CC_ROUTE_KMAX * (2 * (size_t)I + D) * sizeof(float)))) return 0;
+    float *gu = ch->cm_mbuf, *dn = ch->cm_mbuf + (size_t)CC_ROUTE_KMAX * 2 * I;   /* [miss][gate I | up I], [miss][D] */
+    const double t0 = now_s();
+    const int rb = I / 2, rd = D / 2;   /* the packed row bytes: gate/up rows of D inputs (D/2 bytes), down rows of I (I/2) */
+    #pragma omp parallel for schedule(static)
+    for (int q = 0; q < nm * 2 * I; q++) {
+        const int u = q / (2 * I), r = q - u * 2 * I, up = r >= I, o = up ? r - I : r;
+        const Slot *s = sl[u];
+        const uint8_t *wq = (up ? s->w3 : s->w1) + (size_t)o * rd, *sc = (up ? s->s3 : s->s1) + (size_t)o * (D / 32);
+        gu[(size_t)u * 2 * I + r] = v41u_mx4_dot(x, wq, sc, D);
+    }
+    for (int u = 0; u < nm; u++) swiglu_into(c, gu + (size_t)u * 2 * I, gu + (size_t)u * 2 * I + I, (int64_t)I);
+    #pragma omp parallel for schedule(static)
+    for (int q = 0; q < nm * D; q++) {
+        const int u = q / D, o = q - u * D;
+        const Slot *s = sl[u];
+        dn[(size_t)u * D + o] = v41u_mx4_dot(gu + (size_t)u * 2 * I, s->w2 + (size_t)o * rb, s->s2 + (size_t)o * (I / 32), I);
+    }
+    m->t_expert += now_s() - t0;
+    const int tl = v41_tier_layer(m, "layers", i);
+    for (int u = 0; u < nm; u++) {
+        float *dst = ch->cm_contrib + (size_t)slotk[u] * D;
+        const float wk = w[slotk[u]];
+        for (int d = 0; d < D; d++) dst[d] = wk * dn[(size_t)u * D + d];
+        VktExpertSrc src = vk_slot_src(m, sl[u]);
+        XT(note)(tl, eid[u], &src);
+        vk_drop_rows(sl[u]);
+    }
+    return 1;
+}
 static void v41u_cmoe_host(V41U *ch, Model *m, int i, const float *x, int *ids, float *w) {
     const int D = m->c.dim, E = ch->cm_E, K = ch->cm_K;
     memcpy(ids, cc_ptr(ch->cm_ids), (size_t)K * sizeof(int));
@@ -721,7 +798,9 @@ static void v41u_cmoe_host(V41U *ch, Model *m, int i, const float *x, int *ids, 
     memset(hy, 0, (size_t)D * sizeof(float));
     if (!nmiss) return;
     const double tc0 = now_s();
-    moe_vk_cpu(m, &m->cache[i], "layers", i, K, x, 1, ids, w, want, ch->cm_contrib);
+    if (ch->cm_batch < 0) { const char *e = getenv("V41_CHAIN_MOE_BATCH"); ch->cm_batch = !(e && *e == '0'); }
+    if (!ch->cm_batch || !v41u_cmoe_misses(ch, m, i, x, ids, w, want))   /* V41_CHAIN_MOE_BATCH=0: one miss at a time */
+        moe_vk_cpu(m, &m->cache[i], "layers", i, K, x, 1, ids, w, want, ch->cm_contrib);
     ch->cm_cpu_ms += (now_s() - tc0) * 1e3;
     for (int k = 0; k < K; k++) {   /* rank order, as moe_vk_block's sum */
         if (!want[k]) continue;
@@ -895,7 +974,16 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     int cmoe = 0;
 #if V41U_CMOE
     cmoe = ok && n == 1 && v41u_cmoe_setup(ch, m);
-    if (cmoe) ch->cm_steps++;
+    if (cmoe) {
+        static long warm = -1;   /* V41_CHAIN_MOE_WARM=<n>: the split's books start over after n decode steps (the warm ones) */
+        if (warm < 0) { const char *e = getenv("V41_CHAIN_MOE_WARM"); warm = e && atol(e) > 0 ? atol(e) : 0; }
+        if (warm && ch->cm_steps == (unsigned long long)warm) {
+            ch->cm_steps = 0; ch->cm_layers = 0; ch->cm_dev_slots = ch->cm_host_slots = 0;
+            ch->cm_dev_ms = ch->cm_host_ms = ch->cm_p2_ms = ch->cm_tab_ms = ch->cm_cpu_ms = ch->cm_cnt_ms = 0;
+            ch->cm_wait_ms = 0; warm = 0;
+        }
+        ch->cm_steps++;
+    }
 #endif
     (void)cmoe;
     for (int s0 = 0; ok && !stopped && s0 < n; s0 += per) {   /* a segment's rows through every layer */
@@ -944,6 +1032,21 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
                     if (cc_lost()) ok = 0;
                     else { v41u_cmoe_off(ch, "the device's router or experts refused (cc_matmul/cc_route/cc_moe parts 1)"); cmoe = 0; }
                 }
+#endif
+#if V41U_CMOE
+                if (cmoe) {   /* the frame left running: its word says the routes (and h2d, copied before them) are down */
+                    ok = ok && cc_submit(0);
+                    if (ok) {
+                        const double tw = now_s();
+                        volatile unsigned *fw = (volatile unsigned *)cc_ptr(ch->cm_flag);
+                        for (unsigned long spin = 0; *fw < ch->cm_seq; spin++)
+                            if ((spin & 0xFFFFu) == 0 && (cc_lost() || now_s() - tw > 60.0)) {
+                                fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: the device did not reach layer %d's routes in 60 s\n", i);
+                                ok = 0; break;
+                            }
+                        ch->cm_wait_ms += (now_s() - tw) * 1e3;
+                    }
+                } else
 #endif
                 ok = ok && cc_submit(1);
                 if (ok) memcpy(ch->lw_in + (size_t)lc * D, cc_ptr(ch->h2d), (size_t)nr * D * sizeof(float));
