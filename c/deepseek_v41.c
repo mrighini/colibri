@@ -6060,6 +6060,9 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
         int got = v41_ps_take(m, ids, n_prompt, reuse);
         if (got) { reuse = got; ps_from = 1; g_pin_use_logit = 0; g_pin_logit = NULL; }
     }
+    /* a read-out (logprobs) from a live prefix without its pin photo would start past position 0, which the gateway
+     * refuses by name (engine_pinned_prefix_not_echoed): such a request reads its whole prompt from nothing instead */
+    if (cmd->logprobs > 0 && reuse > 0 && !(g_pin_use_logit && g_pin_logit)) { kv_prefix_clear(&m->kvp); reuse = 0; }
     const int ps_keep = (ps_from || !reuse) && cmd->logprobs == 0 && !had_image;
     if (getenv("COLI_PREFIX_LOG") && !ps_from) {
         if (reuse)
@@ -6127,6 +6130,8 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
             if (g_pin_use_logit && g_pin_logit)
                 v41_echo(cmd->id, reuse, ids[reuse], g_pin_logit, c->vocab,
                          cmd->logprobs, tokenizer);
+            else if (reuse == 0)   /* nothing conditions position 0: colibri.c's and qwen36.c's " nan 0" frame */
+                v41_echo(cmd->id, 0, ids[0], NULL, c->vocab, 0, tokenizer);
             for (int p = 0; p + 1 < nfresh; p++)
                 v41_echo(cmd->id, reuse + p + 1, ids[reuse + p + 1],
                          all + (size_t)p * c->vocab, c->vocab, cmd->logprobs, tokenizer);
