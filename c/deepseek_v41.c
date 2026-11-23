@@ -960,6 +960,48 @@ static size_t v41_b16_preload(const WB *w) {
 #define V41_E4(...)
 static void v41_e4_start(int dev) { (void)dev; }
 #endif
+#include "v41_amx.h"   /* V41_AMX: the prompt pass's products on AMX-BF16 tiles (opt-in, not the AVX2 bits) */
+#if V41_AMX_HAVE
+static void v41_amx_pack_fp8(const void *ctx, int o0, int O, int I, uint16_t *dst) {
+    const W8 *w = (const W8 *)ctx;
+    const int tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
+    for (int n = 0; n < 32; n++) {
+        const int o = o0 + n;
+        if (o >= O) { for (int i = 0; i < I; i++) dst[v41_amx_bidx(n, i)] = 0; continue; }
+        const uint8_t *row = w->q + (size_t)o * I, *sc = w->s + (size_t)(o / FP8_TILE) * tiles_i;
+        for (int i = 0; i < I; i++) dst[v41_amx_bidx(n, i)] = v41_f2bf_exact(e4m3_decode(row[i]) * ue8m0(sc[i / FP8_TILE]));
+    }
+}
+static void v41_amx_pack_bf16(const void *ctx, int o0, int O, int I, uint16_t *dst) {
+    const WB *w = (const WB *)ctx;
+    for (int n = 0; n < 32; n++) {
+        const int o = o0 + n;
+        const uint16_t *row = o < O ? w->w + (size_t)o * I : NULL;
+        for (int i = 0; i < I; i++) dst[v41_amx_bidx(n, i)] = row ? row[i] : 0;
+    }
+}
+typedef struct { const uint8_t *q4, *e8s; } V41Mx4;
+static void v41_amx_pack_mxfp4(const void *ctx, int o0, int O, int I, uint16_t *dst) {
+    const V41Mx4 *w = (const V41Mx4 *)ctx;
+    const int rb = (I + 1) / 2, ng = (I + 31) / 32;
+    for (int n = 0; n < 32; n++) {
+        const int o = o0 + n;
+        if (o >= O) { for (int i = 0; i < I; i++) dst[v41_amx_bidx(n, i)] = 0; continue; }
+        const uint8_t *row = w->q4 + (size_t)o * rb, *sc = w->e8s + (size_t)o * ng;
+        for (int i = 0; i < I; i++) {
+            const uint8_t byte = row[i >> 1];
+            dst[v41_amx_bidx(n, i)] = v41_f2bf_exact(mx4_lut[(i & 1) ? byte >> 4 : byte & 0xF] * mx4_scale(sc[i >> 5]));
+        }
+    }
+}
+#define V41_AMX_FP8(y, ys, w, x, xs, rows) \
+    if ((rows) >= 2 && !(w)->gx && v41_amx_gemm(y, ys, x, xs, rows, (w)->I, (w)->O, v41_amx_pack_fp8, (w))) return;
+#define V41_AMX_BF16(y, ys, w, x, xs, rows) \
+    if ((rows) >= 2 && !(w)->gx && (w)->w && v41_amx_gemm(y, ys, x, xs, rows, (w)->I, (w)->O, v41_amx_pack_bf16, (w))) return;
+#else
+#define V41_AMX_FP8(...)
+#define V41_AMX_BF16(...)
+#endif
 static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
     if (w->gx) { V41_CU(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows) v41_gx_rows(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows); return; }
 #ifdef COLI_VULKAN
@@ -967,6 +1009,7 @@ static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xst
     v41_dho_host(w->q);
 #endif
     V41_E4(y, ystride, w, x, xstride, rows)
+    V41_AMX_FP8(y, ystride, w, x, xstride, rows)
     mv8_rows_cpu(y, ystride, w, x, xstride, rows);
 }
 static void mv8_rows_cpu(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
@@ -1061,6 +1104,7 @@ static void mvb_rows(float *y, int ystride, const WB *w, const float *x, int xst
     v41_dho_host(w->w);
 #endif
     V41_B16(y, ystride, w, x, xstride, rows)
+    V41_AMX_BF16(y, ystride, w, x, xstride, rows)
     for (int r = 0; r < rows; r++) mvb_cpu(y + (size_t)r * ystride, w, x + (size_t)r * xstride);
 }
 
@@ -3320,6 +3364,9 @@ static void swiglu_into(const Cfg *c, float *gate, const float *up, int64_t coun
 /* One of an expert's matrices: FP4 and scales (type -1), or a GGUF's ggml blocks. */
 static void expert_mat(float *y, const uint8_t *w, const uint8_t *scales, int type,
                        const float *x, int rows, int I, int O) {
+#if V41_AMX_HAVE
+    if (type < 0 && rows >= 2) { V41Mx4 mx = { w, scales }; if (v41_amx_gemm(y, O, x, I, rows, I, O, v41_amx_pack_mxfp4, &mx)) return; }
+#endif
     if (type < 0) matmul_mxfp4(y, x, w, scales, rows, I, O);
     else v41_gx_rows(y, O, w, type, O, I, x, I, rows);
 }
