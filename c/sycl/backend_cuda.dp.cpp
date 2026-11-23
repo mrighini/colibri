@@ -6165,6 +6165,12 @@ __dpct_inline__ float mx4_d2(unsigned n) {
     return (float)((n & 8u) ? -v : v);
 }
 /* fmt 7: a ue8m0 byte's 2^(s-127) (mx4_scale_dev's bits) halved, undoing mx4_d2's doubling */
+__dpct_inline__ float mx4_moe_scale(uint8_t s);
+/* fmt 7's scale i of a matrix: CcMoe.gs 32 = the tier's form (vk_tier.c turns each ue8m0 into the float 2^(s-127),
+ * one a 32 inputs: halved here like the byte), else the backend's (ue8m0 bytes, coli_cuda_tensor_upload) */
+__dpct_inline__ float mx4_sc(const float *sc, size_t i, int gs) {
+    return gs == 32 ? sc[i] * 0.5f : mx4_moe_scale(reinterpret_cast<const uint8_t *>(sc)[i]);
+}
 __dpct_inline__ float mx4_moe_scale(uint8_t s) {
     return sycl::bit_cast<float>((uint32_t)s << 23) * 0.5f;
 }
@@ -6211,8 +6217,7 @@ moe_lane_dot(const uint8_t *__restrict__ row, const float *__restrict__ sc,
             }
             acc += part * sc[(size_t)(o >> 7) * nb + (b0 >> 7)];
         }
-    } else if (FMT == 7) {   /* ng = n / 32 ue8m0 bytes a row; a lane's 16 columns sit in group i0 / 32 */
-        const uint8_t *sb = reinterpret_cast<const uint8_t *>(sc) + (size_t)o * ng;
+    } else if (FMT == 7) {   /* ng = n / 32 scales a row (mx4_sc: bytes or the tier's floats); a lane's 16 columns sit in group i0 / 32 */
         for (int i0 = lane * 16; i0 < n; i0 += SG * 16) {
             sycl::uint2 v =
                 *reinterpret_cast<const sycl::uint2 *>(row + i0 / 2);
@@ -6222,7 +6227,7 @@ moe_lane_dot(const uint8_t *__restrict__ row, const float *__restrict__ sc,
                 unsigned bb = ((k < 4 ? v.x() : v.y()) >> (8 * (k & 3))) & 255u;
                 part += xs[i0 + 2 * k] * mx4_d2(bb) + xs[i0 + 2 * k + 1] * mx4_d2(bb >> 4);
             }
-            acc += part * mx4_moe_scale(sb[i0 >> 5]);
+            acc += part * mx4_sc(sc, (size_t)o * ng + (i0 >> 5), gs);
         }
     }
     return acc;
@@ -6527,8 +6532,8 @@ static void moe_gv_gu_k(const CcExpert *__restrict__ tab,
                     g += mg_step<FMT>(vg, q, xs) * ke[k].gs[gi]; uu += mg_step<FMT>(vu, q, xs) * ke[k].us[gi];
                 } else if (FMT == 7) {   /* step q is group q: nq ue8m0 bytes a row */
                     size_t gi = (size_t)o * nq + q;
-                    g += mg_step<FMT>(vg, q, xs) * mx4_moe_scale(reinterpret_cast<const uint8_t *>(ke[k].gs)[gi]);
-                    uu += mg_step<FMT>(vu, q, xs) * mx4_moe_scale(reinterpret_cast<const uint8_t *>(ke[k].us)[gi]);
+                    g += mg_step<FMT>(vg, q, xs) * mx4_sc(ke[k].gs, gi, p.gs);
+                    uu += mg_step<FMT>(vu, q, xs) * mx4_sc(ke[k].us, gi, p.gs);
                 } else { g += mg_step<FMT>(vg, q, xs); uu += mg_step<FMT>(vu, q, xs); }
             }
         }
@@ -6576,7 +6581,7 @@ static void moe_gv_dn_k(const CcExpert *__restrict__ tab,
             for (int q = ql; q < nq; q += lpr) {
                 float d = mg_step<FMT>(wd[q], q, xs);
                 v += FMT == 4 ? d * ex.ds[oc * ng + (q * 32) / p.gs]
-                   : FMT == 7 ? d * mx4_moe_scale(reinterpret_cast<const uint8_t *>(ex.ds)[(size_t)oc * nq + q])
+                   : FMT == 7 ? d * mx4_sc(ex.ds, (size_t)oc * nq + q, p.gs)
                    : d;
             }
         }

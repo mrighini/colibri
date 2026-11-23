@@ -125,25 +125,43 @@ static void suite(int dev, int D, int I) {
         }
     }
 
+    /* the tier's form of the same experts: each ue8m0 byte as the float 2^(s-127) (vk_tier.c), in device buffers whose
+     * addresses replace the scale pointers; cc_moe reads them with CcMoe.gs 32 (the bytes with gs 0) */
+    std::vector<CcBuf *> fsb;
+    auto fscales = [&](const Mat &m) -> const float * {
+        std::vector<float> f(m.s.size());
+        for (size_t i = 0; i < f.size(); i++) f[i] = (float)std::ldexp(1.0, (int)m.s[i] - 127);
+        CcBuf *b = up(f.data(), f.size() * 4);
+        fsb.push_back(b);
+        return (const float *)T->dev_addr(b);
+    };
+    std::vector<CcExpert> tabf = tab;
+    for (int e = 0; e < E; e++) { CcExpert &x = tabf[2 + e]; x.gs = fscales(G[e]); x.us = fscales(U[e]); x.ds = fscales(Dn[e]);
+                                  require(x.gs && x.us && x.ds, "float scales' device addresses"); }
+    std::vector<CcExpert> partf = tabf;
+    std::memset(&partf[2 + host_a], 0, sizeof(CcExpert)); std::memset(&partf[2 + host_b], 0, sizeof(CcExpert));
     CcBuf *tb = up(tab.data(), tab.size() * sizeof(CcExpert)), *pb = up(part.data(), part.size() * sizeof(CcExpert));
+    CcBuf *tbf = up(tabf.data(), tabf.size() * sizeof(CcExpert)), *pbf = up(partf.data(), partf.size() * sizeof(CcExpert));
     CcBuf *xb = up(x.data(), x.size() * 4), *ib = up(ids, sizeof ids), *wb = up(w.data(), w.size() * 4);
     CcBuf *hyb = up(hy.data(), hy.size() * 4, CC_UP);
     CcBuf *hb = T->buf(cc_moe_hid_floats(SM, K, D, I, E) * 4, CC_DEV), *yb = T->buf(((size_t)SM * D + 8) * 4, CC_DEV);
     require(hb && yb, "hid and y buffers");
     std::vector<float> y((size_t)SM * D + 8);
+    for (int fs = 0; fs < 2; fs++)
     for (int act = 0; act < 2; act++)
         for (int S : {1, 2, 4})
             for (int split = 0; split < 2; split++) {   /* 0: parts 3, every expert on the device; 1: parts 1 then 2, the host's two */
                 CcMoe m; std::memset(&m, 0, sizeof m);
-                m.S = S; m.K = K; m.D = D; m.I = I; m.fmt = 7; m.gs = 32; m.act = act; m.parts = 3;
+                m.S = S; m.K = K; m.D = D; m.I = I; m.fmt = 7; m.gs = fs ? 32 : 0; m.act = act; m.parts = 3;
+                CcBuf *t3 = fs ? tbf : tb, *t12 = fs ? pbf : pb;
                 m.t_off = 2; m.x_off = 4; m.x_row = D; m.i_off = 0; m.i_row = K; m.w_off = 0; m.w_row = K;
                 m.y_off = 8; m.y_row = D; m.h_off = -1; m.E = E; m.act_lim = act ? lim : 0.f;
                 int ok;
-                if (!split) ok = T->begin() && T->moe(tb, xb, ib, wb, hb, yb, NULL, &m) && T->submit(1);
+                if (!split) ok = T->begin() && T->moe(t3, xb, ib, wb, hb, yb, NULL, &m) && T->submit(1);
                 else {
                     CcMoe m1 = m, m2 = m; m1.parts = 1; m2.parts = 2; m2.h_off = 0;
-                    ok = T->begin() && T->moe(pb, xb, ib, wb, hb, yb, hyb, &m1) && T->submit(0) &&
-                         T->begin() && T->moe(pb, xb, ib, wb, hb, yb, hyb, &m2) && T->submit(1);
+                    ok = T->begin() && T->moe(t12, xb, ib, wb, hb, yb, hyb, &m1) && T->submit(0) &&
+                         T->begin() && T->moe(t12, xb, ib, wb, hb, yb, hyb, &m2) && T->submit(1);
                 }
                 ok = ok && T->read(yb, 0, y.data(), y.size() * 4);
                 double me = 0, mr = 0;
@@ -164,13 +182,16 @@ static void suite(int dev, int D, int I) {
                 const double rel = mr > 0 ? me / mr : me;
                 const bool reached = act == 0 || nh > 0;   /* act 1 must have met its limit, or it tested nothing */
                 const bool pass = ok && rel < 2e-5 && reached;
-                std::printf("MOE7 D=%d I=%d S=%d K=%d act=%d%s parts=%s: max|err|/max|ref| = %.3g (max|ref| %.4g)%s %s\n", D, I, S, K, act,
+                std::printf("MOE7 D=%d I=%d S=%d K=%d %s act=%d%s parts=%s: max|err|/max|ref| = %.3g (max|ref| %.4g)%s %s\n", D, I, S, K,
+                            fs ? "scales f32 (the tier's, gs 32)" : "scales ue8m0 (gs 0)", act,
                             act ? " lim=7" : "", split ? "1+2 host rows" : "3", rel, mr,
                             act ? (nh ? "" : " [limit never reached]") : "", pass ? "ok" : ok ? "FAIL" : "FAIL (the call or frame failed)");
                 if (act) std::printf("MOE7   clamps in the rows' gate/up: %ld\n", nh);
                 std::fflush(stdout);
                 if (!pass) fails++;
             }
+    for (CcBuf *b : fsb) T->free(b);
+    T->free(tbf); T->free(pbf);
     T->free(tb); T->free(pb); T->free(xb); T->free(ib); T->free(wb); T->free(hyb); T->free(hb); T->free(yb);
     for (int e = 0; e < E; e++) { coli_cuda_tensor_free(G[e].t); coli_cuda_tensor_free(U[e].t); coli_cuda_tensor_free(Dn[e].t); }
 }
