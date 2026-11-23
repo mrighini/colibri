@@ -58,6 +58,48 @@ static void v41_mv8_pair(float *y, int ystride, const uint8_t *q, const uint8_t 
     }
     for (int r = 0; r < nr; r++) { y[(size_t)(r0 + r) * ystride + o] = s0[r]; y[(size_t)(r0 + r) * ystride + o + 1] = s1[r]; }
 }
+/* quant.h's matmul_mxfp4 (I % 32 == 0 branch) for outputs o and o+1 over all S rows, with its bits. That loop, per
+ * output and row: acc = 0; per 32-column group: the nibbles to doubled e2m1 int8 (pshufb), ga = x0*w0 (a multiply),
+ * fma(x1,w1,ga), fma(x2,w2,ga), fma(x3,w3,ga); acc = fma(ga, scale*0.5, acc); y = hsum256(acc). Here the low half is
+ * o and the high half o+1 -- each with its own group scale -- and every lane goes through the same operations. */
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,fma")))
+static void v41_mx4_pair(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s, int S, int I, int O, int o) {
+    const int rb = (I + 1) / 2, ng = (I + 31) / 32;
+    const uint8_t *w0 = q4 + (int64_t)o * rb, *w1 = w0 + rb, *c0 = e8s + (int64_t)o * ng, *c1 = c0 + ng;
+    const __m128i lut2 = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12), m4 = _mm_set1_epi8(0x0F);
+    for (int s0 = 0; s0 < S; s0 += 8) {   /* up to 8 rows share each group's decode; each row keeps its own chain */
+        const int ns = S - s0 < 8 ? S - s0 : 8;
+        __m512 acc[8];
+        for (int r = 0; r < ns; r++) acc[r] = _mm512_setzero_ps();
+        for (int g = 0; g < ng; g++) {
+            const __m128i b0 = _mm_loadu_si128((const __m128i *)(w0 + g * 16)), b1 = _mm_loadu_si128((const __m128i *)(w1 + g * 16));
+            const __m128i l0 = _mm_and_si128(b0, m4), h0 = _mm_and_si128(_mm_srli_epi16(b0, 4), m4);
+            const __m128i l1 = _mm_and_si128(b1, m4), h1 = _mm_and_si128(_mm_srli_epi16(b1, 4), m4);
+            const __m128i a0 = _mm_shuffle_epi8(lut2, _mm_unpacklo_epi8(l0, h0)), a1 = _mm_shuffle_epi8(lut2, _mm_unpackhi_epi8(l0, h0));
+            const __m128i e0 = _mm_shuffle_epi8(lut2, _mm_unpacklo_epi8(l1, h1)), e1 = _mm_shuffle_epi8(lut2, _mm_unpackhi_epi8(l1, h1));
+            /* 8 columns of o (low) and the same 8 of o+1 (high) */
+            const __m512 wk0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_unpacklo_epi64(a0, e0)));
+            const __m512 wk1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_unpackhi_epi64(a0, e0)));
+            const __m512 wk2 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_unpacklo_epi64(a1, e1)));
+            const __m512 wk3 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_unpackhi_epi64(a1, e1)));
+            const union { uint32_t u; float f; } c0v = { (uint32_t)c0[g] << 23 }, c1v = { (uint32_t)c1[g] << 23 };
+            const __m512 sc = _mm512_insertf32x8(_mm512_set1_ps(c0v.f * 0.5f), _mm256_set1_ps(c1v.f * 0.5f), 1);
+            for (int r = 0; r < ns; r++) {
+                const float *xg = x + (int64_t)(s0 + r) * I + g * 32;
+                __m512 ga = _mm512_mul_ps(_mm512_broadcast_f32x8(_mm256_loadu_ps(xg)), wk0);
+                ga = _mm512_fmadd_ps(_mm512_broadcast_f32x8(_mm256_loadu_ps(xg + 8)), wk1, ga);
+                ga = _mm512_fmadd_ps(_mm512_broadcast_f32x8(_mm256_loadu_ps(xg + 16)), wk2, ga);
+                ga = _mm512_fmadd_ps(_mm512_broadcast_f32x8(_mm256_loadu_ps(xg + 24)), wk3, ga);
+                acc[r] = _mm512_fmadd_ps(ga, sc, acc[r]);
+            }
+        }
+        for (int r = 0; r < ns; r++) {
+            const __m512 h = v41_hsum2(acc[r]);
+            y[(int64_t)(s0 + r) * O + o] = _mm512_cvtss_f32(h);
+            y[(int64_t)(s0 + r) * O + o + 1] = _mm512_cvtss_f32(_mm512_shuffle_f32x4(h, h, 2));
+        }
+    }
+}
 #else
 #define V41_MV8_512_HAVE 0
 #endif

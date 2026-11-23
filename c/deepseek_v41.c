@@ -3363,6 +3363,22 @@ static void expert_mat(float *y, const uint8_t *w, const uint8_t *scales, int ty
 #if V41_AMX_HAVE
     if (type < 0 && rows >= 2) { V41Mx4 mx = { w, scales }; if (v41_amx_gemm(y, O, x, I, rows, I, O, v41_amx_dec_mxfp4, &mx)) return; }
 #endif
+#if V41_MV8_512_HAVE
+    /* v41_mv8_512.h: matmul_mxfp4's bits, two outputs a zmm, each group decoded once for up to 8 rows; from 2 rows
+     * (one row stays matmul_mxfp4's: there the pairs measured 11 % slower, tests/bench_mv8_512.c) */
+    if (type < 0 && rows >= 2 && !(I % 32) && O >= 2 && v41_mv8_512_on()) {
+        const int pairs = O / 2;
+        #pragma omp parallel for schedule(static)
+        for (int p = 0; p < pairs; p++) v41_mx4_pair(y, x, w, scales, rows, I, O, 2 * p);
+        if (O & 1) {   /* the odd last output: matmul_mxfp4 itself on that one row of weights */
+            float *t = xmalloc((size_t)rows * sizeof(float), "expert tail");
+            matmul_mxfp4(t, x, w + (size_t)(O - 1) * (I / 2), scales + (size_t)(O - 1) * (I / 32), rows, I, 1);
+            for (int r = 0; r < rows; r++) y[(size_t)r * O + O - 1] = t[r];
+            free(t);
+        }
+        return;
+    }
+#endif
     if (type < 0) matmul_mxfp4(y, x, w, scales, rows, I, O);
     else v41_gx_rows(y, O, w, type, O, I, x, I, rows);
 }
