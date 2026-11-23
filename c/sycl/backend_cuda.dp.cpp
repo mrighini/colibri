@@ -6150,11 +6150,24 @@ extern "C" int coli_cuda_load_module(void) {
  * formats are the CUDA tier's: 1 int8 rows and 2 int4 rows (a scale per row), 4 int4
  * with a scale per gs inputs (gs a multiple of 16: a lane's 16 weights sit in one
  * group), 8 fp8-e4m3 with a scale per 128 x 128 block (a warp's 128 weights a step sit
- * in one), its values from a shared copy of c_e4m3. The sums are the CPU's up to the
- * order of the float additions. */
+ * in one), its values from a shared copy of c_e4m3; 7 MXFP4 (quant.h's matmul_mxfp4: e2m1
+ * nibbles as doubled exact integers, a 16-column chunk inside one 32-column group, its sum
+ * times the group's ue8m0 scale halved -- the scales are BYTES behind CcExpert's float
+ * pointers). The sums are the CPU's up to the order of the float additions. */
 #define MOE_RPW 2
 #define MOE_ROWS(wpb) ((wpb) * MOE_RPW)   /* output rows a block: a sub-group ("warp") MOE_RPW of them */
 #define MOE_DIM_MAX CC_MOE_DIM_MAX
+/* fmt 7: an e2m1 nibble (the low 4 bits of n; bit 3 the sign, bits 0..2 index
+ * {0,.5,1,1.5,2,3,4,6}) as TWICE its value, an exact small integer from the packed
+ * nibbles of 0xC8643210 (0,1,2,3,4,6,8,12); the 0.5 rides the group's scale (mx4_moe_scale) */
+__dpct_inline__ float mx4_d2(unsigned n) {
+    int v = (int)((0xC8643210u >> (4u * (n & 7u))) & 15u);
+    return (float)((n & 8u) ? -v : v);
+}
+/* fmt 7: a ue8m0 byte's 2^(s-127) (mx4_scale_dev's bits) halved, undoing mx4_d2's doubling */
+__dpct_inline__ float mx4_moe_scale(uint8_t s) {
+    return sycl::bit_cast<float>((uint32_t)s << 23) * 0.5f;
+}
 /* row o's dot with xs (n inputs), this lane's share; FMT 2/4 scaled by group here, 1/2/8
  * by row or block where noted */
 template <int FMT, int SG>
@@ -6198,6 +6211,19 @@ moe_lane_dot(const uint8_t *__restrict__ row, const float *__restrict__ sc,
             }
             acc += part * sc[(size_t)(o >> 7) * nb + (b0 >> 7)];
         }
+    } else if (FMT == 7) {   /* ng = n / 32 ue8m0 bytes a row; a lane's 16 columns sit in group i0 / 32 */
+        const uint8_t *sb = reinterpret_cast<const uint8_t *>(sc) + (size_t)o * ng;
+        for (int i0 = lane * 16; i0 < n; i0 += SG * 16) {
+            sycl::uint2 v =
+                *reinterpret_cast<const sycl::uint2 *>(row + i0 / 2);
+            float part = 0.f;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                unsigned bb = ((k < 4 ? v.x() : v.y()) >> (8 * (k & 3))) & 255u;
+                part += xs[i0 + 2 * k] * mx4_d2(bb) + xs[i0 + 2 * k + 1] * mx4_d2(bb >> 4);
+            }
+            acc += part * mx4_moe_scale(sb[i0 >> 5]);
+        }
     }
     return acc;
 }
@@ -6208,7 +6234,19 @@ __dpct_inline__ float moe_warp_sum(float v) {
 }
 template <int FMT>
 __dpct_inline__ size_t moe_row_bytes(int n) {
-    return FMT == 2 || FMT == 4 ? (size_t)n / 2 : (size_t)n;
+    return FMT == 2 || FMT == 4 || FMT == 7 ? (size_t)n / 2 : (size_t)n;
+}
+/* the experts' activation of gate g and up u (CcMoe.act): 0 silu(g) * u; 1 the clamped SwiGLU
+ * of deepseek_v41.c's swiglu_into, the same comparisons in the same order: u to [-lim, lim],
+ * g to at most lim (no lower bound), then silu(g) * u */
+__dpct_inline__ float moe_act(float g, float u, const CcMoe &p) {
+    if (p.act == 1) {
+        const float lim = p.act_lim;
+        if (u > lim) u = lim;
+        if (u < -lim) u = -lim;
+        if (g > lim) g = lim;
+    }
+    return (g / (1.f + sycl::native::exp(-g))) * u;
 }
 
 /* gate and up for pair a = blockIdx.y (row a / K, slot a % K): hid[a][o] = silu(g) * u */
@@ -6231,7 +6269,7 @@ static void moe_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__
     item_ct1.barrier();
     int lane = item_ct1.get_local_id(2) & (SG - 1),
         warp = item_ct1.get_local_id(2) / SG,
-        ng = FMT == 4 ? (p.D + p.gs - 1) / p.gs : 1;
+        ng = FMT == 4 ? (p.D + p.gs - 1) / p.gs : FMT == 7 ? p.D / 32 : 1;
     size_t rb = moe_row_bytes<FMT>(p.D);
     for (int r = 0; r < MOE_RPW; r++) {
         int o = item_ct1.get_group(2) * MOE_ROWS(256 / SG) + r * (256 / SG) + warp;
@@ -6240,7 +6278,7 @@ static void moe_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__
         float u = moe_warp_sum<SG>(moe_lane_dot<FMT, SG>((const uint8_t *)ex.u + o * rb, ex.us, p.gs, ng, o, p.D, xs, slut));
         if (lane == 0) {
             if (FMT == 1 || FMT == 2) { g *= ex.gs[o]; u *= ex.us[o]; }
-            hid[(size_t)a * p.I + o] = (g / (1.f + sycl::native::exp(-g))) * u;
+            hid[(size_t)a * p.I + o] = moe_act(g, u, p);
         }
     }
 }
@@ -6264,7 +6302,7 @@ static void moe_dn_k(const CcExpert *__restrict__ tab,
     item_ct1.barrier();
     int lane = item_ct1.get_local_id(2) & (SG - 1),
         warp = item_ct1.get_local_id(2) / SG,
-        ng = FMT == 4 ? (p.I + p.gs - 1) / p.gs : 1;
+        ng = FMT == 4 ? (p.I + p.gs - 1) / p.gs : FMT == 7 ? p.I / 32 : 1;
     size_t rb = moe_row_bytes<FMT>(p.I), dn = (size_t)p.S * p.K * p.I;
     for (int r = 0; r < MOE_RPW; r++) {
         int o = item_ct1.get_group(2) * MOE_ROWS(256 / SG) + r * (256 / SG) + warp;
@@ -6381,7 +6419,8 @@ static void moe_rows_sum_k(const float *__restrict__ w, const float *__restrict_
  * conflict), each output row lpr lanes of 16-byte weight steps, gate and up in the same loop,
  * the lanes joined by shuffles. moe_gu_k and moe_dn_k took a warp a row with 8-byte steps
  * and lanes 16 floats apart: GLM-5.2's eight int4-g64 experts (6144 x 2048) 537 us a step on
- * an RTX PRO 4000. Formats 1, 2 and 4 (the CUDA tier's signed nibbles, weight 2j low), rows
+ * an RTX PRO 4000. Formats 1, 2 and 4 (the CUDA tier's signed nibbles, weight 2j low) and 7
+ * (MXFP4: a 16-byte step is one 32-column group, its sum times the group's halved ue8m0 scale), rows
  * 16-byte aligned (cudaMalloc'd tensors), the staged row within 48 KiB; else moe_launch. */
 #define MOE_GV_SMEM (49152 - 4096)   /* the staged row's dynamic shared memory: the slots' table beside it */
 static inline int moe_gv_lanes(int fmt, int n, int sg) {   /* about eight 16-byte steps a lane, 1 to the sub-group */
@@ -6409,7 +6448,15 @@ __dpct_inline__ float mg_dot8w(unsigned w, const sycl::float4 a) {
     return a.x() * mg_s8(w, 0) + a.y() * mg_s8(w, 1) + a.z() * mg_s8(w, 2) +
            a.w() * mg_s8(w, 3);
 }
-/* one 16-byte step q of a row against the staged row: 16 int8 or 32 int4 weights */
+/* fmt 7: a word's eight e2m1 nibbles (column order, low first) as doubled values, against 8 inputs */
+__dpct_inline__ float mg_dot4m(unsigned w, const sycl::float4 a,
+                               const sycl::float4 b) {
+    return a.x() * mx4_d2(w) + a.y() * mx4_d2(w >> 4) + a.z() * mx4_d2(w >> 8) +
+           a.w() * mx4_d2(w >> 12) + b.x() * mx4_d2(w >> 16) + b.y() * mx4_d2(w >> 20) +
+           b.z() * mx4_d2(w >> 24) + b.w() * mx4_d2(w >> 28);
+}
+/* one 16-byte step q of a row against the staged row: 16 int8 or 32 int4 weights, or 32 e2m1
+ * ones (fmt 7: doubled, unscaled; the caller multiplies by the group's mx4_moe_scale) */
 template <int FMT>
 __dpct_inline__ float mg_step(sycl::uint4 v, int q, const sycl::float4 *xs) {
     if (FMT == 1) {
@@ -6419,6 +6466,11 @@ __dpct_inline__ float mg_step(sycl::uint4 v, int q, const sycl::float4 *xs) {
                mg_dot8w(v.w(), xs[mgx(b + 3)]);
     }
     int b = q * 8;
+    if (FMT == 7)
+        return mg_dot4m(v.x(), xs[mgx(b)], xs[mgx(b + 1)]) +
+               mg_dot4m(v.y(), xs[mgx(b + 2)], xs[mgx(b + 3)]) +
+               mg_dot4m(v.z(), xs[mgx(b + 4)], xs[mgx(b + 5)]) +
+               mg_dot4m(v.w(), xs[mgx(b + 6)], xs[mgx(b + 7)]);
     return mg_dot4w(v.x(), xs[mgx(b)], xs[mgx(b + 1)]) +
            mg_dot4w(v.y(), xs[mgx(b + 2)], xs[mgx(b + 3)]) +
            mg_dot4w(v.z(), xs[mgx(b + 4)], xs[mgx(b + 5)]) +
@@ -6473,14 +6525,17 @@ static void moe_gv_gu_k(const CcExpert *__restrict__ tab,
                 if (FMT == 4) {
                     int gi = o * ng + (q * 32) / p.gs;
                     g += mg_step<FMT>(vg, q, xs) * ke[k].gs[gi]; uu += mg_step<FMT>(vu, q, xs) * ke[k].us[gi];
+                } else if (FMT == 7) {   /* step q is group q: nq ue8m0 bytes a row */
+                    size_t gi = (size_t)o * nq + q;
+                    g += mg_step<FMT>(vg, q, xs) * mx4_moe_scale(reinterpret_cast<const uint8_t *>(ke[k].gs)[gi]);
+                    uu += mg_step<FMT>(vu, q, xs) * mx4_moe_scale(reinterpret_cast<const uint8_t *>(ke[k].us)[gi]);
                 } else { g += mg_step<FMT>(vg, q, xs); uu += mg_step<FMT>(vu, q, xs); }
             }
         }
         g = mg_lanes_sum(g, lpr); uu = mg_lanes_sum(uu, lpr);
         if (ql == 0 && live) {
-            if (FMT != 4) { g *= ke[k].gs[o]; uu *= ke[k].us[o]; }
-            hid[((size_t)s * p.K + k) * p.I + o] =
-                (g / (1.f + sycl::native::exp(-g))) * uu;
+            if (FMT != 4 && FMT != 7) { g *= ke[k].gs[o]; uu *= ke[k].us[o]; }
+            hid[((size_t)s * p.K + k) * p.I + o] = moe_act(g, uu, p);
         }
     }
 }
@@ -6520,11 +6575,13 @@ static void moe_gv_dn_k(const CcExpert *__restrict__ tab,
             const sycl::uint4 *wd = (const sycl::uint4 *)ex.d + (size_t)oc * nq;
             for (int q = ql; q < nq; q += lpr) {
                 float d = mg_step<FMT>(wd[q], q, xs);
-                v += FMT == 4 ? d * ex.ds[oc * ng + (q * 32) / p.gs] : d;
+                v += FMT == 4 ? d * ex.ds[oc * ng + (q * 32) / p.gs]
+                   : FMT == 7 ? d * mx4_moe_scale(reinterpret_cast<const uint8_t *>(ex.ds)[(size_t)oc * nq + q])
+                   : d;
             }
         }
         v = mg_lanes_sum(v, lpr);
-        if (ql == 0 && live) hid[dn + (size_t)j * p.D + o] = FMT != 4 ? v * ex.ds[oc] : v;
+        if (ql == 0 && live) hid[dn + (size_t)j * p.D + o] = FMT != 4 && FMT != 7 ? v * ex.ds[oc] : v;
     }
 }
 static int moe_gv_sg(const DeviceContext *ctx) {
@@ -6703,8 +6760,7 @@ moe_bd_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__ x,
             for (int q = ql; q < nq; q += lpr) { bdi_step<TG, 1>(wg, (bd_u32)q, X, 1, tb, &g); bdi_step<TG, 1>(wu, (bd_u32)q, X, 1, tb, &uu); }
         }
         g = mg_lanes_sum(g, lpr); uu = mg_lanes_sum(uu, lpr);
-        if (ql == 0 && live) hid[((size_t)s * p.K + k) * p.I + o] =
-            (g / (1.f + sycl::native::exp(-g))) * uu;
+        if (ql == 0 && live) hid[((size_t)s * p.K + k) * p.I + o] = moe_act(g, uu, p);
     }
 }
 
@@ -6837,7 +6893,7 @@ static int moe_bd_launch(DeviceContext *ctx, const CcExpert *tab,
 static int moe_gv_ok(const CcMoe *p) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_MOE_GV"); on = !(e && *e == '0'); }
-    return on && (p->fmt == 1 || p->fmt == 2 || (p->fmt == 4 && p->gs % 32 == 0)) && p->K <= CC_ROUTE_KMAX &&
+    return on && (p->fmt == 1 || p->fmt == 2 || (p->fmt == 4 && p->gs % 32 == 0) || p->fmt == 7) && p->K <= CC_ROUTE_KMAX &&
            moe_gv_smem(p->D) <= MOE_GV_SMEM && moe_gv_smem(p->I) <= MOE_GV_SMEM;
 }
 
@@ -6896,7 +6952,9 @@ extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, i
 extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream) {
     if (fault_injected()) return 0;
-    if (!tab || !ids || !hid || !p || p->S < 1 || p->K < 1 || p->D < 32 || p->I < 32 || p->D % 32 || p->I % 32 || p->act) return 0;
+    if (!tab || !ids || !hid || !p || p->S < 1 || p->K < 1 || p->D < 32 || p->I < 32 || p->D % 32 || p->I % 32) return 0;
+    /* act 0 silu(gate) * up; act 1 the clamped SwiGLU (moe_act), its limit act_lim > 0 (NaN refused) */
+    if (p->act != 0 && !(p->act == 1 && p->act_lim > 0.f)) return 0;
     const int LS = p->lay_S > 0 ? p->lay_S : p->S;   /* the rows hid's layout is for: a part 1's, its rows' sums' (CcMoe.lay_S) */
     if (p->lay_S < 0 || p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
     if (p->fmt >= 100) {   /* a GGUF's experts: every row on the GEMV kernels (a prompt chunk's went through the
@@ -6924,7 +6982,8 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
         return 1;
     }
     if (p->fmt == 4 && (p->gs < 16 || p->gs % 16)) return 0;
-    if (p->fmt != 1 && p->fmt != 2 && p->fmt != 4 && p->fmt != 8) return 0;
+    /* fmt 7 (MXFP4, the scales ue8m0 bytes behind CcExpert's float pointers): the GEMV kernels alone */
+    if (p->fmt != 1 && p->fmt != 2 && p->fmt != 4 && p->fmt != 7 && p->fmt != 8) return 0;
     if (p->D > MOE_DIM_MAX || p->I > MOE_DIM_MAX) return 0;   /* an input row in 48 KiB of shared memory, the fp8 table beside it */
     DeviceContext *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
@@ -6932,9 +6991,11 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
     /* a prompt chunk's rows through the matrix engines (sorted by expert: coli_sycl_xmx_moe, the f16
      * joint_matrix tiles where hcg's and tcg's tensor-core tiles were), where the profile has the
      * shape and the family takes the format and the widths (whole steps of 64); else, and for a
-     * decode step, the warp kernels per (row, slot) */
+     * decode step, the warp kernels per (row, slot). The engines' epilogue is act 0's alone: an act 1
+     * call's rows take the warp kernels (a parts 2 call must pass the act its parts 1 had, as every
+     * other field, for the layout to agree) */
     const coli_sycl_profile &prof = coli_sycl_profile_for(device);
-    int rows = LS > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && p->D % XMX_BK == 0 && p->I % XMX_BK == 0 &&
+    int rows = LS > CC_MOE_FRAME_ROWS && p->act == 0 && p->E > 0 && p->E <= 4096 && p->D % XMX_BK == 0 && p->I % XMX_BK == 0 &&
                (p->fmt == 1 || p->fmt == 2 || (p->fmt == 4 && p->gs >= 16 && p->gs % 16 == 0)) &&
                (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0 && xmx_engines(prof) && coli_sycl_xmx_moe_ok(prof, *p);
     if (LS > CC_MOE_FRAME_ROWS && (p->parts & 1)) xmx_note("routed experts (prompt rows)", rows);
@@ -6944,9 +7005,10 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
         if (!x) return 0;
         int ok = rows ? moe_xmx_launch(prof, tab, x, ids, hid, m, p, st)
                : moe_gv_ok(p) ? (p->fmt == 1 ? moe_gv_launch<1>(tab, x, ids, hid, p, st) : p->fmt == 2 ? moe_gv_launch<2>(tab, x, ids, hid, p, st)
-                                                : moe_gv_launch<4>(tab, x, ids, hid, p, st))
+                                : p->fmt == 7 ? moe_gv_launch<7>(tab, x, ids, hid, p, st) : moe_gv_launch<4>(tab, x, ids, hid, p, st))
                : p->fmt == 1 ? moe_launch<1>(tab, x, ids, hid, p, st) : p->fmt == 2 ? moe_launch<2>(tab, x, ids, hid, p, st)
-               : p->fmt == 4 ? moe_launch<4>(tab, x, ids, hid, p, st) : moe_launch<8>(tab, x, ids, hid, p, st);
+               : p->fmt == 4 ? moe_launch<4>(tab, x, ids, hid, p, st) : p->fmt == 7 ? moe_launch<7>(tab, x, ids, hid, p, st)
+               : moe_launch<8>(tab, x, ids, hid, p, st);
         if (!ok) return 0;
     }
     if (p->parts & 2) {

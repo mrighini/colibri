@@ -144,10 +144,14 @@ typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; int planar, h
  * floats) routed to ids and w as cc_route writes them (i_off + s*i_row, w_off + s*w_row,
  * K each); expert e is entry t_off + e of the table (E of them), its matrices of format fmt (1 int8
  * rows, 2 int4 rows, 4 int4 with a scale per gs inputs, 8 fp8-e4m3 with a scale per
- * 128 x 128 block: the tier's formats; 100 + t a GGUF's ggml type t, fmt_d down's, the types
- * with cuda_bd.cuh's integer step), D and I multiples of 32 up to CC_MOE_DIM_MAX. hid holds S*K rows of
- * I floats (silu(gate) * up, act 0, the only one) and then S*K rows of D (down's
- * output). parts 1: the experts the table holds; parts 2: y (y_off + s*y_row) = the
+ * 128 x 128 block: the tier's formats; 7 MXFP4 (compressed-tensors: [O][I/2] e2m1 nibbles, low
+ * nibble the even column, and one ue8m0 exponent BYTE a 32 inputs, [O][I/32], in CcExpert's
+ * gs/us/ds cast to float pointers; gs unused; the SYCL backend only); 100 + t a GGUF's ggml type
+ * t, fmt_d down's, the types with cuda_bd.cuh's integer step), D and I multiples of 32 up to
+ * CC_MOE_DIM_MAX. hid holds S*K rows of I floats (act 0: silu(gate) * up; act 1, the SYCL
+ * backend only: the clamped SwiGLU of deepseek_v41.c's swiglu_into, up clamped to
+ * [-act_lim, act_lim] and gate to at most act_lim before silu(gate) * up, act_lim > 0) and
+ * then S*K rows of D (down's output). parts 1: the experts the table holds; parts 2: y (y_off + s*y_row) = the
  * host's row (hy at h_off + s*D, h_off >= 0; else 0) plus each slot the table holds,
  * w * down's output, in rank order (the CPU tier's order: its misses, then the device's
  * results); 3 both. A slot whose id is -1 or whose entry is not on the device adds
@@ -162,6 +166,7 @@ typedef struct {
                      0 = fmt's; a matrix's rows as the file has them, padded to words */
     int lay_S, lay_s0;   /* parts 2 only: hid as a parts 1 of lay_S rows left it (0: S), this call's
                             S rows its rows lay_s0.. (a prompt chunk's lanes sum their own rows) */
+    float act_lim;   /* act 1's limit (> 0; refused otherwise); unread for act 0, so a zeroed field keeps act 0 */
 } CcMoe;
 /* the ggml types cc_moe takes for a GGUF's experts (CcMoe.fmt >= 100: cuda_bd.cuh's integer step) */
 static inline int cc_moe_block_type(int t) {
