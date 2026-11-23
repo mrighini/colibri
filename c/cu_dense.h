@@ -53,6 +53,7 @@ static size_t cud_bytes(int fmt, int O, int I, int gs) {
     if (O < 1 || I < 1) return 0;
     if (fmt == 0) return (size_t)O * I * 4;
     if (fmt == 1) return (size_t)O * I + (size_t)O * 4;
+    if (fmt == 9) return I % 32 ? 0 : (size_t)O * I + 256 * 4 + (size_t)((O + 31) / 32) * (I / 32);   /* e4m3, 32x32 ue8m0 tiles */
     if (fmt == 4) return gs > 0 ? (size_t)O * ((I + 1) / 2) + (size_t)O * ((I + gs - 1) / gs) * 4 : 0;
     if (fmt >= 100) {
         if (gq_r16_base(fmt - 100) >= 0) fmt = 100 + gq_r16_base(fmt - 100);   /* the file's rows */
@@ -243,6 +244,20 @@ static ColiCudaTensor *cud_tensor(const void *data, int fmt, int O, int I) {
     const int up = coli_cuda_tensor_upload(&t, rows ? (const void *)rows : data, NULL, f, I, O, g_cud.dev);
     free(rows);
     if (!up || !t) { if (t) coli_cuda_tensor_free(t); e->no = 1; g_cud.left++; return NULL; }
+    e->h = t; g_cud.used += b; g_cud.mats++;
+    return t;
+}
+/* fmt 9: an e4m3 matrix with one ue8m0 a 32x32 tile (deepseek_v41's native FP8 W8), its scales beside it; the same map
+ * (keyed by the weights' address and shape), the same budget */
+static ColiCudaTensor *cud_tensor_e4t(const uint8_t *q, const uint8_t *s, int O, int I) {
+    if (!g_cud.on || !q || !s) return NULL;
+    CudEntry *e = cud_entry(q, 9, O, I);
+    if (!e || e->no) return NULL;
+    if (e->h) return (ColiCudaTensor *)e->h;
+    const size_t b = cud_bytes(9, O, I, 0);
+    if (!b || g_cud.used + b > g_cud.budget) { e->no = 1; g_cud.left++; return NULL; }
+    ColiCudaTensor *t = NULL;
+    if (!coli_cuda_tensor_upload_e4t(&t, q, s, O, I, g_cud.dev) || !t) { if (t) coli_cuda_tensor_free(t); e->no = 1; g_cud.left++; return NULL; }
     e->h = t; g_cud.used += b; g_cud.mats++;
     return t;
 }

@@ -6687,7 +6687,10 @@ static size_t v41_cu_float(int O, int I) {
     return e && *e == '0' ? 0 : (size_t)O * I * 4;
 }
 static size_t v41_cu_w8(const W8 *w) {
-    if (!w->gx) return 0;
+    if (!w->gx) {   /* the native FP8 the CUDA chain takes as fmt 9 (deepseek_v41_cuchain.h's v41u_t8) */
+        const char *e = getenv("COLI_CUDA_CHAIN");
+        return (e && *e == '0') || !w->q || !w->s || g_v41_mux_slots > 1 ? 0 : cud_bytes(9, w->O, w->I, 0);
+    }
     return cud_float(100 + w->gt) ? v41_cu_float(w->O, w->I) : cud_bytes(100 + w->gt, w->O, w->I, 0);
 }
 static size_t v41_cu_wb(const WB *w) {
@@ -6762,7 +6765,7 @@ static size_t v41_cu_dense_bytes(const Model *m) {
 static size_t v41_tier_chain_bytes(Model *m) {
 #ifdef COLI_CUDA
     const char *e = getenv("COLI_CUDA_CHAIN");
-    if (xt_cuda() && m->gguf && !(e && *e == '0') && g_v41_mux_slots <= 1) return v41u_plan_bytes(m, m->c.max_positions);
+    if (xt_cuda() && (m->gguf || v41u_native(m)) && !(e && *e == '0') && g_v41_mux_slots <= 1) return v41u_plan_bytes(m, m->c.max_positions);
 #endif
     (void)m;
     return 0;

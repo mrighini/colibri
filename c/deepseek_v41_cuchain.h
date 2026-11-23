@@ -58,7 +58,11 @@ static V41U *g_v41u;
 static int g_v41u_off;   /* declined for good (set up refused, or COLI_CUDA_CHAIN=0) */
 
 static int v41u_res(CcBuf **b, size_t floats, int kind) { return cc_reserve(b, (floats ? floats : 1) * sizeof(float), kind); }
-static ColiCudaTensor *v41u_t8(const W8 *w) { return w->gx && w->q ? cud_tensor(w->q, 100 + w->gt, w->O, w->I) : NULL; }
+/* a W8: a GGUF's blocks, or the native checkpoint's e4m3 with its 32x32 ue8m0 tiles (fmt 9, mv8_rows_cpu's bits) */
+static ColiCudaTensor *v41u_t8(const W8 *w) {
+    if (w->gx) return w->q ? cud_tensor(w->q, 100 + w->gt, w->O, w->I) : NULL;
+    return w->q && w->s ? cud_tensor_e4t(w->q, w->s, w->O, w->I) : NULL;
+}
 /* a WB: a GGUF's blocks, or the bf16 rows the loader keeps of a GGUF's BF16 tensor (unsloth's
  * compressor and indexer matrices), those as floats */
 static ColiCudaTensor *v41u_tb(const WB *w) {
@@ -66,6 +70,11 @@ static ColiCudaTensor *v41u_tb(const WB *w) {
     return w->w ? cud_tensor(w->w, 100 + GQ_BF16, w->O, w->I) : NULL;
 }
 static ColiCudaTensor *v41u_woa(const W8 *w, int g, int ol) {
+    if (!w->gx) {   /* the native FP8: group g is rows g*ol.. of the matrix and their rows of tiles (ol a multiple of 32) */
+        if (!w->q || !w->s || ol % FP8_TILE || w->I % FP8_TILE) return NULL;
+        const size_t tiles_i = (size_t)w->I / FP8_TILE;
+        return cud_tensor_e4t(w->q + (size_t)g * ol * w->I, w->s + (size_t)g * (ol / FP8_TILE) * tiles_i, ol, w->I);
+    }
     const int64_t rb = gq_row_bytes(w->gt, w->I);   /* an interleaved type's: 16 of them step a group */
     return w->gx && w->q && rb > 0 ? cud_tensor(w->q + (size_t)g * ol * (size_t)rb, 100 + w->gt, ol, w->I) : NULL;
 }
@@ -136,10 +145,13 @@ static size_t v41u_plan_bytes(const Model *m, int ctx) {
 }
 /* the chain keeps one conversation's state on the device: KV_SLOTS > 1 (v41_seq_swap trades the
  * host's) turns it off, as it does the Vulkan chain */
+/* the native checkpoint the chain takes: its W8 are e4m3 with tiles (not a GGUF's blocks) */
+static int v41u_native(const Model *m) { return !m->gguf && m->c.n_layers > 0 && !m->L[0].wq_a.gx && m->L[0].wq_a.s; }
 static int v41u_wanted(Model *m) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN"); on = !(e && *e == '0'); }
-    return on && !g_v41u_off && g_v41_mux_slots <= 1 && xt_cuda() && g_cud.on && m->gguf && cc_available() && cc_dsv4_ready();
+    /* a GGUF, or the native FP8 checkpoint (its W8 as fmt 9: v41u_t8) */
+    return on && !g_v41u_off && g_v41_mux_slots <= 1 && xt_cuda() && g_cud.on && (m->gguf || v41u_native(m)) && cc_available() && cc_dsv4_ready();
 }
 /* the struct, its device's context, the parameters, every layer's matrices and state: 0 =
  * declined (the CPU runs the layers from then on) */
