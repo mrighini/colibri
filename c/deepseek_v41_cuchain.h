@@ -25,7 +25,8 @@
  * memory (a matrix the dense budget does not take, scratch refused): forward_full runs the
  * layers. KV_SLOTS above 1: every slot's state in its own region of the state buffers (v41u_wo,
  * v41u_co, v41u_io, v41u_ro), and only a decode step's one row on the chain, a slot at a time
- * (forward_rows, v41u_mux_rows; COLI_CUDA_V41_MIN=1), the prompts on the CPU. COLI_CUDA_CHAIN=0:
+ * (forward_rows, v41u_mux_rows; COLI_CUDA_V41_MIN=1), the prompts on the CPU; V41_CHAIN_ROWS=1: the
+ * active conversations' decode rows together, a frame a layer (v41u_forward_rows). COLI_CUDA_CHAIN=0:
  * never. COLI_CUDA_V41_ROWS: a chunk's rows (256). */
 #ifndef DEEPSEEK_V41_CUCHAIN_H
 #define DEEPSEEK_V41_CUCHAIN_H
@@ -82,6 +83,12 @@ typedef struct {
     unsigned long long cm_steps, cm_layers, cm_dev_slots, cm_host_slots, cm_reads, cm_checked, cm_route_diff;
     double cm_dev_ms, cm_host_ms, cm_p2_ms, cm_err_max, cm_err_sum, cm_wdiff;
     double cm_tab_ms, cm_cpu_ms, cm_cnt_ms, cm_wait_ms;   /* cm_wait_ms: the host waiting for the frame's routes */   /* within the above: the tables' refresh, the misses' CPU experts, vkt_dev_count */
+    /* V41_CHAIN_ROWS=1 (v41u_forward_rows): a decode step's rows of every active conversation in one
+     * frame a layer, the attention a slot at a time inside it; the exit report's books */
+    unsigned long long rw_steps, rw_rows, rw_fallbacks, rw_layers, rw_dev_slots, rw_host_slots;
+    unsigned long long rw_checked_steps, rw_checked_rows;
+    double rw_dev_ms, rw_host_ms, rw_p2_ms, rw_book_ms, rw_head_ms, rw_fwd_ms, rw_err_max, rw_err_sum;
+    float *rw_mbuf, *rw_contrib;   /* the rows' host misses: [pair][gate I | up I] then [pair][D]; [row * K + k][D] */
 } V41U;
 static V41U *g_v41u;
 static int g_v41u_off;   /* declined for good (set up refused, or COLI_CUDA_CHAIN=0) */
@@ -233,6 +240,18 @@ static void v41u_report(void) {   /* where a chain forward's time went (PLAN-sca
         fprintf(stderr, "[CUDA] deepseek_v41 chain MoE check: %llu pairs, max rel err %.3g, mean %.3g (the CPU's routing differed "
                         "in %llu, max route weight diff %.3g)\n", ch->cm_checked, ch->cm_err_max, ch->cm_err_sum / (double)ch->cm_checked,
                 ch->cm_route_diff, ch->cm_wdiff);
+    if (ch->rw_steps || ch->rw_fallbacks) {   /* V41_CHAIN_ROWS's batched decode steps */
+        const double s = ch->rw_steps ? (double)ch->rw_steps : 1.0, ly = ch->rw_layers ? (double)ch->rw_layers : 1.0;
+        fprintf(stderr, "[CUDA] deepseek_v41 chain rows: %llu batched decode steps (%llu rows, %.2f a step; %llu fell back to a row at "
+                        "a time), %.2f ms each: device frames %.2f (attention+shared+router+resident experts %.2f, parts-2+FFN %.2f), "
+                        "host misses %.2f, host bookkeeping %.2f, heads %.2f; of a layer's slots %.2f resident, %.2f host misses\n",
+                ch->rw_steps, ch->rw_rows, ch->rw_rows / s, ch->rw_fallbacks, ch->rw_fwd_ms / s, (ch->rw_dev_ms + ch->rw_p2_ms) / s,
+                ch->rw_dev_ms / s, ch->rw_p2_ms / s, ch->rw_host_ms / s, ch->rw_book_ms / s, ch->rw_head_ms / s,
+                ch->rw_dev_slots / ly, ch->rw_host_slots / ly);
+    }
+    if (ch->rw_checked_rows)
+        fprintf(stderr, "[CUDA] deepseek_v41 chain rows check: %llu steps (%llu rows) against a row at a time, logits max rel err %.3g, "
+                        "mean %.3g\n", ch->rw_checked_steps, ch->rw_checked_rows, ch->rw_err_max, ch->rw_err_sum / (double)ch->rw_checked_rows);
 }
 static int v41u_wanted(Model *m, int n) {
     static int on = -1;
@@ -535,9 +554,10 @@ static int v41u_shared(V41U *ch, Model *m, Layer *l, int nr) {   /* silu(min(w1 
            cc_mhc(CC_SWIGLU_CLAMP, ch->gs, ch->us, NULL, NULL, ch->hs, &sw) &&
            o->matmul(v41u_t8(&l->sh_w2), ch->hs, 0, ch->ds, 0, nr);
 }
-static int v41u_engram(V41U *ch, Model *m, int i, int nr, int pb, float *rows) {
-    Cfg *c = &m->c; Engram *e = &m->engram; Layer *l = &m->L[i];
-    const int table = l->engram_index, width = e->cols * e->head_dim, H = c->hc_mult, D = c->dim;
+/* the engram's rows of layer i for positions pb.. (the bound sequence's history), on the host */
+static void v41u_engram_host(Model *m, int i, int nr, int pb, float *rows) {
+    Engram *e = &m->engram; Layer *l = &m->L[i];
+    const int table = l->engram_index, width = e->cols * e->head_dim;
     int64_t ids[V41_MAX_NGRAM * V41_MAX_EHEADS];
     double t0 = now_s();
     engram_advise_rows(e, table, pb, nr);
@@ -548,9 +568,18 @@ static int v41u_engram(V41U *ch, Model *m, int i, int nr, int pb, float *rows) {
                    (size_t)e->head_dim * sizeof(float));
     }
     m->t_engram += now_s() - t0;
+}
+/* those rows up, eng_wkv, and the gate into the nr rows of streams in xs (in the open frame) */
+static int v41u_engram_dev(V41U *ch, Model *m, int i, int nr, const float *rows) {
+    Cfg *c = &m->c; Engram *e = &m->engram; Layer *l = &m->L[i];
+    const int width = e->cols * e->head_dim, H = c->hc_mult, D = c->dim;
     CcDsEngram p = {nr, H, D, 0, D * (H + 1), 0, H * D, (int)ch->o_eq[i], (int)ch->o_ek[i], c->norm_eps};
     return cc_write(ch->erows, 0, rows, (size_t)nr * width * sizeof(float)) &&
            cc_ops()->matmul(v41u_t8(&l->eng_wkv), ch->erows, 0, ch->ekv, 0, nr) && cc_ds_engram(ch->ekv, ch->prm, ch->xs, &p);
+}
+static int v41u_engram(V41U *ch, Model *m, int i, int nr, int pb, float *rows) {
+    v41u_engram_host(m, i, nr, pb, rows);
+    return v41u_engram_dev(ch, m, i, nr, rows);
 }
 /* a chunk's RoPE rows and the window half of each row's list (deepseek_v41_chain.h's v41c_chunk_tables) */
 static void v41u_chunk_tables(const V41U *ch, const Model *m, int start, int pb, int nr, int csB, float *cs_, int *wl) {
@@ -624,6 +653,92 @@ static int v41u_state_pull(V41U *ch, Model *m, int start, int E, const size_t *p
              (r <= 1 || cc_copy(ch->pull, at + (size_t)np * (hd + ihd), ch->ring[i], v41u_ro(ch, m, i, sl), (size_t)2 * r * hd));
     }
     return ok;
+}
+/* A forward's n rows from start of the bound sequence: whose index keys each index source reads, per
+ * row (keyl[i * n + t]: indexer_run, published_owner), the rows of each kv_source layer the forward
+ * reads that it does not produce first (need), the last layer that publishes new keys (*last_pub, -1
+ * none), and every kv_source layer's device cache for them (v41u_cache). 0: a cache refused. */
+static int v41u_plan_keys(V41U *ch, Model *m, int start, int n, int *keyl, int *need, int *last_pub) {
+    const Cfg *c = &m->c;
+    const int L = c->n_layers, E = start + n;
+    static int tidy = -1;
+    if (tidy < 0) tidy = getenv("V41_INDEX_OWNER") != NULL;
+    for (int i = 0; i < L; i++) need[i] = c->kv_source[i] && c->compress_ratio[i] > 0 ? start / c->compress_ratio[i] : 0;
+    int pub = m->published_index_k ? m->published_index_layer : -1, lp = -1;
+    for (int i = 0; i < L; i++) {
+        const int r = c->compress_ratio[i];
+        if (r <= 0) continue;
+        const int owner = c->index_owner[i];
+        if (c->kv_source[i] && E / r - start / r > 0) { pub = i; lp = i; }
+        if (E / r > need[owner]) need[owner] = E / r;
+        for (int t = 0; t < n; t++) {
+            int k = owner;
+            if (c->index_source[i] && !tidy) {
+                if (m->pub_rows > 0) {
+                    const int p = published_owner(m, i, start, t);
+                    k = p >= 0 ? p : m->pub_before ? m->pub_before_layer : owner;
+                } else if (n == 1 && pub >= 0) k = pub;
+            }
+            keyl[(size_t)i * n + t] = k;
+            if (c->index_source[i] && (start + t + 1) / r > need[k]) need[k] = (start + t + 1) / r;
+        }
+    }
+    *last_pub = lp;
+    int ok = 1;
+    for (int i = 0; ok && i < L; i++) {
+        if (!c->kv_source[i]) continue;
+        const int r = c->compress_ratio[i], host = c->max_positions / r;
+        if (need[i] > host) need[i] = host;
+        const int want = need[i] > E / r ? need[i] : E / r;
+        ok = v41u_cache(ch, m, i, want > 0 ? want : 1);
+    }
+    return ok;
+}
+/* what comes back at a forward's end (v41u_state_pull), from float base of pull: each layer's window
+ * rows, its compressed rows, keys and group at pc[i]; the floats it takes */
+static size_t v41u_pull_plan(const V41U *ch, const Model *m, int start, int n, size_t base, size_t *pc) {
+    const Cfg *c = &m->c;
+    const int E = start + n;
+    const size_t pw = (size_t)(n < ch->W ? n : ch->W) * c->head_dim;
+    size_t pn = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        pc[i] = base + pn; pn += pw;
+        const int r = c->compress_ratio[i];
+        if (!c->kv_source[i]) continue;
+        pn += (size_t)(E / r - start / r) * (c->head_dim + c->index_head_dim);
+        if (r > 1) pn += (size_t)2 * r * c->head_dim;
+    }
+    return pn;
+}
+/* a forward's pulled state (pull at pc, its frame waited for) into the bound sequence's host arrays,
+ * as the CPU would have left them; the device's copy of that slot valid up to start + n */
+static void v41u_state_apply(V41U *ch, Model *m, int start, int n, const size_t *pc, size_t pw, int last_pub) {
+    const Cfg *c = &m->c;
+    const int L = c->n_layers, W = ch->W, hd = c->head_dim, E = start + n, sl = v41u_slot(ch);
+    const float *pl = (const float *)cc_ptr(ch->pull);
+    for (int i = 0; i < L; i++) {
+        Layer *l = &m->L[i];
+        const int q0 = E - W > start ? E - W : start;
+        for (int t = 0; t < n; t++) {
+            const int p = start + t, slot = p % W;
+            if (p < q0) continue;
+            memcpy(l->window + (size_t)slot * hd, pl + pc[i] + (size_t)(p - q0) * hd, (size_t)hd * sizeof(float));
+            l->window_pos[slot] = p;
+        }
+        if (!c->kv_source[i]) continue;
+        const int r = c->compress_ratio[i], g0 = start / r, np = E / r - g0, ihd = c->index_head_dim;
+        const float *src = pl + pc[i] + pw;
+        memcpy(l->ckv + (size_t)g0 * hd, src, (size_t)np * hd * sizeof(float));
+        memcpy(l->ikey + (size_t)g0 * ihd, src + (size_t)np * hd, (size_t)np * ihd * sizeof(float));
+        if (r <= 1) continue;
+        const float *ring = src + (size_t)np * (hd + ihd);
+        memcpy(l->cstate_kv, ring, (size_t)r * hd * sizeof(float));
+        memcpy(l->cstate_score, ring + (size_t)r * hd, (size_t)r * hd * sizeof(float));
+    }
+    if (last_pub >= 0) { m->published_index_k = m->L[last_pub].ikey; m->published_index_layer = last_pub; }
+    ch->win_valid[sl] = E;
+    int *kvv = v41u_kvv(ch, m, sl);
+    for (int i = 0; i < L; i++) if (c->kv_source[i]) kvv[i] = E / c->compress_ratio[i];
 }
 
 /* ---- V41_CHAIN_MOE: a decode step's routed experts in the chain (PLAN-scale S3c) ------------
@@ -751,35 +866,37 @@ static int v41u_cmoe_setup(V41U *ch, Model *m) {
     if (ch->cm_check) fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: checking the first %d (layer, step) pairs against moe_run_at\n", ch->cm_check);
     return 1;
 }
-static CcMoe v41u_cmoe_args(const V41U *ch, const Model *m, int i, int parts) {
+static CcMoe v41u_cmoe_args_s(const V41U *ch, const Model *m, int i, int parts, int S) {   /* S rows (V41_CHAIN_ROWS) */
     const Cfg *c = &m->c;
     CcMoe p;
     memset(&p, 0, sizeof p);
-    p.S = 1; p.K = ch->cm_K; p.D = c->dim; p.I = c->moe_inter; p.fmt = 7; p.gs = 32; p.act = ch->cm_act; p.parts = parts;
+    p.S = S; p.K = ch->cm_K; p.D = c->dim; p.I = c->moe_inter; p.fmt = 7; p.gs = 32; p.act = ch->cm_act; p.parts = parts;
     p.t_off = i * ch->cm_E; p.x_off = 0; p.x_row = c->dim; p.i_off = 0; p.i_row = ch->cm_K; p.w_off = 0; p.w_row = ch->cm_K;
     p.y_off = 0; p.y_row = c->dim; p.h_off = 0; p.E = ch->cm_E; p.planar = 0; p.fmt_d = 0; p.lay_S = 0; p.lay_s0 = 0;
     p.act_lim = ch->cm_lim;
     return p;
 }
+static CcMoe v41u_cmoe_args(const V41U *ch, const Model *m, int i, int parts) { return v41u_cmoe_args_s(ch, m, i, parts, 1); }
 /* layer i's router and resident experts, appended to the open attention+shared frame (nrm: the
  * normalized FFN input the host step reads as h2d) */
-static int v41u_cmoe_dev(V41U *ch, Model *m, int i) {
+static int v41u_cmoe_dev_s(V41U *ch, Model *m, int i, int S) {   /* nrm's S rows (V41_CHAIN_ROWS: every conversation's) */
     const Cfg *c = &m->c;
     const int E = ch->cm_E, K = ch->cm_K;
     CcRoute r;
     memset(&r, 0, sizeof r);
-    r.S = 1; r.E = E; r.K = K; r.kind = 2;
+    r.S = S; r.E = E; r.K = K; r.kind = 2;
     r.l_off = 0; r.l_row = E; r.b_off = i * E; r.has_bias = 1;   /* moe_gate: the bias for the pick only */
     r.i_off = 0; r.i_row = K; r.w_off = 0; r.w_row = K;
     r.n_group = 0; r.topk_group = 0;
     r.norm = c->norm_topk_prob && K > 1 ? 1 : 0;   /* moe_gate: by the sum + 1e-20 only with norm_topk_prob */
     r.temp = c->gate_temp; r.scale = c->route_scale; r.norm_eps = 1e-20f;
-    CcMoe p = v41u_cmoe_args(ch, m, i, 1);
+    CcMoe p = v41u_cmoe_args_s(ch, m, i, 1, S);
     /* the routes down, then the word: the host's misses run while cc_moe parts 1 computes the resident experts */
-    return cc_matmul(ch->cm_gate[i], ch->nrm, 0, ch->cm_lg, 0, 1) && cc_route(ch->cm_lg, ch->cm_bias, ch->cm_ids, ch->cm_w, &r) &&
+    return cc_matmul(ch->cm_gate[i], ch->nrm, 0, ch->cm_lg, 0, S) && cc_route(ch->cm_lg, ch->cm_bias, ch->cm_ids, ch->cm_w, &r) &&
            cc_signal(ch->cm_flag, 0, ++ch->cm_seq) &&
            cc_moe(ch->cm_tab, ch->nrm, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_y, ch->cm_hy, &p);
 }
+static int v41u_cmoe_dev(V41U *ch, Model *m, int i) { return v41u_cmoe_dev_s(ch, m, i, 1); }
 /* The host's part of layer i after the device's frame: the routing it made (ids, w back to the
  * host), the misses -- slots whose expert the device's table does not hold -- on the CPU
  * (moe_vk_cpu: w * expert(x) per slot, through the expert cache, each passed to the tier as
@@ -923,6 +1040,106 @@ static void v41u_cmoe_after(V41U *ch, Model *m, Layer *l, int i, const float *x,
     if (ch->cm_checked <= 4 || rel > 1e-2)
         fprintf(stderr, "[CUDA] deepseek_v41 chain MoE check: layer %d, rel err %.3g%s\n", i, rel, same ? "" : " (the CPU routed otherwise)");
 }
+/* V41_CHAIN_ROWS: a batched decode step's misses of layer i for its S rows (x: S rows of D; want: S * K).
+ * The union of the missed experts through the cache once (expert_slots_at, a cache's worth at a time),
+ * then every (row, slot) pair's gate and up rows in one parallel loop, the clamped SwiGLU a pair, every
+ * pair's down rows in another: each output v41u_mx4_dot of that row's own input, so a row's
+ * contributions are the bits v41u_cmoe_misses gives it alone. contrib[(row * K + k) * D] = w * down;
+ * the tier's notes once an expert. 0: not this form (the caller takes moe_vk_cpu a row at a time). */
+static int v41u_cmoe_misses_rows(V41U *ch, Model *m, int i, int S, const float *x, const int *ids, const float *w, const uint8_t *want) {
+    const Cfg *c = &m->c;
+    const int D = c->dim, I = c->moe_inter, K = ch->cm_K, draws = S * K;
+    if (D % 32 || I % 32) return 0;
+    int uq[4 * CC_ROUTE_KMAX], du[4 * CC_ROUTE_KMAX], nu = 0;   /* the missed experts; each draw's place among them */
+    for (int d = 0; d < draws; d++) {
+        du[d] = -1;
+        if (!want[d]) continue;
+        int at = -1;
+        for (int u = 0; u < nu; u++) if (uq[u] == ids[d]) { at = u; break; }
+        if (at < 0) { at = nu; uq[nu++] = ids[d]; }
+        du[d] = at;
+    }
+    if (!nu) return 1;
+    const size_t pairs_max = (size_t)4 * CC_ROUTE_KMAX;
+    if (!ch->rw_mbuf && !(ch->rw_mbuf = (float *)malloc(pairs_max * (2 * (size_t)I + D) * sizeof(float)))) return 0;
+    float *gu = ch->rw_mbuf, *dn = ch->rw_mbuf + pairs_max * 2 * I;   /* [pair][gate I | up I], [pair][D] */
+    const int cap = m->cache[i].cap, step = cap < MOE_ROW_CHUNK ? cap : MOE_ROW_CHUNK;
+    if (step < 1) return 0;
+    const int rb = I / 2, rd = D / 2, tl = v41_tier_layer(m, "layers", i);
+    for (int u0 = 0; u0 < nu; u0 += step) {
+        const int ne = nu - u0 < step ? nu - u0 : step;
+        Slot *sl[MOE_ROW_CHUNK];
+        expert_slots_at(m, &m->cache[i], "layers", i, uq + u0, ne, sl);
+        for (int u = 0; u < ne; u++) if (!sl[u] || sl[u]->gt[0] >= 0 || sl[u]->gt[1] >= 0 || sl[u]->gt[2] >= 0 || vk_slot_ilv(sl[u])) return 0;
+        int pd[4 * CC_ROUTE_KMAX], np = 0;   /* this part's pairs: their draws */
+        const Slot *ps[4 * CC_ROUTE_KMAX];
+        for (int d = 0; d < draws; d++) if (du[d] >= u0 && du[d] < u0 + ne) { pd[np] = d; ps[np] = sl[du[d] - u0]; np++; }
+        const double t0 = now_s();
+        #pragma omp parallel for schedule(static)
+        for (int q = 0; q < np * 2 * I; q++) {
+            const int u = q / (2 * I), r = q - u * 2 * I, up = r >= I, o = up ? r - I : r;
+            const Slot *s = ps[u];
+            const uint8_t *wq = (up ? s->w3 : s->w1) + (size_t)o * rd, *sc = (up ? s->s3 : s->s1) + (size_t)o * (D / 32);
+            gu[(size_t)u * 2 * I + r] = v41u_mx4_dot(x + (size_t)(pd[u] / K) * D, wq, sc, D);
+        }
+        for (int u = 0; u < np; u++) swiglu_into(c, gu + (size_t)u * 2 * I, gu + (size_t)u * 2 * I + I, (int64_t)I);
+        #pragma omp parallel for schedule(static)
+        for (int q = 0; q < np * D; q++) {
+            const int u = q / D, o = q - u * D;
+            const Slot *s = ps[u];
+            dn[(size_t)u * D + o] = v41u_mx4_dot(gu + (size_t)u * 2 * I, s->w2 + (size_t)o * rb, s->s2 + (size_t)o * (I / 32), I);
+        }
+        m->t_expert += now_s() - t0;
+        for (int u = 0; u < np; u++) {
+            float *dst = ch->rw_contrib + (size_t)pd[u] * D;
+            const float wk = w[pd[u]];
+            for (int d = 0; d < D; d++) dst[d] = wk * dn[(size_t)u * D + d];
+        }
+        for (int u = 0; u < ne; u++) {
+            VktExpertSrc src = vk_slot_src(m, sl[u]);
+            XT(note)(tl, uq[u0 + u], &src);
+            vk_drop_rows(sl[u]);
+        }
+    }
+    return 1;
+}
+/* v41u_cmoe_host for a batched step's S rows: the routing back (S * K), each row's books as a one-row
+ * step keeps them (rt_count, the device's hits), the misses of every row (v41u_cmoe_misses_rows, or
+ * moe_vk_cpu a row at a time), hy's row t = row t's misses summed in rank order */
+static void v41u_cmoe_host_rows(V41U *ch, Model *m, int i, int S, const float *x, int *ids, float *w) {
+    const int D = m->c.dim, E = ch->cm_E, K = ch->cm_K, draws = S * K;
+    memcpy(ids, cc_ptr(ch->cm_ids), (size_t)draws * sizeof(int));
+    memcpy(w, cc_ptr(ch->cm_w), (size_t)draws * sizeof(float));
+    const CcExpert *t = ch->cm_tabh + (size_t)i * E;
+    uint8_t want[4 * CC_ROUTE_KMAX];
+    int nmiss = 0;
+    for (int r = 0; r < S; r++) {
+        rt_count(i, ids + (size_t)r * K, K);
+        for (int k = 0; k < K; k++) {
+            const int d = r * K + k, e = ids[d], valid = e >= 0 && e < E, dev = valid && t[e].g != NULL;
+            want[d] = valid && !dev;
+            nmiss += want[d];
+            if (dev) { ehit_mark(m, i, e); ch->rw_dev_slots++; }
+        }
+    }
+    ch->rw_host_slots += (unsigned long long)nmiss;
+    float *hy = (float *)cc_ptr(ch->cm_hy);
+    memset(hy, 0, (size_t)S * D * sizeof(float));
+    if (!nmiss) return;
+    if (ch->cm_batch < 0) { const char *e = getenv("V41_CHAIN_MOE_BATCH"); ch->cm_batch = !(e && *e == '0'); }
+    if (!ch->cm_batch || !v41u_cmoe_misses_rows(ch, m, i, S, x, ids, w, want))
+        for (int r = 0; r < S; r++)
+            moe_vk_cpu(m, &m->cache[i], "layers", i, K, x + (size_t)r * D, 1, ids + (size_t)r * K, w + (size_t)r * K, want + (size_t)r * K,
+                       ch->rw_contrib + (size_t)r * K * D);
+    for (int r = 0; r < S; r++)
+        for (int k = 0; k < K; k++) {   /* rank order, as moe_vk_block's sum */
+            const int d = r * K + k;
+            if (!want[d]) continue;
+            const float *cv = ch->rw_contrib + (size_t)d * D;
+            float *hr = hy + (size_t)r * D;
+            for (int e = 0; e < D; e++) hr[e] += cv[e];
+        }
+}
 #else
 #define V41U_CMOE 0
 #endif
@@ -964,45 +1181,11 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     int ok = f.keyl && need && pc && wl && cs_ && (!m->engram.active || er) && outs && pres;
     /* whose index keys each index source reads, per row (indexer_run, published_owner), and the
      * rows of each kv_source layer the forward reads that it does not produce first */
-    static int tidy = -1;
-    if (tidy < 0) tidy = getenv("V41_INDEX_OWNER") != NULL;
-    for (int i = 0; ok && i < L; i++) if (c->kv_source[i] && c->compress_ratio[i] > 0) need[i] = start / c->compress_ratio[i];
-    int pub = m->published_index_k ? m->published_index_layer : -1, last_pub = -1;
-    for (int i = 0; ok && i < L; i++) {
-        const int r = c->compress_ratio[i];
-        if (r <= 0) continue;
-        const int owner = c->index_owner[i];
-        if (c->kv_source[i] && E / r - start / r > 0) { pub = i; last_pub = i; }
-        if (E / r > need[owner]) need[owner] = E / r;
-        for (int t = 0; t < n; t++) {
-            int k = owner;
-            if (c->index_source[i] && !tidy) {
-                if (m->pub_rows > 0) {
-                    const int p = published_owner(m, i, start, t);
-                    k = p >= 0 ? p : m->pub_before ? m->pub_before_layer : owner;
-                } else if (n == 1 && pub >= 0) k = pub;
-            }
-            f.keyl[(size_t)i * n + t] = k;
-            if (c->index_source[i] && (start + t + 1) / r > need[k]) need[k] = (start + t + 1) / r;
-        }
-    }
-    for (int i = 0; ok && i < L; i++) {
-        if (!c->kv_source[i]) continue;
-        const int r = c->compress_ratio[i], host = c->max_positions / r;
-        if (need[i] > host) need[i] = host;
-        const int want = need[i] > E / r ? need[i] : E / r;
-        ok = v41u_cache(ch, m, i, want > 0 ? want : 1);
-    }
+    int last_pub = -1;
+    ok = ok && v41u_plan_keys(ch, m, start, n, f.keyl, need, &last_pub);
     /* what comes back at the end: each layer's window rows, its compressed rows, keys and group */
     const size_t pw = (size_t)(n < W ? n : W) * hd;
-    size_t pn = 0;
-    for (int i = 0; ok && i < L; i++) {
-        pc[i] = pn; pn += pw;
-        const int r = c->compress_ratio[i];
-        if (!c->kv_source[i]) continue;
-        pn += (size_t)(E / r - start / r) * (hd + c->index_head_dim);
-        if (r > 1) pn += (size_t)2 * r * hd;
-    }
+    const size_t pn = ok ? v41u_pull_plan(ch, m, start, n, 0, pc) : 0;
     ok = ok && v41u_scratch(ch, m, rows, E) && v41u_res(&ch->pull, pn, CC_DOWN) && v41u_res(&ch->lw_list, (size_t)n * LR, CC_DEV);
     for (int seg_ok = 0; ok && !seg_ok;) {   /* a segment's rows on the device; refused, segments half as long */
         seg_ok = v41u_res(&ch->lw_xs, (size_t)per * HD, CC_DEV) && v41u_res(&ch->lw_hp, (size_t)per * hr, CC_DEV) &&
@@ -1216,32 +1399,7 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         if (!ok) { *lost = 1; g_v41u_off = 1; ch->ok = 0; fprintf(stderr, "[CUDA] deepseek_v41 chain: a frame failed; the CPU runs the layers from now on\n"); }
         return 0;
     }
-    {   /* every chunk is through: the host's state as the CPU would have left it */
-        const float *pl = (const float *)cc_ptr(ch->pull);
-        for (int i = 0; i < L; i++) {
-            Layer *l = &m->L[i];
-            const int q0 = E - W > start ? E - W : start;
-            for (int t = 0; t < n; t++) {
-                const int p = start + t, slot = p % W;
-                if (p < q0) continue;
-                memcpy(l->window + (size_t)slot * hd, pl + pc[i] + (size_t)(p - q0) * hd, (size_t)hd * sizeof(float));
-                l->window_pos[slot] = p;
-            }
-            if (!c->kv_source[i]) continue;
-            const int r = c->compress_ratio[i], g0 = start / r, np = E / r - g0, ihd = c->index_head_dim;
-            const float *src = pl + pc[i] + pw;
-            memcpy(l->ckv + (size_t)g0 * hd, src, (size_t)np * hd * sizeof(float));
-            memcpy(l->ikey + (size_t)g0 * ihd, src + (size_t)np * hd, (size_t)np * ihd * sizeof(float));
-            if (r <= 1) continue;
-            const float *ring = src + (size_t)np * (hd + ihd);
-            memcpy(l->cstate_kv, ring, (size_t)r * hd * sizeof(float));
-            memcpy(l->cstate_score, ring + (size_t)r * hd, (size_t)r * hd * sizeof(float));
-        }
-        if (last_pub >= 0) { m->published_index_k = m->L[last_pub].ikey; m->published_index_layer = last_pub; }
-        ch->win_valid[sl] = E;
-        int *kvv = v41u_kvv(ch, m, sl);
-        for (int i = 0; i < L; i++) if (c->kv_source[i]) kvv[i] = E / c->compress_ratio[i];
-    }
+    v41u_state_apply(ch, m, start, n, pc, pw, last_pub);   /* every chunk is through: the host's state as the CPU would have left it */
     if (all) { memcpy(h, outs, (size_t)n * HD * sizeof(float)); memcpy(pre_mix, pres, (size_t)n * H * sizeof(float)); }
     else { memcpy(h + (size_t)(n - 1) * HD, outs, (size_t)HD * sizeof(float)); memcpy(pre_mix + (size_t)(n - 1) * H, pres, (size_t)H * sizeof(float)); }
     free(f.keyl); free(need); free(pc); free(wl); free(cs_); free(er); free(outs); free(pres);
@@ -1249,5 +1407,366 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     if (n == 1) ch->one_row++;
     ch->fwd_ms += (now_s() - tfw) * 1e3;
     return L;
+}
+
+/* ---- V41_CHAIN_ROWS: a decode step's rows of every active conversation together (M3) --------
+ * Opt-in (V41_CHAIN_ROWS=1; off, forward_rows takes M2's row at a time as before), KV_SLOTS > 1
+ * with the decode steps on the chain (v41u_mux_rows), 2..4 rows of different slots. Per layer one
+ * frame for the S rows where the arithmetic is a row's own: the engram gate, the hyper-connections'
+ * split, collapse and write back, the trunk's matrices (cc_matmul with S rows), the shared expert,
+ * the router and the resident experts (V41_CHAIN_MOE: cc_route and cc_moe parts 1 with S rows, one
+ * cc_signal); the host's misses of every row (v41u_cmoe_host_rows; without V41_CHAIN_MOE moe_run_at
+ * over the S rows); then a frame of cc_moe parts 2, the FFN add and write back for the S rows. A
+ * slot at a time inside the first frame: the window ring's row, the compressor and the index keys,
+ * the indexer's scores, candidates and top-k (each row's own width, positions and key source), the
+ * sparse attention (cc_ds_attn S = 1 on that slot's regions). RoPE reads a table of a row each: the
+ * cs buffer holds [S rows of rope_window at each row's position | S rows of rope_compress at it |
+ * a block of rmax rows of rope_compress a row, positions pos - rmax + 1 .. pos (a latent's group)].
+ * Each row's host side is what forward_full does for a one-row step: the slot's plan, state_up,
+ * list and engram rows with it bound before the frames, its pulled state applied with it bound
+ * after (apply 0: neither the pull nor the validity -- V41_CHAIN_ROWS_CHECK). Returns 1 with h
+ * (S rows of streams in: the embeddings; out: the last layer's) and pre_mix (S rows of H); 0 not
+ * taken or refused (h untouched, the slots' device copies lowered to their positions; *lost: the
+ * device is gone, the chain off for good). Leaves some slot bound: the caller binds. */
+static void v41_mux_bind(Model *m, int slot);   /* deepseek_v41.c's: the Model holds that slot's sequence */
+#define V41U_ROWS_MAX 4
+static int v41u_rows_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("V41_CHAIN_ROWS"); on = e && atoi(e) > 0; }
+    return on;
+}
+static int g_v41u_rows_check = -1;   /* V41_CHAIN_ROWS_CHECK: the batched steps still to check */
+static int v41u_rows_check_take(void) {
+    if (g_v41u_rows_check < 0) { const char *e = getenv("V41_CHAIN_ROWS_CHECK"); g_v41u_rows_check = e && atoi(e) > 0 ? atoi(e) : 0; }
+    if (g_v41u_rows_check <= 0) return 0;
+    g_v41u_rows_check--;
+    return 1;
+}
+/* forward_rows' step for the batched path: asked for, the decode steps on the chain, 2..4 rows of
+ * different slots in range */
+static int v41u_rows_wanted(Model *m, const int *slots, int n) {
+    if (!v41u_rows_on() || n < 2 || n > V41U_ROWS_MAX || !v41u_mux_rows(m)) return 0;
+    for (int t = 0; t < n; t++) {
+        if (slots[t] < 0 || slots[t] >= g_v41_mux_slots) return 0;
+        for (int u = 0; u < t; u++) if (slots[u] == slots[t]) return 0;
+    }
+    return 1;
+}
+static int v41u_close(int ok) { return cc_submit(1) && ok; }   /* the open frame ends (waited for) whatever was refused in it */
+/* layer i's attention for a batched step's S rows (slots[t] at pos[t]; keyl[t * L + i] row t's key
+ * source): v41u_attention's ops, the projections, norms and RoPE over the S rows, the state's a slot
+ * at a time */
+static int v41u_attention_rows(V41U *ch, Model *m, int i, int S, const int *slots, const int *pos, const int *keyl) {
+    Cfg *c = &m->c; Layer *l = &m->L[i];
+    const int L = c->n_layers, hd = c->head_dim, nh = c->n_heads, rd = c->rope_dim, QL = c->q_lora, r = c->compress_ratio[i];
+    const int qrow = nh * hd, W = ch->W, LR = W + ch->K, rmax = ch->rmax;
+    const int tcs = r > 0 ? S * rd : 0;   /* row t's RoPE row at tcs + t rd: its position's in rope_compress (r > 0) or rope_window */
+    const ColiCudaChainOps *o = cc_ops();
+    int ok = o->matmul(v41u_t8(&l->wq_a), ch->nrm, 0, ch->qa, 0, S) &&
+             v41u_norm(ch, ch->qa, 0, QL, ch->o_qn[i], ch->qr, 0, QL, S, QL, c->norm_eps) &&
+             o->matmul(v41u_t8(&l->wq_b), ch->qr, 0, ch->q, 0, S) &&
+             o->matmul(v41u_t8(&l->wkv), ch->nrm, 0, ch->kv, 0, S) &&
+             v41u_norm(ch, ch->kv, 0, hd, ch->o_kn[i], ch->kv, 0, hd, S, hd, c->norm_eps) &&
+             v41u_rope(ch, m, ch->q, S * nh, nh, hd - rd, qrow, hd, tcs, rd, 0) &&
+             v41u_rope(ch, m, ch->kv, S, 1, hd - rd, hd, 0, tcs, rd, 0);
+    if (!ok) return 0;
+    CcRegion rg[V41U_ROWS_MAX];   /* each row into its slot's window ring */
+    for (int t = 0; t < S; t++) rg[t] = (CcRegion){v41u_wo(ch, slots[t]) + (size_t)(pos[t] % ch->Wd) * hd, (size_t)t * hd, (size_t)hd};
+    ok = o->copy_regions(ch->win[i], ch->kv, rg, S);
+    if (ok && r > 0 && c->kv_source[i]) {   /* the compressor, its latents, the index keys: a slot at a time */
+        const int ihd = c->index_head_dim;
+        CcBuf *cb = ch->ckv[i];
+        ok = o->matmul(v41u_tb(&l->comp_wkv), ch->nrm, 0, ch->craw, 0, S) &&
+             (r == 1 || o->matmul(v41u_tb(&l->comp_wgate), ch->nrm, 0, ch->cscr, 0, S));
+        for (int t = 0; ok && t < S; t++) {
+            const int sl = slots[t], pb = pos[t], g0 = pb / r, np = (pb + 1) / r - g0;
+            const size_t cso = v41u_co(ch, i, sl), iso = v41u_io(ch, i, sl), co = cso + (size_t)g0 * hd, io = iso + (size_t)g0 * ihd;
+            if (r == 1) ok = v41u_norm(ch, ch->craw, (size_t)t * hd, hd, ch->o_cn[i], cb, co, hd, 1, hd, c->norm_eps);
+            else {
+                CcDsComp cp = {1, pb, r, hd, hd, 0, t * hd, hd, t * hd, hd, -1, (int)cso, hd, (int)v41u_ro(ch, m, i, sl)};
+                ok = cc_ds_compress(ch->craw, ch->cscr, ch->ring[i], NULL, cb, &cp) &&
+                     (np == 0 || v41u_norm(ch, cb, co, hd, ch->o_cn[i], cb, co, hd, np, hd, c->norm_eps));
+            }
+            if (ok && np > 0) {   /* a latent rotates at its group's first position: row t's block of rmax rows */
+                const int bc = 2 * S * rd + t * rmax * rd + (g0 * r - (pb - rmax + 1)) * rd;
+                ok = o->matmul(v41u_tb(&l->idx_wk), cb, co, ch->ikey[i], io, np) &&
+                     v41u_norm(ch, ch->ikey[i], io, ihd, ch->o_ikn[i], ch->ikey[i], io, ihd, np, ihd, c->norm_eps) &&
+                     v41u_rope(ch, m, ch->ikey[i], np, 1, (int)io + ihd - rd, ihd, 0, bc, r * rd, 0) &&
+                     v41u_rope(ch, m, cb, np, 1, (int)co + hd - rd, hd, 0, bc, r * rd, 0);
+            }
+        }
+    }
+    if (ok && r > 0 && c->index_source[i]) {   /* the indexer: the queries over the S rows, each row's selection on its own */
+        const int IH = c->index_n_heads, ID = c->index_head_dim, cs = c->candidate_source;
+        const int cand = v41u_cand_on(c), mrow = cand && cs < i ? (int)ch->wcap : 0;
+        const float wscale = (1.0f / sqrtf((float)ID)) * (1.0f / sqrtf((float)IH));
+        ok = o->matmul(v41u_t8(&l->idx_wq_b), ch->qr, 0, ch->iq, 0, S) &&
+             v41u_rope(ch, m, ch->iq, S * IH, IH, ID - rd, IH * ID, ID, tcs, rd, 0) &&
+             o->matmul(v41u_tb(&l->idx_wproj), ch->nrm, 0, ch->ihw, 0, S);
+        /* the scores in isc's row 0, a row at a time (the queue runs them in order; cand and topk read row 0) */
+        for (int t = 0; ok && t < S; t++) {
+            const int sl = slots[t], pb = pos[t], width = (pb + 1) / r, kl = keyl[(size_t)t * L + i];
+            CcDsScore sp = {1, pb, r, IH, ID, width, t * IH * ID, IH * ID, t * IH, IH, (int)v41u_io(ch, kl, sl), ID, mrow,
+                            (int)ch->wcap, wscale, 0, t * mrow};
+            ok = cc_ds_score(ch->iq, ch->ihw, ch->ikey[kl], mrow ? ch->lw_mask : NULL, ch->isc, &sp);
+            if (ok && cand && cs == i) {
+                CcDsCand cp = {1, pb, r, width, c->candidate_block_size, c->candidate_topk_blocks, (int)ch->wcap, (int)ch->wcap,
+                               t * (int)ch->wcap};
+                ok = cc_ds_cand(ch->isc, ch->lw_mask, &cp);
+            }
+            CcDsTopk tp = {1, width, ch->K, (int)ch->wcap, t * LR + W, LR, ch->Wd, 0};
+            ok = ok && cc_ds_topk(ch->isc, ch->lw_list, &tp);
+        }
+    }
+    for (int t = 0; ok && t < S; t++) {   /* the sparse attention: a slot's row on that slot's regions */
+        const int sl = slots[t];
+        CcDsAttn a = {1, nh, hd, W + (r > 0 ? ch->K : 0), t * LR, LR, ch->Wd, (int)v41u_wo(ch, sl),
+                      r > 0 ? (int)v41u_co(ch, c->index_owner[i], sl) : 0, t * qrow, qrow, t * qrow, qrow, (int)ch->o_sink[i], 0,
+                      1.0f / sqrtf((float)hd)};
+        ok = cc_ds_attn(ch->q, ch->win[i], r > 0 ? ch->ckv[c->index_owner[i]] : NULL, ch->lw_list, ch->prm, ch->heads, &a);
+    }
+    return ok && v41u_rope(ch, m, ch->heads, S * nh, nh, hd - rd, qrow, hd, tcs, rd, 1) &&
+           v41u_wo_a(ch, m, l, S) && o->matmul(v41u_t8(&l->wo_b), ch->grp, 0, ch->br, 0, S);
+}
+static int v41u_forward_rows(Model *m, const int *slots, const int *pos, int S, float *h, float *pre_mix, int apply, int *lost) {
+    *lost = 0;
+    Cfg *c = &m->c;
+    const int L = c->n_layers, D = c->dim, H = c->hc_mult, HD = H * D, hr = 2 * H + H * H, hd = c->head_dim, rd = c->rope_dim;
+    if (S < 1 || S > V41U_ROWS_MAX || m->spec.active || !v41u_wanted(m, 1) || !v41u_setup(m)) return 0;
+    V41U *ch = g_v41u;
+    for (int t = 0; t < S; t++) {
+        if (slots[t] < 0 || slots[t] >= ch->SL || pos[t] < 0) return 0;
+        for (int u = 0; u < t; u++) if (slots[u] == slots[t]) return 0;
+    }
+    const double t0 = now_s();
+    const int W = ch->W, LR = W + ch->K, rmax = ch->rmax, cand = v41u_cand_on(c);
+    const size_t ncs = (size_t)S * (2 + rmax) * rd;
+    int maxE = 1;
+    for (int t = 0; t < S; t++) if (pos[t] + 1 > maxE) maxE = pos[t] + 1;
+    Engram *eg = &m->engram;
+    const int ew = eg->active ? eg->cols * eg->head_dim : 0;
+    int neng = 0;
+    for (int i = 0; i < L; i++) neng += m->L[i].engram_index >= 0;
+    int *keyl = (int *)malloc((size_t)S * L * sizeof(int)), *need = (int *)malloc((size_t)S * L * sizeof(int));
+    int *wl = (int *)malloc((size_t)S * LR * sizeof(int)), *eng = (int *)malloc((size_t)L * sizeof(int));
+    size_t *pc = (size_t *)malloc((size_t)S * L * sizeof(size_t));
+    float *cs1 = (float *)malloc((size_t)(1 + rmax) * rd * sizeof(float)), *csa = (float *)malloc(ncs * sizeof(float));
+    float *er = neng && ew ? (float *)malloc((size_t)neng * S * ew * sizeof(float)) : NULL;
+    float *hp0 = (float *)calloc((size_t)S * hr, sizeof(float));
+    int last_pub[V41U_ROWS_MAX];
+    int ok = keyl && need && wl && eng && pc && cs1 && csa && hp0 && (!neng || er);
+    for (int i = 0, j = 0; ok && i < L; i++) eng[i] = m->L[i].engram_index >= 0 ? j++ : -1;
+    for (int t = 0; hp0 && t < S; t++) hp0[(size_t)t * hr] = 1.0f;   /* the first site collapses with [1, 0, ...] */
+    /* each conversation's plan, RoPE rows, list and engram rows, with it bound (its host state) */
+    size_t pn = 0;
+    for (int t = 0; ok && t < S; t++) {
+        v41_mux_bind(m, slots[t]);
+        v41u_lower(m, pos[t]);   /* this step writes the slot from pos[t] */
+        ok = v41u_plan_keys(ch, m, pos[t], 1, keyl + (size_t)t * L, need + (size_t)t * L, &last_pub[t]);
+        if (!ok) break;
+        v41u_chunk_tables(ch, m, pos[t], pos[t], 1, rd, cs1, wl + (size_t)t * LR);
+        memcpy(csa + (size_t)t * rd, cs1, (size_t)rd * sizeof(float));
+        memcpy(csa + (size_t)(S + t) * rd, cs1 + (size_t)rmax * rd, (size_t)rd * sizeof(float));   /* rope_compress[pos]: cs1's last row */
+        memcpy(csa + (size_t)2 * S * rd + (size_t)t * rmax * rd, cs1 + rd, (size_t)rmax * rd * sizeof(float));
+        for (int i = 0; i < L; i++) if (eng[i] >= 0) v41u_engram_host(m, i, 1, pos[t], er + ((size_t)eng[i] * S + t) * ew);
+        pn += v41u_pull_plan(ch, m, pos[t], 1, pn, pc + (size_t)t * L);
+    }
+    /* the step's buffers, between frames (a reserve that grows drops what the buffer held) */
+    ok = ok && v41u_scratch(ch, m, S, maxE) && v41u_res(&ch->cs, ncs, CC_DEV) && v41u_res(&ch->pull, pn, CC_DOWN) &&
+         v41u_res(&ch->lw_list, (size_t)S * LR, CC_DEV) && (!cand || v41u_res(&ch->lw_mask, ((size_t)S * ch->wcap + 3) / 4, CC_DEV));
+    if (ok && ch->lw_cap < (size_t)S) {
+        float *a = (float *)realloc(ch->lw_in, (size_t)S * D * sizeof(float));
+        if (a) ch->lw_in = a;
+        float *b = a ? (float *)realloc(ch->lw_out, (size_t)S * D * sizeof(float)) : NULL;
+        if (b) ch->lw_out = b;
+        ok = a && b;
+        if (ok) ch->lw_cap = (size_t)S;
+    }
+    int cmoe = 0;
+#if V41U_CMOE
+    int cm_ids[V41U_ROWS_MAX * CC_ROUTE_KMAX];
+    float cm_w[V41U_ROWS_MAX * CC_ROUTE_KMAX];
+    cmoe = ok && v41u_cmoe_setup(ch, m);
+    if (cmoe) {
+        const int E = ch->cm_E, K = ch->cm_K;
+        ok = v41u_res(&ch->cm_lg, (size_t)S * E, CC_DEV) && cc_reserve(&ch->cm_ids, (size_t)S * K * sizeof(int), CC_DOWN) &&
+             v41u_res(&ch->cm_w, (size_t)S * K, CC_DOWN) && v41u_res(&ch->cm_hid, cc_moe_hid_floats(S, K, D, c->moe_inter, E), CC_DEV) &&
+             v41u_res(&ch->cm_y, (size_t)S * D, CC_DEV) && v41u_res(&ch->cm_hy, (size_t)S * D, CC_UP) &&
+             v41u_res(&ch->cm_yd, (size_t)S * D, CC_DOWN);
+        if (ok && !ch->rw_contrib) ok = (ch->rw_contrib = (float *)malloc((size_t)V41U_ROWS_MAX * CC_ROUTE_KMAX * D * sizeof(float))) != NULL;
+    }
+#endif
+    /* the frame that brings each slot's state up as far as the device does not hold it, the lists, the
+     * RoPE rows, the streams and the first collapse's mixes */
+    if (ok) {
+        ok = cc_begin();
+        for (int t = 0; ok && t < S; t++) { v41_mux_bind(m, slots[t]); ok = v41u_state_up(ch, m, pos[t], need + (size_t)t * L); }
+        ok = ok && cc_write(ch->lw_list, 0, wl, (size_t)S * LR * sizeof(int)) && cc_write(ch->cs, 0, csa, ncs * sizeof(float)) &&
+             cc_write(ch->xs, 0, h, (size_t)S * HD * sizeof(float)) && cc_write(ch->hpf, 0, hp0, (size_t)S * hr * sizeof(float));
+        ok = v41u_close(ok);
+    }
+    double dev_ms = 0.0, host_ms = 0.0, p2_ms = 0.0;
+    for (int i = 0; ok && i < L; i++) {
+        Layer *l = &m->L[i];
+        const double ta = now_s();
+        XT(stream_prefetch)(i, S);
+#if V41U_CMOE
+        if (cmoe && !v41u_cmoe_tables(ch, m, 0)) {   /* the tier's residents moved: this layer's frame reads the new tables */
+            if (cc_lost()) { ok = 0; break; }
+            v41u_cmoe_off(ch, "the tier's tables refused");
+            cmoe = 0;
+        }
+#endif
+        const int opened = cc_begin();
+        ok = opened;
+        if (ok && eng[i] >= 0) ok = v41u_engram_dev(ch, m, i, S, er + (size_t)eng[i] * S * ew);
+        ok = ok && v41u_pre(ch, m, ch->fna[i], ch->o_hca[i], ch->hpa, ch->hpf, ch->o_an[i], S) &&
+             v41u_attention_rows(ch, m, i, S, slots, pos, keyl) && v41u_post(ch, m, ch->hpa, S) &&
+             v41u_pre(ch, m, ch->fnf[i], ch->o_hcf[i], ch->hpf, ch->hpa, ch->o_fn[i], S) &&
+             cc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)S * D) && v41u_shared(ch, m, l, S);
+#if V41U_CMOE
+        if (ok && cmoe && !v41u_cmoe_dev_s(ch, m, i, S)) {   /* refused (not a lost device): the host's routed experts from here on */
+            if (cc_lost()) ok = 0;
+            else { v41u_cmoe_off(ch, "the device's router or experts refused (cc_matmul/cc_route/cc_moe parts 1, S rows)"); cmoe = 0; }
+        }
+        if (ok && cmoe) {   /* the frame left running: its word says the routes (and h2d, copied before them) are down */
+            ok = cc_submit(0);
+            if (ok) {
+                const double tw = now_s();
+                volatile unsigned *fw = (volatile unsigned *)cc_ptr(ch->cm_flag);
+                for (unsigned long spin = 0; *fw < ch->cm_seq; spin++)
+                    if ((spin & 0xFFFFu) == 0 && (cc_lost() || now_s() - tw > 60.0)) {
+                        fprintf(stderr, "[CUDA] deepseek_v41 chain rows: the device did not reach layer %d's routes in 60 s\n", i);
+                        ok = 0; break;
+                    }
+            }
+        } else
+#endif
+        if (opened) ok = v41u_close(ok);
+        if (ok) memcpy(ch->lw_in, cc_ptr(ch->h2d), (size_t)S * D * sizeof(float));
+        m->t_attn += now_s() - ta;
+        dev_ms += (now_s() - ta) * 1e3;
+        if (!ok) break;
+        const double th = now_s();
+#if V41U_CMOE
+        if (cmoe) v41u_cmoe_host_rows(ch, m, i, S, ch->lw_in, cm_ids, cm_w);
+        else
+#endif
+        moe_run_at(m, l, &m->cache[i], "layers", i, c->n_routed, c->n_activated, ch->lw_in, S, ch->lw_out, 0);
+        host_ms += (now_s() - th) * 1e3;
+        const double tp = now_s();
+        CcBuf *rin = ch->routed;   /* the routed rows the add reads: the host's, or the device's y */
+        CcEw add = {CC_EW_ADD, S * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+        int open = 0;
+#if V41U_CMOE
+        if (cmoe) {   /* y = hy + the resident slots' w * down in rank order (cc_moe parts 2, S rows), then the add from y */
+            CcMoe p2 = v41u_cmoe_args_s(ch, m, i, 2, S);
+            ok = open = cc_begin();
+            if (ok && cc_moe(ch->cm_tab, ch->nrm, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_y, ch->cm_hy, &p2)) rin = ch->cm_y;
+            else if (ok) {   /* refused: this layer's routed rows from moe_run_at after all, the host step from here on */
+                ok = !cc_lost() && cc_submit(1);
+                open = 0;
+                if (ok) {
+                    v41u_cmoe_off(ch, "the device's experts refused (cc_moe parts 2, S rows)");
+                    cmoe = 0;
+                    moe_run_at(m, l, &m->cache[i], "layers", i, c->n_routed, c->n_activated, ch->lw_in, S, ch->lw_out, 0);
+                }
+            }
+        }
+#endif
+        if (ok && rin == ch->routed) {
+            memcpy(cc_ptr(ch->routed), ch->lw_out, (size_t)S * D * sizeof(float));
+            ok = open = cc_begin();
+        }
+        ok = ok && cc_ops()->ew(ch->br, rin, ch->ds, NULL, NULL, &add) && v41u_post(ch, m, ch->hpf, S);
+        if (open) ok = v41u_close(ok);
+        p2_ms += (now_s() - tp) * 1e3;
+#if V41U_CMOE
+        if (ok && rin == ch->cm_y) {   /* the device's books for each row (vkt_dev_count), as a one-row step's */
+            const int E = ch->cm_E, K = ch->cm_K;
+            for (int t = 0; t < S; t++) {
+                int valid = 1;
+                for (int k = 0; k < K; k++) valid &= cm_ids[t * K + k] >= 0 && cm_ids[t * K + k] < E;
+                if (valid) XT(dev_count)(i, 1, K, cm_ids + t * K);
+            }
+        }
+#endif
+        if (ok) ch->rw_layers++;
+    }
+    (void)cmoe;
+    /* the streams and mixes back, and (apply) each slot's state */
+    if (ok) {
+        const double tz = now_s();
+        ok = cc_begin();
+        ok = ok && cc_copy(ch->xd, 0, ch->xs, 0, (size_t)S * HD) && cc_copy(ch->hpd, 0, ch->hpf, 0, (size_t)S * hr);
+        for (int t = 0; ok && apply && t < S; t++) {
+            v41_mux_bind(m, slots[t]);
+            ok = v41u_state_pull(ch, m, pos[t], pos[t] + 1, pc + (size_t)t * L, (size_t)hd);
+        }
+        ok = v41u_close(ok);
+        dev_ms += (now_s() - tz) * 1e3;
+    }
+    if (ok) {
+        const float *xd = (const float *)cc_ptr(ch->xd), *hpd = (const float *)cc_ptr(ch->hpd);
+        for (int t = 0; t < S; t++) {
+            memcpy(h + (size_t)t * HD, xd + (size_t)t * HD, (size_t)HD * sizeof(float));
+            memcpy(pre_mix + (size_t)t * H, hpd + (size_t)t * hr, (size_t)H * sizeof(float));
+        }
+        for (int t = 0; apply && t < S; t++) {   /* the window row (pw: a row's), compressed rows, keys and group of each */
+            v41_mux_bind(m, slots[t]);
+            v41u_state_apply(ch, m, pos[t], 1, pc + (size_t)t * L, (size_t)hd, last_pub[t]);
+        }
+    }
+    free(keyl); free(need); free(wl); free(eng); free(pc); free(cs1); free(csa); free(er); free(hp0);
+    if (!ok) {   /* the slots' device copies from their positions are stale; the host's state is as it was */
+        for (int t = 0; t < S; t++) { v41_mux_bind(m, slots[t]); v41u_lower(m, pos[t]); }
+        if (cc_lost()) {
+            *lost = 1; g_v41u_off = 1; ch->ok = 0;
+            fprintf(stderr, "[CUDA] deepseek_v41 chain rows: a frame failed; the CPU runs the layers from now on\n");
+        }
+        return 0;
+    }
+    const double tot = (now_s() - t0) * 1e3;
+    ch->rw_steps++; ch->rw_rows += (unsigned long long)S;
+    ch->rw_dev_ms += dev_ms; ch->rw_host_ms += host_ms; ch->rw_p2_ms += p2_ms;
+    ch->rw_book_ms += tot - dev_ms - host_ms - p2_ms; ch->rw_fwd_ms += tot;
+    if (ch->rw_steps == 1)
+        fprintf(stderr, "[CUDA] deepseek_v41 chain rows (V41_CHAIN_ROWS): a decode step's %d conversations' rows in one frame a layer, "
+                        "their attention a slot at a time%s\n", S, cmoe ? "; the routed experts in the chain" : "");
+    return 1;
+}
+/* forward_rows' books: the heads' time of a batched step; a step that fell back (said once); a checked
+ * step's comparison of each row's logits (lg: the batched step's, ref: a row at a time's) */
+static void v41u_rows_head(double ms) {
+    if (g_v41u) { g_v41u->rw_head_ms += ms; g_v41u->rw_fwd_ms += ms; }
+}
+static void v41u_rows_fallback(int lost) {
+    static int said;
+    if (g_v41u) g_v41u->rw_fallbacks++;
+    if (!said++) fprintf(stderr, "[CUDA] deepseek_v41 chain rows (V41_CHAIN_ROWS): a batched step %s; that step a row at a time%s\n",
+                         lost ? "lost the device" : "was not taken or refused", lost ? " (the CPU from now on)" : "");
+}
+static void v41u_rows_compare(const float *lg, const float *ref, int n, int V) {
+    V41U *ch = g_v41u;
+    if (!ch) return;
+    ch->rw_checked_steps++;
+    for (int t = 0; t < n; t++) {
+        double mx = 0.0, md = 0.0;
+        int a0 = 0, a1 = 0;
+        for (int v = 0; v < V; v++) {
+            const double r = fabs((double)ref[(size_t)t * V + v]), df = fabs((double)ref[(size_t)t * V + v] - (double)lg[(size_t)t * V + v]);
+            if (r > mx) mx = r;
+            if (df > md || df != df) md = df;
+            if (lg[(size_t)t * V + v] > lg[(size_t)t * V + a0]) a0 = v;
+            if (ref[(size_t)t * V + v] > ref[(size_t)t * V + a1]) a1 = v;
+        }
+        const double rel = mx > 0.0 ? md / mx : md;
+        if (rel > ch->rw_err_max || rel != rel) ch->rw_err_max = rel;
+        ch->rw_err_sum += rel;
+        ch->rw_checked_rows++;
+        if (ch->rw_checked_steps <= 4 || rel > 1e-3 || a0 != a1)
+            fprintf(stderr, "[CUDA] deepseek_v41 chain rows check: step %llu row %d of %d, logits max rel err %.3g%s\n", ch->rw_checked_steps,
+                    t, n, rel, a0 != a1 ? " (the argmax differs)" : "");
+    }
 }
 #endif

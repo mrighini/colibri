@@ -5257,6 +5257,92 @@ static void v41_seq_alloc(Model *m, V41Seq *q, int with_state) {
     }
 }
 
+#ifdef COLI_CUDA
+/* V41_CHAIN_ROWS=1 (deepseek_v41_cuchain.h's v41u_forward_rows): a decode step's rows of the active
+ * conversations through the chain together, each row's sequence books as forward_full keeps them for a
+ * one-row step (the engram push, the head, the record, the position). 1: done, logits [n, V], every
+ * conversation one position on, slots[n - 1] bound; 0: not taken or refused, every conversation's
+ * host state as it was (the caller takes the row at a time, M2).
+ * V41_CHAIN_ROWS_CHECK=<steps>: for the first steps the batched result is computed but not applied (no
+ * state pulled, no device validity raised, the engram pushes taken back, the slots' device copies
+ * lowered to their positions), then the row at a time runs the step for real and the two sets of
+ * logits are compared (v41u_rows_compare; the exit report's summary). Its routed experts go through
+ * the cache and the tier twice, so a checked run's hit counts and the tier's heat are not a plain run's. */
+static int v41_rows_chain(Model *m, const int *slots, const int *ids, int n, float *logits) {
+    if (!v41u_rows_wanted(m, slots, n)) return 0;
+    Cfg *c = &m->c;
+    const int dim = c->dim, hc = c->hc_mult, V = c->vocab;
+    int pos[V41U_ROWS_MAX];
+    for (int t = 0; t < n; t++) {
+        v41_mux_bind(m, slots[t]);
+        pos[t] = m->pos;
+        if (pos[t] + 1 > c->max_positions) return 0;   /* the row at a time says CONTEXT_EXCEEDED */
+    }
+    const int check = v41u_rows_check_take();
+    m->rollback_save = 0; m->pub_rows = 0;
+    for (int t = 0; t < n; t++) {   /* forward_full's push, before the hashes read the history */
+        v41_mux_bind(m, slots[t]);
+        if (m->engram.active) engram_push(&m->engram, ids + t, 1, NULL);
+    }
+    float *h = xmalloc((size_t)n * hc * dim * sizeof(float), "residual streams");
+    float *pre_mix = xmalloc((size_t)n * hc * sizeof(float), "pre mix");
+    float *lg = check ? xmalloc((size_t)n * V * sizeof(float), "checked logits") : logits;
+    for (int t = 0; t < n; t++) {
+        wb_row_f32(&m->embed, ids[t], h + (size_t)t * hc * dim);
+        for (int copy = 1; copy < hc; copy++)
+            memcpy(h + ((size_t)t * hc + copy) * dim, h + (size_t)t * hc * dim, (size_t)dim * sizeof(float));
+    }
+    int lost = 0;
+    const int done = v41u_forward_rows(m, slots, pos, n, h, pre_mix, !check, &lost);
+    if (done) {   /* the head per row, forward_full's arithmetic */
+        const double th = now_s();
+        float *collapsed = xmalloc((size_t)dim * sizeof(float), "collapsed stream");
+        float *normed = xmalloc((size_t)dim * sizeof(float), "final norm");
+        for (int t = 0; t < n; t++) {
+            const float *mix = pre_mix + (size_t)t * hc;
+            for (int i = 0; i < dim; i++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++) sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+                collapsed[i] = sum;
+            }
+            rms_into(normed, collapsed, m->norm.w, dim, c->norm_eps);
+            mvb(lg + (size_t)t * V, &m->head, normed);
+        }
+        free(normed); free(collapsed);
+        v41u_rows_head((now_s() - th) * 1e3);
+    }
+    free(h); free(pre_mix);
+    if (!done || check) {   /* nothing of the batched step stays: the pushes back, the device's copies from each position stale */
+        for (int t = 0; t < n; t++) {
+            v41_mux_bind(m, slots[t]);
+            if (m->engram.active) m->engram.history_len--;
+            v41u_lower(m, pos[t]);
+        }
+        if (!done) {
+            v41u_rows_fallback(lost);
+            if (check) free(lg);
+            return 0;
+        }
+        if (!v41u_mux_rows(m)) { free(lg); return 0; }
+        for (int t = 0; t < n; t++) {   /* the proven path, for real */
+            v41_mux_bind(m, slots[t]);
+            forward(m, ids + t, 1, logits + (size_t)t * V);
+        }
+        v41u_rows_compare(lg, logits, n, V);
+        free(lg);
+        return 1;
+    }
+    for (int t = 0; t < n; t++) {   /* forward_full's books for each row's one-row step; slots[n - 1] stays bound */
+        v41_mux_bind(m, slots[t]);
+        kv_prefix_record(&m->kvp, ids + t, pos[t], 1);
+        m->pos = pos[t] + 1;
+        m->last_start = m->last_from = pos[t]; m->last_rows = 1;
+        m->forwards++;
+    }
+    return 1;
+}
+#endif
+
 /* One decode step of several conversations: row t is the token ids[t] of the
  * conversation in slot slots[t], at its next position. The streams, their mixes,
  * the routed experts and the head run once over the n rows; the engram and the
@@ -5271,6 +5357,7 @@ static void forward_rows(Model *m, const int *slots, const int *ids, int n, floa
      * one-row decode step of its own conversation through forward_full, as KV_SLOTS=1 runs one
      * (the engram push, the chain or the CPU's layers, the head, the position and the record);
      * the last row's slot stays bound, as below */
+    if (v41u_mux_rows(m) && v41_rows_chain(m, slots, ids, n, logits)) return;   /* V41_CHAIN_ROWS=1: the rows together */
     if (v41u_mux_rows(m)) {
         for (int t = 0; t < n; t++) {
             v41_mux_bind(m, slots[t]);
