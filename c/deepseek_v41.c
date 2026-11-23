@@ -1629,6 +1629,7 @@ typedef struct {
     int32_t *candidates; int candidate_topk, candidate_width, candidate_rows;
 } V41Seq;
 static int g_v41_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
+static int g_v41_mux_cur;          /* the slot the Model holds, -1 when every one is parked (serve_mux) */
 
 /* ------------------------------------------------------------ rope --------- */
 
@@ -5196,7 +5197,7 @@ static int argmax(const float *values, int n) {
  * own conversation bound (attention_run reads the cross-layer state from the Model,
  * so it is bound whole: pointers, not copies). Nothing drafts. */
 static V41Seq *g_v41_mux_seq;   /* [slots]: the conversations the Model does not hold */
-static int g_v41_mux_cur;       /* the slot the Model holds, -1 when every one is parked */
+/* g_v41_mux_cur: declared beside g_v41_mux_slots (the CUDA chain's per-slot state reads it) */
 
 static void v41_seq_swap(Model *m, V41Seq *q) {
 #define V41_SWAP(T,a,b) do { T t_ = (a); (a) = (b); (b) = t_; } while (0)
@@ -5265,12 +5266,28 @@ static void v41_seq_alloc(Model *m, V41Seq *q, int with_state) {
 static void forward_rows(Model *m, const int *slots, const int *ids, int n, float *logits) {
     Cfg *c = &m->c;
     int dim = c->dim, hc = c->hc_mult;
+#ifdef COLI_CUDA
+    /* the CUDA chain holds every slot's state (deepseek_v41_cuchain.h, v41u_mux_rows): each row a
+     * one-row decode step of its own conversation through forward_full, as KV_SLOTS=1 runs one
+     * (the engram push, the chain or the CPU's layers, the head, the position and the record);
+     * the last row's slot stays bound, as below */
+    if (v41u_mux_rows(m)) {
+        for (int t = 0; t < n; t++) {
+            v41_mux_bind(m, slots[t]);
+            forward(m, ids + t, 1, logits + (size_t)t * c->vocab);
+        }
+        return;
+    }
+#endif
     int *pos = xmalloc((size_t)n * sizeof(int), "row positions");
     for (int t = 0; t < n; t++) {
         v41_mux_bind(m, slots[t]);
         pos[t] = m->pos;
         if (pos[t] + 1 > c->max_positions) { fprintf(stderr, "CONTEXT_EXCEEDED %d %d\n", pos[t] + 1, c->max_positions); exit(1); }
         if (m->engram.active) engram_push(&m->engram, ids + t, 1, NULL);
+#ifdef COLI_CUDA
+        v41u_lower(m, pos[t]);   /* the CPU writes this slot's state from pos[t]: the device's copy past it is stale */
+#endif
     }
     m->rollback_save = 0; m->pub_rows = 0;
     float *h = xmalloc((size_t)n * hc * dim * sizeof(float), "residual streams");
@@ -6689,7 +6706,7 @@ static size_t v41_cu_float(int O, int I) {
 static size_t v41_cu_w8(const W8 *w) {
     if (!w->gx) {   /* the native FP8 the CUDA chain takes as fmt 9 (deepseek_v41_cuchain.h's v41u_t8) */
         const char *e = getenv("COLI_CUDA_CHAIN");
-        return (e && *e == '0') || !w->q || !w->s || g_v41_mux_slots > 1 ? 0 : cud_bytes(9, w->O, w->I, 0);
+        return (e && *e == '0') || !w->q || !w->s || !v41u_slots_ok() ? 0 : cud_bytes(9, w->O, w->I, 0);
     }
     return cud_float(100 + w->gt) ? v41_cu_float(w->O, w->I) : cud_bytes(100 + w->gt, w->O, w->I, 0);
 }
@@ -6760,12 +6777,13 @@ static size_t v41_cu_dense_bytes(const Model *m) {
     return b;
 }
 #endif
-/* what a prompt's chain allocates on the tier's device: the CUDA chain's at most (a GGUF on the
- * CUDA tier, one conversation, COLI_CUDA_CHAIN not 0); the tier leaves it */
+/* what a prompt's chain allocates on the tier's device: the CUDA chain's at most (a GGUF or the
+ * native FP8 on the CUDA tier, COLI_CUDA_CHAIN not 0; KV_SLOTS > 1 only with the decode steps on
+ * the chain, COLI_CUDA_V41_MIN=1: v41u_slots_ok, every slot's state counted); the tier leaves it */
 static size_t v41_tier_chain_bytes(Model *m) {
 #ifdef COLI_CUDA
     const char *e = getenv("COLI_CUDA_CHAIN");
-    if (xt_cuda() && (m->gguf || v41u_native(m)) && !(e && *e == '0') && g_v41_mux_slots <= 1) return v41u_plan_bytes(m, m->c.max_positions);
+    if (xt_cuda() && (m->gguf || v41u_native(m)) && !(e && *e == '0') && v41u_slots_ok()) return v41u_plan_bytes(m, m->c.max_positions);
 #endif
     (void)m;
     return 0;

@@ -23,7 +23,10 @@
  *
  * Not here: a decode step, a speculative verify, DSpark's targets, a model past the device's
  * memory (a matrix the dense budget does not take, scratch refused): forward_full runs the
- * layers; KV_SLOTS above 1. COLI_CUDA_CHAIN=0: never. COLI_CUDA_V41_ROWS: a chunk's rows (256). */
+ * layers. KV_SLOTS above 1: every slot's state in its own region of the state buffers (v41u_wo,
+ * v41u_co, v41u_io, v41u_ro), and only a decode step's one row on the chain, a slot at a time
+ * (forward_rows, v41u_mux_rows; COLI_CUDA_V41_MIN=1), the prompts on the CPU. COLI_CUDA_CHAIN=0:
+ * never. COLI_CUDA_V41_ROWS: a chunk's rows (256). */
 #ifndef DEEPSEEK_V41_CUCHAIN_H
 #define DEEPSEEK_V41_CUCHAIN_H
 #include "cuda_chain.h"
@@ -45,7 +48,11 @@ typedef struct {
     size_t *o_an, *o_fn, *o_qn, *o_kn, *o_sink, *o_hca, *o_hcf, *o_cn, *o_ikn, *o_eq, *o_ek;
     ColiCudaTensor **fna, **fnf;
     CcBuf **win, **ckv, **ikey, **ring;
-    int *kv_valid, *ccap, win_valid;
+    /* KV_SLOTS > 1 (serve_mux): every slot's state in its own region of each layer's buffer at a fixed
+     * stride (v41u_wo, v41u_co, v41u_io, v41u_ro), SL of them; one slot: slot 0's region, at 0 */
+    int SL, hd, ihd;
+    int *kv_valid;   /* [SL * n_layers]: slot s, layer i at s * n_layers + i */
+    int *ccap, *win_valid;   /* win_valid: [SL] */
     CcBuf *xs, *xn, *mix, *hpa, *hpf, *col, *nrm, *qa, *qr, *q, *kv, *heads, *grp, *br, *craw, *cscr;
     CcBuf *iq, *ihw, *isc, *cs, *erows, *ekv, *gs, *us, *hs, *ds, *h2d, *xd, *hpd, *pull, *routed;
     CcBuf *lw_xs, *lw_hp, *lw_ds, *lw_list, *lw_mask;
@@ -79,6 +86,16 @@ typedef struct {
 static V41U *g_v41u;
 static int g_v41u_off;   /* declined for good (set up refused, or COLI_CUDA_CHAIN=0) */
 
+/* the slot whose state the chain reads and writes: the one the Model holds (v41_mux_bind), -1 none */
+static int v41u_slot(const V41U *ch) { return ch->SL > 1 ? g_v41_mux_cur : 0; }
+/* slot s's region in a layer's window ring (Wd rows), compressed rows and index keys (ccap[i] each),
+ * the compressor's group (2r rows: the kv, then the scores), in floats; slot 0's is at 0 */
+static size_t v41u_wo(const V41U *ch, int s) { return (size_t)s * ch->Wd * ch->hd; }
+static size_t v41u_co(const V41U *ch, int i, int s) { return (size_t)s * ch->ccap[i] * ch->hd; }
+static size_t v41u_io(const V41U *ch, int i, int s) { return (size_t)s * ch->ccap[i] * ch->ihd; }
+static size_t v41u_ro(const V41U *ch, const Model *m, int i, int s) { return (size_t)s * 2 * m->c.compress_ratio[i] * ch->hd; }
+static int *v41u_kvv(const V41U *ch, const Model *m, int s) { return ch->kv_valid + (size_t)s * m->c.n_layers; }
+
 static int v41u_res(CcBuf **b, size_t floats, int kind) { return cc_reserve(b, (floats ? floats : 1) * sizeof(float), kind); }
 /* a W8: a GGUF's blocks, or the native checkpoint's e4m3 with its 32x32 ue8m0 tiles (fmt 9, mv8_rows_cpu's bits) */
 static ColiCudaTensor *v41u_t8(const W8 *w) {
@@ -107,10 +124,15 @@ static void v41u_lower(Model *m, int pos) {
     V41U *ch = g_v41u;
     if (!ch || !ch->ok) return;
     if (pos < 0) pos = 0;
-    if (ch->win_valid > pos) ch->win_valid = pos;
-    for (int i = 0; i < m->c.n_layers; i++) {
-        int r = m->c.compress_ratio[i];
-        if (m->c.kv_source[i] && r > 0 && ch->kv_valid[i] > pos / r) ch->kv_valid[i] = pos / r;
+    /* the bound slot's; KV_SLOTS > 1 with none bound (or one out of range): every slot's */
+    const int cur = v41u_slot(ch), all = cur < 0 || cur >= ch->SL;
+    for (int s = all ? 0 : cur; s < (all ? ch->SL : cur + 1); s++) {
+        int *kvv = v41u_kvv(ch, m, s);
+        if (ch->win_valid[s] > pos) ch->win_valid[s] = pos;
+        for (int i = 0; i < m->c.n_layers; i++) {
+            int r = m->c.compress_ratio[i];
+            if (m->c.kv_source[i] && r > 0 && kvv[i] > pos / r) kvv[i] = pos / r;
+        }
     }
 }
 
@@ -155,18 +177,36 @@ static size_t v41u_plan_bytes(const Model *m, int ctx) {
     f += R * (2 * HD + nm + 2 * hr + 3 * D + 2 * (size_t)c->q_lora + 2 * nh * hd + 3 * hd + (size_t)c->o_groups * c->o_lora +
               IH * ID + IH + E + ew + D * (H + 1) + 3 * (size_t)c->moe_inter) + (R + (size_t)rmax) * 2 * (size_t)c->rope_dim;
     f += ((size_t)64 << 20) / 4 + R * nh;                        /* the attention's scores (cc_ds_attn's 64 MiB) */
-    f += L * (W + R) * hd + L * 2 * nm * HD;                     /* the window rings, the mixers' matrices */
+    /* every slot's state (KV_SLOTS > 1: SL of them, each compressed cache sized once for max_positions
+     * as v41u_cache does, so a slot's growth never drops another's) */
+    const size_t SL = g_v41_mux_slots > 1 ? (size_t)g_v41_mux_slots : 1;
+    f += SL * L * (W + R) * hd + L * 2 * nm * HD;                /* the window rings, the mixers' matrices */
     for (int i = 0; i < c->n_layers; i++) {
         const int r = c->compress_ratio[i];
         if (!c->kv_source[i] || r < 1) continue;
         size_t cap = 64;
-        while (cap < E / (size_t)r) cap *= 2;
-        f += cap * (hd + ID) + (r > 1 ? 2 * (size_t)r * hd : 0);
+        if (SL > 1) {
+            const size_t host = (size_t)(c->max_positions / r);
+            while (cap < host) cap *= 2;
+            if (cap > host) cap = host;
+        } else
+            while (cap < E / (size_t)r) cap *= 2;
+        f += SL * (cap * (hd + ID) + (r > 1 ? 2 * (size_t)r * hd : 0));
     }
     return f * sizeof(float) + ((size_t)64 << 20);               /* and the GEMMs' passing scratch */
 }
-/* the chain keeps one conversation's state on the device: KV_SLOTS > 1 (v41_seq_swap trades the
- * host's) turns it off, as it does the Vulkan chain */
+/* COLI_CUDA_V41_MIN=<rows>: a forward of that many rows on takes the chain (1: every step, a decode's
+ * one row too -- PLAN-scale S3); 0 (unset): a prompt of more than one chunk */
+static int v41u_min_rows(void) {
+    static int min_rows = -1;
+    if (min_rows < 0) { const char *e = getenv("COLI_CUDA_V41_MIN"); min_rows = e && atoi(e) > 0 ? atoi(e) : 0; }
+    return min_rows;
+}
+/* KV_SLOTS > 1 (v41_seq_swap trades the host's state): the chain holds every slot's state (M1) and
+ * takes their decode steps one row and one slot at a time (forward_rows, v41u_mux_rows), so only
+ * when the decode steps go to the chain (COLI_CUDA_V41_MIN=1); a prompt stays the CPU's
+ * (v41u_wanted) */
+static int v41u_slots_ok(void) { return g_v41_mux_slots <= 1 || v41u_min_rows() == 1; }
 /* the native checkpoint the chain takes: its W8 are e4m3 with tiles (not a GGUF's blocks) */
 static int v41u_native(const Model *m) { return !m->gguf && m->c.n_layers > 0 && !m->L[0].wq_a.gx && m->L[0].wq_a.s; }
 static void v41u_report(void) {   /* where a chain forward's time went (PLAN-scale S3) */
@@ -194,11 +234,18 @@ static void v41u_report(void) {   /* where a chain forward's time went (PLAN-sca
                         "in %llu, max route weight diff %.3g)\n", ch->cm_checked, ch->cm_err_max, ch->cm_err_sum / (double)ch->cm_checked,
                 ch->cm_route_diff, ch->cm_wdiff);
 }
-static int v41u_wanted(Model *m) {
+static int v41u_wanted(Model *m, int n) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN"); on = !(e && *e == '0'); }
-    /* a GGUF, or the native FP8 checkpoint (its W8 as fmt 9: v41u_t8) */
-    return on && !g_v41u_off && g_v41_mux_slots <= 1 && xt_cuda() && g_cud.on && (m->gguf || v41u_native(m)) && cc_available() && cc_dsv4_ready();
+    /* a GGUF, or the native FP8 checkpoint (its W8 as fmt 9: v41u_t8); KV_SLOTS > 1: a decode step's
+     * one row only (the caller refuses a speculative batch), a prompt the CPU's */
+    const int slots_ok = g_v41_mux_slots <= 1 || (n == 1 && v41u_slots_ok());
+    return on && !g_v41u_off && slots_ok && xt_cuda() && g_cud.on && (m->gguf || v41u_native(m)) && cc_available() && cc_dsv4_ready();
+}
+/* forward_rows (KV_SLOTS > 1): each row a one-row forward_full of its own bound slot through the
+ * chain, as a KV_SLOTS=1 decode step (nothing drafts with KV_SLOTS > 1; DSpark stays unloaded) */
+static int v41u_mux_rows(Model *m) {
+    return g_v41_mux_slots > 1 && v41u_slots_ok() && !m->spec.active && v41u_wanted(m, 1) && (!g_v41u || g_v41u->ok);
 }
 /* the struct, its device's context, the parameters, every layer's matrices and state: 0 =
  * declined (the CPU runs the layers from then on) */
@@ -208,6 +255,8 @@ static int v41u_setup(Model *m) {
     const int L = c->n_layers, D = c->dim, H = c->hc_mult, nm = (2 + H) * H, hd = c->head_dim;
     V41U *ch = (V41U *)calloc(1, sizeof *ch);
     if (!ch) return 0;
+    const int SL = g_v41_mux_slots > 1 ? g_v41_mux_slots : 1;
+    ch->SL = SL; ch->hd = hd; ch->ihd = c->index_head_dim;
     ch->cm_batch = -1;
     g_v41u = ch;
     const char *why = NULL;
@@ -217,7 +266,8 @@ static int v41u_setup(Model *m) {
     if (!why && (!(ch->fna = (ColiCudaTensor **)calloc((size_t)L, sizeof *ch->fna)) || !(ch->fnf = (ColiCudaTensor **)calloc((size_t)L, sizeof *ch->fnf)) ||
                  !(ch->win = (CcBuf **)calloc((size_t)L, sizeof *ch->win)) || !(ch->ckv = (CcBuf **)calloc((size_t)L, sizeof *ch->ckv)) ||
                  !(ch->ikey = (CcBuf **)calloc((size_t)L, sizeof *ch->ikey)) || !(ch->ring = (CcBuf **)calloc((size_t)L, sizeof *ch->ring)) ||
-                 !(ch->kv_valid = (int *)calloc((size_t)L, sizeof(int))) || !(ch->ccap = (int *)calloc((size_t)L, sizeof(int)))))
+                 !(ch->kv_valid = (int *)calloc((size_t)L * SL, sizeof(int))) || !(ch->ccap = (int *)calloc((size_t)L, sizeof(int))) ||
+                 !(ch->win_valid = (int *)calloc((size_t)SL, sizeof(int)))))
         why = "memory";
     ch->W = c->window; ch->K = c->index_topk > 0 ? c->index_topk : 0; ch->rmax = 1;
     for (int i = 0; i < L; i++) if (c->kv_source[i] && c->compress_ratio[i] > ch->rmax) ch->rmax = c->compress_ratio[i];
@@ -285,8 +335,8 @@ static int v41u_setup(Model *m) {
                             "%.2f of %.2f GiB used)\n", i, bad, bt, bo, bi, g_cud.used / 1073741824.0, g_cud.budget / 1073741824.0);
             why = "a matrix the device's dense budget or format does not take"; break;
         }
-        if (!(ch->win[i] = cc_buf((size_t)ch->Wd * hd * sizeof(float), CC_DEV)) ||
-            (c->kv_source[i] && r > 1 && !(ch->ring[i] = cc_buf((size_t)2 * r * hd * sizeof(float), CC_DEV))))
+        if (!(ch->win[i] = cc_buf((size_t)SL * ch->Wd * hd * sizeof(float), CC_DEV)) ||
+            (c->kv_source[i] && r > 1 && !(ch->ring[i] = cc_buf((size_t)SL * 2 * r * hd * sizeof(float), CC_DEV))))
             why = "device memory for the layers' state";
     }
     if (why) {
@@ -296,21 +346,37 @@ static int v41u_setup(Model *m) {
     }
     ch->ok = 1;
     atexit(v41u_report);
+    if (SL > 1) fprintf(stderr, "[CUDA] deepseek_v41 chain: %d conversations' state on the card (KV_SLOTS), their decode steps "
+                                "one row at a time; their prompts on the CPU\n", SL);
     fprintf(stderr, "[CUDA] deepseek_v41 chain: a prompt's %d layers on the card, layer by layer (%.1f MiB of parameters; "
                     "COLI_CUDA_CHAIN=0: the CPU)\n", L, n * 4 / 1048576.0);
     return 1;
 }
+/* layer i's compressed rows and index keys for rows groups. One slot: grown as needed (what it held is
+ * dropped). KV_SLOTS > 1: every slot's region sized once for max_positions (the same rule at the
+ * host's groups), so no slot's growth drops another's; refused past the ops' int offsets */
 static int v41u_cache(V41U *ch, Model *m, int i, int rows) {
     Cfg *c = &m->c;
     if (ch->ccap[i] >= rows) return 1;
     int r = c->compress_ratio[i], host = c->max_positions / (r > 0 ? r : 1), cap = 64;
-    while (cap < rows) cap *= 2;
+    if (ch->SL > 1 && ch->ccap[i] > 0) return 0;   /* already max_positions' */
+    const int target = ch->SL > 1 ? (host > rows ? host : rows) : rows;
+    while (cap < target) cap *= 2;
     if (cap > host) cap = host;
     if (cap < rows) return 0;
+    const size_t wide = (size_t)(c->head_dim > c->index_head_dim ? c->head_dim : c->index_head_dim);
+    if (ch->SL > 1 && (size_t)ch->SL * (size_t)cap * wide > (size_t)0x7fffffff) {
+        static int said;
+        if (!said++) fprintf(stderr, "[CUDA] deepseek_v41 chain: %d slots of %d compressed rows pass the ops' offsets; "
+                                     "the CPU decodes\n", ch->SL, cap);
+        g_v41u_off = 1;   /* for good: forward_rows batches its rows on the CPU again */
+        return 0;
+    }
     cc_free(ch->ckv[i]); cc_free(ch->ikey[i]);
-    ch->ckv[i] = cc_buf((size_t)cap * c->head_dim * sizeof(float), CC_DEV);
-    ch->ikey[i] = cc_buf((size_t)cap * c->index_head_dim * sizeof(float), CC_DEV);
-    ch->kv_valid[i] = 0; ch->ccap[i] = 0;
+    ch->ckv[i] = cc_buf((size_t)ch->SL * cap * c->head_dim * sizeof(float), CC_DEV);
+    ch->ikey[i] = cc_buf((size_t)ch->SL * cap * c->index_head_dim * sizeof(float), CC_DEV);
+    for (int s = 0; s < ch->SL; s++) v41u_kvv(ch, m, s)[i] = 0;
+    ch->ccap[i] = 0;
     if (!ch->ckv[i] || !ch->ikey[i]) return 0;
     ch->ccap[i] = cap;
     return 1;
@@ -392,6 +458,8 @@ static int v41u_attention(V41U *ch, Model *m, int i, const V41UFwd *f) {
     const int nr = f->nr, pb = f->pb, qrow = nh * hd, LR = ch->W + ch->K;
     const int tcs = r > 0 ? f->csB + (ch->rmax - 1) * rd : 0;   /* rope_for(layer): the row of position pb */
     const ColiCudaChainOps *o = cc_ops();
+    const int sl = v41u_slot(ch);   /* the bound slot's regions of the state buffers */
+    const size_t wo = v41u_wo(ch, sl);
     int ok = o->matmul(v41u_t8(&l->wq_a), ch->nrm, 0, ch->qa, 0, nr) &&
              v41u_norm(ch, ch->qa, 0, QL, ch->o_qn[i], ch->qr, 0, QL, nr, QL, c->norm_eps) &&
              o->matmul(v41u_t8(&l->wq_b), ch->qr, 0, ch->q, 0, nr) &&
@@ -402,26 +470,26 @@ static int v41u_attention(V41U *ch, Model *m, int i, const V41UFwd *f) {
     if (!ok) return 0;
     CcRegion *rg = (CcRegion *)malloc((size_t)nr * sizeof *rg);   /* the new rows into the window ring */
     if (!rg) return 0;
-    for (int s = 0; s < nr; s++) rg[s] = (CcRegion){(size_t)((pb + s) % ch->Wd) * hd, (size_t)s * hd, (size_t)hd};
+    for (int s = 0; s < nr; s++) rg[s] = (CcRegion){wo + (size_t)((pb + s) % ch->Wd) * hd, (size_t)s * hd, (size_t)hd};
     ok = o->copy_regions(ch->win[i], ch->kv, rg, nr);
     free(rg);
     if (ok && r > 0 && c->kv_source[i]) {   /* the compressor, its latents, the index keys */
         const int g0 = pb / r, np = (pb + nr) / r - g0, ihd = c->index_head_dim;
         CcBuf *cb = ch->ckv[i];
-        const size_t co = (size_t)g0 * hd;
+        const size_t cso = v41u_co(ch, i, sl), iso = v41u_io(ch, i, sl), co = cso + (size_t)g0 * hd, io = iso + (size_t)g0 * ihd;
         ok = o->matmul(v41u_tb(&l->comp_wkv), ch->nrm, 0, ch->craw, 0, nr);
         if (ok && r == 1) ok = v41u_norm(ch, ch->craw, 0, hd, ch->o_cn[i], cb, co, hd, nr, hd, c->norm_eps);
         else if (ok) {
-            CcDsComp cp = {nr, pb, r, hd, hd, 0, 0, hd, 0, hd, -1, 0, hd, 0};
+            CcDsComp cp = {nr, pb, r, hd, hd, 0, 0, hd, 0, hd, -1, (int)cso, hd, (int)v41u_ro(ch, m, i, sl)};
             ok = o->matmul(v41u_tb(&l->comp_wgate), ch->nrm, 0, ch->cscr, 0, nr) &&
                  cc_ds_compress(ch->craw, ch->cscr, ch->ring[i], NULL, cb, &cp) &&
                  (np == 0 || v41u_norm(ch, cb, co, hd, ch->o_cn[i], cb, co, hd, np, hd, c->norm_eps));
         }
         if (ok && np > 0) {
             const int bc = f->csB + (g0 * r - (pb - ch->rmax + 1)) * rd;   /* a latent rotates at its group's first position */
-            ok = o->matmul(v41u_tb(&l->idx_wk), cb, co, ch->ikey[i], (size_t)g0 * ihd, np) &&
-                 v41u_norm(ch, ch->ikey[i], (size_t)g0 * ihd, ihd, ch->o_ikn[i], ch->ikey[i], (size_t)g0 * ihd, ihd, np, ihd, c->norm_eps) &&
-                 v41u_rope(ch, m, ch->ikey[i], np, 1, g0 * ihd + ihd - rd, ihd, 0, bc, r * rd, 0) &&
+            ok = o->matmul(v41u_tb(&l->idx_wk), cb, co, ch->ikey[i], io, np) &&
+                 v41u_norm(ch, ch->ikey[i], io, ihd, ch->o_ikn[i], ch->ikey[i], io, ihd, np, ihd, c->norm_eps) &&
+                 v41u_rope(ch, m, ch->ikey[i], np, 1, (int)io + ihd - rd, ihd, 0, bc, r * rd, 0) &&
                  v41u_rope(ch, m, cb, np, 1, (int)co + hd - rd, hd, 0, bc, r * rd, 0);
         }
     }
@@ -439,7 +507,7 @@ static int v41u_attention(V41U *ch, Model *m, int i, const V41UFwd *f) {
          * chunk of a layer runs before the next layer, so the later index sources read each row's own */
         const int lr = pb - f->start - f->s0;
         for (int s = 0; ok && s < nr; s += same ? nr : 1) {
-            CcDsScore sp = {same ? nr : 1, pb + s, r, IH, ID, width, s * IH * ID, IH * ID, s * IH, IH, 0, ID, mrow,
+            CcDsScore sp = {same ? nr : 1, pb + s, r, IH, ID, width, s * IH * ID, IH * ID, s * IH, IH, (int)v41u_io(ch, kl[s], sl), ID, mrow,
                             (int)ch->wcap, wscale, s * (int)ch->wcap, (lr + s) * mrow};
             ok = cc_ds_score(ch->iq, ch->ihw, ch->ikey[kl[s]], mrow ? ch->lw_mask : NULL, ch->isc, &sp);
         }
@@ -452,7 +520,8 @@ static int v41u_attention(V41U *ch, Model *m, int i, const V41UFwd *f) {
         ok = ok && cc_ds_topk(ch->isc, f->list, &tp);
     }
     if (!ok) return 0;
-    CcDsAttn a = {nr, nh, hd, ch->W + (r > 0 ? ch->K : 0), f->lo, LR, ch->Wd, 0, 0, 0, qrow, 0, qrow, (int)ch->o_sink[i], 0,
+    CcDsAttn a = {nr, nh, hd, ch->W + (r > 0 ? ch->K : 0), f->lo, LR, ch->Wd, (int)wo, r > 0 ? (int)v41u_co(ch, c->index_owner[i], sl) : 0,
+                  0, qrow, 0, qrow, (int)ch->o_sink[i], 0,
                   1.0f / sqrtf((float)hd)};
     return cc_ds_attn(ch->q, ch->win[i], r > 0 ? ch->ckv[c->index_owner[i]] : NULL, f->list, ch->prm, ch->heads, &a) &&
            v41u_rope(ch, m, ch->heads, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 1) &&
@@ -508,44 +577,51 @@ static void v41u_chunk_tables(const V41U *ch, const Model *m, int start, int pb,
 }
 static int v41u_state_up(V41U *ch, Model *m, int start, const int *need) {
     const Cfg *c = &m->c;
-    const int L = c->n_layers, W = ch->W, hd = c->head_dim;
+    const int L = c->n_layers, W = ch->W, hd = c->head_dim, sl = v41u_slot(ch);
+    const size_t wo = v41u_wo(ch, sl);
+    const int *kvv = v41u_kvv(ch, m, sl);
     int ok = 1;
-    for (int q = ch->win_valid > start - W + 1 ? ch->win_valid : start - W + 1; q < start && ok; q++) {
+    for (int q = ch->win_valid[sl] > start - W + 1 ? ch->win_valid[sl] : start - W + 1; q < start && ok; q++) {
         if (q < 0) continue;
         for (int i = 0; i < L && ok; i++) {
             const Layer *l = &m->L[i];
             if (l->window_pos[q % W] != q) continue;
-            ok = cc_write(ch->win[i], (size_t)(q % ch->Wd) * hd, l->window + (size_t)(q % W) * hd, (size_t)hd * sizeof(float));
+            ok = cc_write(ch->win[i], wo + (size_t)(q % ch->Wd) * hd, l->window + (size_t)(q % W) * hd, (size_t)hd * sizeof(float));
         }
     }
     for (int i = 0; i < L && ok; i++) {
         if (!c->kv_source[i]) continue;
         const Layer *l = &m->L[i];
-        const int r = c->compress_ratio[i], ihd = c->index_head_dim, t0 = ch->kv_valid[i], t1 = need[i];
-        if (t1 > t0) ok = cc_write(ch->ckv[i], (size_t)t0 * hd, l->ckv + (size_t)t0 * hd, (size_t)(t1 - t0) * hd * sizeof(float)) &&
-                          cc_write(ch->ikey[i], (size_t)t0 * ihd, l->ikey + (size_t)t0 * ihd, (size_t)(t1 - t0) * ihd * sizeof(float));
-        if (ok && r > 1) ok = cc_write(ch->ring[i], 0, l->cstate_kv, (size_t)r * hd * sizeof(float)) &&
-                              cc_write(ch->ring[i], (size_t)r * hd, l->cstate_score, (size_t)r * hd * sizeof(float));
+        const int r = c->compress_ratio[i], ihd = c->index_head_dim, t0 = kvv[i], t1 = need[i];
+        const size_t co = v41u_co(ch, i, sl), io = v41u_io(ch, i, sl);
+        if (t1 > t0) ok = cc_write(ch->ckv[i], co + (size_t)t0 * hd, l->ckv + (size_t)t0 * hd, (size_t)(t1 - t0) * hd * sizeof(float)) &&
+                          cc_write(ch->ikey[i], io + (size_t)t0 * ihd, l->ikey + (size_t)t0 * ihd, (size_t)(t1 - t0) * ihd * sizeof(float));
+        if (ok && r > 1) {
+            const size_t ro = v41u_ro(ch, m, i, sl);
+            ok = cc_write(ch->ring[i], ro, l->cstate_kv, (size_t)r * hd * sizeof(float)) &&
+                 cc_write(ch->ring[i], ro + (size_t)r * hd, l->cstate_score, (size_t)r * hd * sizeof(float));
+        }
     }
     return ok;
 }
 static int v41u_state_pull(V41U *ch, Model *m, int start, int E, const size_t *pc, size_t pw) {
     const Cfg *c = &m->c;
-    const int L = c->n_layers, W = ch->W, hd = c->head_dim;
+    const int L = c->n_layers, W = ch->W, hd = c->head_dim, sl = v41u_slot(ch);
+    const size_t wo = v41u_wo(ch, sl);
     int ok = 1;
     for (int i = 0; i < L && ok; i++) {
         const int q0 = E - W > start ? E - W : start, nq = E - q0;
         CcRegion *rg = (CcRegion *)malloc((size_t)nq * sizeof *rg);
         if (!rg) return 0;
-        for (int q = q0; q < E; q++) rg[q - q0] = (CcRegion){pc[i] + (size_t)(q - q0) * hd, (size_t)(q % ch->Wd) * hd, (size_t)hd};
+        for (int q = q0; q < E; q++) rg[q - q0] = (CcRegion){pc[i] + (size_t)(q - q0) * hd, wo + (size_t)(q % ch->Wd) * hd, (size_t)hd};
         ok = cc_ops()->copy_regions(ch->pull, ch->win[i], rg, nq);
         free(rg);
         if (!ok || !c->kv_source[i]) continue;
         const int r = c->compress_ratio[i], g0 = start / r, np = E / r - g0, ihd = c->index_head_dim;
         const size_t at = pc[i] + pw;
-        ok = cc_copy(ch->pull, at, ch->ckv[i], (size_t)g0 * hd, (size_t)np * hd) &&
-             cc_copy(ch->pull, at + (size_t)np * hd, ch->ikey[i], (size_t)g0 * ihd, (size_t)np * ihd) &&
-             (r <= 1 || cc_copy(ch->pull, at + (size_t)np * (hd + ihd), ch->ring[i], 0, (size_t)2 * r * hd));
+        ok = cc_copy(ch->pull, at, ch->ckv[i], v41u_co(ch, i, sl) + (size_t)g0 * hd, (size_t)np * hd) &&
+             cc_copy(ch->pull, at + (size_t)np * hd, ch->ikey[i], v41u_io(ch, i, sl) + (size_t)g0 * ihd, (size_t)np * ihd) &&
+             (r <= 1 || cc_copy(ch->pull, at + (size_t)np * (hd + ihd), ch->ring[i], v41u_ro(ch, m, i, sl), (size_t)2 * r * hd));
     }
     return ok;
 }
@@ -860,16 +936,17 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     Cfg *c = &m->c;
     const int L = c->n_layers, D = c->dim, H = c->hc_mult, HD = H * D, hr = 2 * H + H * H, hd = c->head_dim, rd = c->rope_dim;
     const int T = m->spec.active ? c->n_spec_targets : 0, E = start + n;
-    if (spec || T || !v41u_wanted(m)) return 0;
+    if (spec || T || !v41u_wanted(m, n)) return 0;
     if (!v41u_setup(m)) return 0;
     V41U *ch = g_v41u;
+    const int sl = v41u_slot(ch);
+    if (sl < 0 || sl >= ch->SL) return 0;   /* no slot bound (serve_mux binds one before every forward) */
     const double tfw = now_s();
     v41u_lower(m, start);   /* this forward writes from start: nothing the device holds past it is the host's */
     const int W = ch->W, LR = W + ch->K, rows = n < ch->rows ? n : ch->rows;
     /* a prompt of more than one chunk; COLI_CUDA_V41_MIN=<rows>: from that many rows on (1: every step, a decode's
      * one row too -- PLAN-scale S3) */
-    static int min_rows = -1;
-    if (min_rows < 0) { const char *e = getenv("COLI_CUDA_V41_MIN"); min_rows = e && atoi(e) > 0 ? atoi(e) : 0; }
+    const int min_rows = v41u_min_rows();
     if (min_rows ? n < min_rows : n <= rows) return 0;
     /* in segments of whole chunks, as even as they come, up to v41u_seg_rows each */
     const int chunks = (n + rows - 1) / rows, nseg = (n + v41u_seg_rows(ch) - 1) / v41u_seg_rows(ch);
@@ -1161,8 +1238,9 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
             memcpy(l->cstate_score, ring + (size_t)r * hd, (size_t)r * hd * sizeof(float));
         }
         if (last_pub >= 0) { m->published_index_k = m->L[last_pub].ikey; m->published_index_layer = last_pub; }
-        ch->win_valid = E;
-        for (int i = 0; i < L; i++) if (c->kv_source[i]) ch->kv_valid[i] = E / c->compress_ratio[i];
+        ch->win_valid[sl] = E;
+        int *kvv = v41u_kvv(ch, m, sl);
+        for (int i = 0; i < L; i++) if (c->kv_source[i]) kvv[i] = E / c->compress_ratio[i];
     }
     if (all) { memcpy(h, outs, (size_t)n * HD * sizeof(float)); memcpy(pre_mix, pres, (size_t)n * H * sizeof(float)); }
     else { memcpy(h + (size_t)(n - 1) * HD, outs, (size_t)HD * sizeof(float)); memcpy(pre_mix + (size_t)(n - 1) * H, pres, (size_t)H * sizeof(float)); }
