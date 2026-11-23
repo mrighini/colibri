@@ -2708,6 +2708,83 @@ static void e4m3t_kernel(float *y, int ystride, const float *x, int xstride, con
     if (live && j == 0)
         for (int r = 0; r < nr; r++) y[(size_t)(r0 + r) * ystride + o] = sum[r];
 }
+/* e4m3t3_kernel: the same bits, a tile a work-item. The AVX2 loop's 8 lanes are an order, not a layout: accumulator j
+ * takes columns j, j+8, j+16, j+24 of the tile. One work-item does all eight in registers -- a tile's 32 bytes in two
+ * 16-byte loads, acc_j = w_j*x_j then three fmas each, h = ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)) -- so no byte loads and
+ * no shuffles. A work-group of 256 takes E4T3_OUTS outputs, 256/E4T3_OUTS work-items an output over its tiles
+ * (t = k, k + that, ...); each h of each row goes to local memory; after a barrier one work-item an (output, row) folds
+ * sum = fma(h, tile, sum) in tile order. Every value goes through mv8_rows_cpu's operations in their order. Rows:
+ * E4T3_ROWS a work-group (grid y); local memory E4T3_ROWS x E4T3_OUTS x (I/32) floats. */
+#define E4T3_ROWS 4
+#define E4T3_OUTS 8
+/* quant.h's e4m3_decode8 for one byte, computed (the table e4m3t_kernel reads is built from the same formula) */
+static inline float e4t_dec(uint32_t b) {
+    const uint32_t low = b & 0x7fu;
+    const float v = sycl::bit_cast<float>(((b & 0x80u) << 24) | (low << 20)) * 0x1p120f;
+    return low == 0x7fu ? sycl::bit_cast<float>(0x7fc00000u) : v;
+}
+template <int SG>
+static void e4m3t3_kernel(float *y, int ystride, const float *x, int xstride, const uint8_t *q, const uint8_t *sc,
+                          const float *lut, int S, int I, int O, int outs, uint8_t *slm) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    (void)lut;
+    const int lid = item.get_local_id(2), per = item.get_local_range(2) / outs;
+    const int ol = lid / per, k = lid % per;
+    const int o0 = item.get_group(2) * outs, o = o0 + ol;
+    const int r0 = item.get_group(1) * E4T3_ROWS;
+    const int nr = S - r0 < E4T3_ROWS ? S - r0 : E4T3_ROWS;
+    const int tiles = I >> 5;
+    float *hs = (float *)slm;   /* [row][output][tile] */
+    if (o < O) {
+        const uint8_t *row = q + (size_t)o * I;
+        for (int t = k; t < tiles; t += per) {
+            const int base = t << 5;
+            const sycl::uint4 b0 = *(const sycl::uint4 *)(row + base), b1 = *(const sycl::uint4 *)(row + base + 16);
+            const uint32_t wd[8] = { b0.x(), b0.y(), b0.z(), b0.w(), b1.x(), b1.y(), b1.z(), b1.w() };
+            for (int r = 0; r < nr; r++) {
+                /* columns in order, 4 at a time as they load: column c feeds accumulator c & 7 -- a multiply for the
+                 * first 8, then an fma -- so each accumulator sees j, j+8, j+16, j+24 in that order, as on the CPU */
+                const sycl::float4 *x4 = (const sycl::float4 *)(x + (size_t)(r0 + r) * xstride + base);
+                float a[8];
+#pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    const sycl::float4 f = x4[v];
+                    const float xv[4] = { f.x(), f.y(), f.z(), f.w() };
+                    const uint32_t word = wd[v];
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        const int c = 4 * v + e;
+                        const float wv = e4t_dec((word >> (e * 8)) & 0xffu);
+                        if (c < 8) a[c & 7] = wv * xv[e];
+                        else a[c & 7] = sycl::fma(wv, xv[e], a[c & 7]);
+                    }
+                }
+                const float p0 = a[0] + a[4], p1 = a[1] + a[5], p2 = a[2] + a[6], p3 = a[3] + a[7];
+                const float q0 = p0 + p2, q1 = p1 + p3;
+                hs[((size_t)r * outs + ol) * tiles + t] = q0 + q1;
+            }
+        }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (lid < outs * nr) {
+        const int fo = lid % outs, fr = lid / outs, oo = o0 + fo;
+        if (oo < O) {
+            const uint8_t *srow = sc + (size_t)(oo >> 5) * tiles;
+            const float *hr = hs + ((size_t)fr * outs + fo) * tiles;
+            float sum = 0.0f;
+            int t = 0;
+            for (; t + 4 <= tiles; t += 4) {   /* the loads ahead of the chain; the fmas still one after another */
+                const float h0 = hr[t], h1 = hr[t + 1], h2 = hr[t + 2], h3 = hr[t + 3];
+                sum = sycl::fma(h0, sycl::bit_cast<float>((uint32_t)srow[t] << 23), sum);
+                sum = sycl::fma(h1, sycl::bit_cast<float>((uint32_t)srow[t + 1] << 23), sum);
+                sum = sycl::fma(h2, sycl::bit_cast<float>((uint32_t)srow[t + 2] << 23), sum);
+                sum = sycl::fma(h3, sycl::bit_cast<float>((uint32_t)srow[t + 3] << 23), sum);
+            }
+            for (; t < tiles; t++) sum = sycl::fma(hr[t], sycl::bit_cast<float>((uint32_t)srow[t] << 23), sum);
+            y[(size_t)(r0 + fr) * ystride + oo] = sum;
+        }
+    }
+}
 extern "C" void *coli_cuda_e4m3t_upload(int device, const unsigned char *q, const unsigned char *s, int O, int I) try {
     if (fault_injected() || !q || !s || O < 1 || I < 32 || (I & 31)) return NULL;
     DeviceContext *ctx = find_ctx(device);
@@ -5884,11 +5961,30 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev,
     sycl::queue * st = (sycl::queue *)stream;
     if (t->fmt == 9) {   /* FP8 with 32x32 ue8m0 tiles (coli_cuda_tensor_upload_e4t): no host wait */
         const int I = t->I, O = t->O;
-        dpct::dim3 grid((unsigned)((O + 31) / 32), (unsigned)((S + E4T_ROWS - 1) / E4T_ROWS));
         const uint8_t *dq8 = (const uint8_t *)t->weights;
         const float *dl = t->scales;
         const uint8_t *ds = (const uint8_t *)(t->scales + 256);
-        COLI_SG_LAUNCH((*st), ctx->sg, grid, 256, 0, e4m3t_kernel<SG>(y_dev, O, x_dev, I, dq8, ds, dl, S, I, O));
+        /* outputs a work-group: their tile chains run side by side (the fold is the kernel's serial part); COLI_SYCL_E4T_OUTS
+         * overrides (1, 2, 4, 8, 16, 32, 64) */
+        static int outs_env = -1;
+        if (outs_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_OUTS"); outs_env = e ? std::atoi(e) : 0; }
+        const int rows_wg = S < E4T3_ROWS ? S : E4T3_ROWS;   /* local memory for the rows a work-group has */
+        int outs = 0;
+        if (outs_env == 1 || outs_env == 2 || outs_env == 4 || outs_env == 8 || outs_env == 16 || outs_env == 32 || outs_env == 64) outs = outs_env;
+        else {   /* 8 (measured best over 1..64 on the trunk's shapes, s1-e4t6), fewer where 48 KiB would not hold them */
+            outs = 8;
+            while (outs > 1 && (size_t)rows_wg * outs * (I / 32) * sizeof(float) > 48 * 1024) outs /= 2;
+        }
+        const size_t slm = (size_t)rows_wg * outs * (I / 32) * sizeof(float);
+        if (slm <= 48 * 1024 && ((uintptr_t)dq8 & 15) == 0 && ((uintptr_t)x_dev & 15) == 0) {   /* e4m3t3_kernel: a tile a work-item */
+            dpct::dim3 grid((unsigned)((O + outs - 1) / outs), (unsigned)((S + E4T3_ROWS - 1) / E4T3_ROWS));
+            static int sg_env = -1;   /* COLI_SYCL_E4T_SG: 32 (default, measured faster) or 16 */
+            if (sg_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_SG"); sg_env = e && std::atoi(e) == 16 ? 16 : 32; }
+            COLI_SG_LAUNCH((*st), sg_env, grid, 256, slm, e4m3t3_kernel<SG>(y_dev, O, x_dev, I, dq8, ds, dl, S, I, O, outs, dpct_local));
+        } else {
+            dpct::dim3 grid((unsigned)((O + 31) / 32), (unsigned)((S + E4T_ROWS - 1) / E4T_ROWS));
+            COLI_SG_LAUNCH((*st), ctx->sg, grid, 256, 0, e4m3t_kernel<SG>(y_dev, O, x_dev, I, dq8, ds, dl, S, I, O));
+        }
         return cuda_ok(0, "chain e4t launch");
     }
     if (t->fmt >= 100) return bd_tensor_gemv(ctx, t, y_dev, x_dev, S, st);   /* a GGUF's blocks: cuda_bd.cuh */
