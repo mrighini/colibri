@@ -1,5 +1,6 @@
 /* v41_amx.h -- V41_AMX: deepseek_v41's prompt-pass matrix products (rows >= V41_AMX_MIN, default 16) on the CPU's
- * AMX-BF16 tiles (Sapphire Rapids and later). Off by default. NOT the AVX2 path's bits: the products are summed in the
+ * AMX-BF16 tiles (Sapphire Rapids and later). Off in the code; deepseek_v41's platform defaults set V41_AMX=2 on a CPU
+ * with AMX-BF16 (an explicit V41_AMX, or COLI_PLATFORM_DEFAULTS=0, wins). NOT the AVX2 path's bits: the products are summed in the
  * tile unit's order, and the activations go in as bf16 -- so a run with it is judged by a quality gate, not by
  * identity.
  *   V41_AMX=1  activations rounded to bf16 (round to nearest even): ~3 significant digits an activation.

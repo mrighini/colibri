@@ -88,6 +88,7 @@
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include "spec_draft.h" /* the verify depth from DSpark's confidence (SpecGate) */
+#include "platform_defaults.h"   /* the measured configuration for unset switches (main: V41_AMX on an AMX CPU) */
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -7065,6 +7066,21 @@ int main(int argc, char **argv) {
             g_v41_mux_slots = (int)v;
         }
     }
+#if V41_AMX_HAVE
+    {   /* the CPU's measured default (platform_defaults.h): V41_AMX=2 where the CPU has AMX-BF16 (DS10 on a Xeon w9-3595X:
+         * the prompt pass -24..31 %, decode unchanged, the texts identical, the teacher-forced NLL within 0.0015). Not
+         * the AVX2 bits, so a platform default and not the code's: an explicit V41_AMX (0 turns it off) and
+         * COLI_PLATFORM_DEFAULTS=0 win; v41_amx_on still asks the kernel for the tile state and stands down if refused. */
+        unsigned ea = 0, eb = 0, ec = 0, ed = 0;
+        if (__get_cpuid_count(7, 0, &ea, &eb, &ec, &ed) && (ed & (1u << 24)) && (ed & (1u << 22)) && (eb & (1u << 16))) {
+            static const ColiDefaultKV v41_cpu[] = { {"V41_AMX", "2"} };
+            char got[64];
+            if (coli_platform_defaults_apply(v41_cpu, 1, got, sizeof got))
+                fprintf(stderr, "[v41] CPU defaults for the switches left unset (AMX-BF16 here; COLI_PLATFORM_DEFAULTS=0 "
+                                "keeps the code's own): %s\n", got);
+        }
+    }
+#endif
     int cap = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 8;
     const char *ref_path = argc > 2 ? argv[2] : NULL;
     int engram_rows = getenv("V41_ENGRAM_ROWS") ? atoi(getenv("V41_ENGRAM_ROWS")) : 65536;
