@@ -78,11 +78,21 @@ static void shape(int dev, int O, int I, int S) {
     require(yb && T->begin() && T->matmul(t, xb, 0, yb, 0, S) && T->submit(1), "the chain's matmul on fmt 9");
     require(T->read(yb, 0, y.data(), y.size() * 4), "read back");
     reference(want.data(), q.data(), s.data(), x.data(), S, I, O);
+    /* COLI_SYCL_E4T_FAST (default 1): rows <= 4 take the fast product, held to a tolerance (max |err| / max |ref| < 1e-5);
+     * otherwise (and with COLI_SYCL_E4T_FAST=0) the exact kernel, byte for byte */
+    const char *fe = getenv("COLI_SYCL_E4T_FAST");
+    const bool fast = !(fe && *fe == '0') && S <= 4;
     size_t diff = 0;
-    for (size_t k = 0; k < y.size(); k++) diff += std::memcmp(&y[k], &want[k], 4) != 0;
-    std::printf("E4T O=%d I=%d S=%d: %zu of %zu outputs differ\n", O, I, S, diff, y.size());
+    double me = 0, mr = 0;
+    for (size_t k = 0; k < y.size(); k++) {
+        diff += std::memcmp(&y[k], &want[k], 4) != 0;
+        me = std::fmax(me, std::fabs((double)y[k] - want[k])); mr = std::fmax(mr, std::fabs((double)want[k]));
+    }
+    const double rel = mr > 0 ? me / mr : me;
+    if (fast) std::printf("E4T O=%d I=%d S=%d fast: max|err|/max|ref| %.3g (%zu of %zu not byte-equal)\n", O, I, S, rel, diff, y.size());
+    else std::printf("E4T O=%d I=%d S=%d: %zu of %zu outputs differ\n", O, I, S, diff, y.size());
     std::fflush(stdout);
-    if (diff) fails++;
+    if (fast ? !(rel < 1e-5) : diff != 0) fails++;
     T->free(xb); T->free(yb);
     coli_cuda_tensor_free(t);
 }

@@ -2785,6 +2785,49 @@ static void e4m3t3_kernel(float *y, int ystride, const float *x, int xstride, co
         }
     }
 }
+/* e4t_fast_k: fmt 9 for a decode's few rows (S <= E4T_FAST_ROWS), not mv8_rows_cpu's bits (quality-gated: the dense
+ * chain's GPU path): a sub-group an output row; each lane takes 16-byte chunks of the row (16 columns of one 32x32 tile),
+ * decodes them (e4t_dec), dots them with the rows' activations, scales the chunk by its tile, and the sub-group sums
+ * its lanes. The int8 gemv's shape, at fmt 9's one byte a weight. */
+#define E4T_FAST_ROWS 4
+template <int SG>
+static void e4t_fast_k(float *y, int ystride, const float *x, int xstride, const uint8_t *q, const uint8_t *sc, int S,
+                       int I, int O) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lane = sg.get_local_linear_id();
+    const int o = item.get_group(2) * (item.get_local_range(2) / SG) + (int)sg.get_group_linear_id();
+    if (o >= O) return;   /* the whole sub-group: one row */
+    const int tiles = I >> 5, nr = S < E4T_FAST_ROWS ? S : E4T_FAST_ROWS;
+    const uint8_t *row = q + (size_t)o * I, *srow = sc + (size_t)(o >> 5) * tiles;
+    float acc[E4T_FAST_ROWS] = {0.f, 0.f, 0.f, 0.f};
+    for (int c0 = lane * 16; c0 < I; c0 += SG * 16) {
+        const sycl::uint4 b = *(const sycl::uint4 *)(row + c0);
+        const uint32_t wd[4] = { b.x(), b.y(), b.z(), b.w() };
+        float w[16];
+#pragma unroll
+        for (int c = 0; c < 16; c++) w[c] = e4t_dec((wd[c >> 2] >> ((c & 3) * 8)) & 0xffu);
+        const float tl = sycl::bit_cast<float>((uint32_t)srow[c0 >> 5] << 23);
+#pragma unroll
+        for (int r = 0; r < E4T_FAST_ROWS; r++) {
+            if (r >= nr) break;
+            const sycl::float4 *x4 = (const sycl::float4 *)(x + (size_t)r * xstride + c0);
+            float part = 0.f;
+#pragma unroll
+            for (int v = 0; v < 4; v++) {
+                const sycl::float4 f = x4[v];
+                part += w[4 * v] * f.x() + w[4 * v + 1] * f.y() + w[4 * v + 2] * f.z() + w[4 * v + 3] * f.w();
+            }
+            acc[r] += part * tl;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < E4T_FAST_ROWS; r++) {
+        if (r >= nr) break;
+        const float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+        if (lane == 0) y[(size_t)r * ystride + o] = v;
+    }
+}
 extern "C" void *coli_cuda_e4m3t_upload(int device, const unsigned char *q, const unsigned char *s, int O, int I) try {
     if (fault_injected() || !q || !s || O < 1 || I < 32 || (I & 31)) return NULL;
     DeviceContext *ctx = find_ctx(device);
@@ -5964,6 +6007,14 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev,
         const uint8_t *dq8 = (const uint8_t *)t->weights;
         const float *dl = t->scales;
         const uint8_t *ds = (const uint8_t *)(t->scales + 256);
+        static int fast_env = -1;   /* COLI_SYCL_E4T_FAST: 1 (default) the decode rows' fast product (not the CPU's bits), 0 exact */
+        if (fast_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_FAST"); fast_env = !(e && *e == '0'); }
+        if (fast_env && S <= E4T_FAST_ROWS && ((uintptr_t)dq8 & 15) == 0 && ((uintptr_t)x_dev & 15) == 0) {
+            const int sgw = ctx->sg, rpw = 256 / sgw;
+            dpct::dim3 grid((unsigned)((O + rpw - 1) / rpw), 1u);
+            COLI_SG_LAUNCH((*st), sgw, grid, 256, 0, e4t_fast_k<SG>(y_dev, O, x_dev, I, dq8, ds, S, I, O));
+            return cuda_ok(0, "chain e4t fast launch");
+        }
         /* outputs a work-group: their tile chains run side by side (the fold is the kernel's serial part); COLI_SYCL_E4T_OUTS
          * overrides (1, 2, 4, 8, 16, 32, 64) */
         static int outs_env = -1;
