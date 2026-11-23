@@ -29,6 +29,7 @@
 #include <dpct/dpct.hpp>   /* dim3 */
 #include "backend_cuda.h"
 #define COLI_CUDA_CHAIN_NO_WRAPPERS
+#include "cuda_chain.h"   /* CcExpert: the dense chain's table entry (cu_xb_expert_entry) */
 #include "backend_gpu_compat.h"
 #include "coli_sycl.h"     /* the tier's device: coli_cuda_init's, through the profile module */
 #include "backend_sycl.h"  /* the error protocol, the shuffles, the SG launch */
@@ -743,7 +744,22 @@ static void cu_xb_expert_free(ColiVkExpert *e) {
 static void cu_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d) {
     *g = e ? e->g : NULL; *u = e ? e->u : NULL; *d = e ? e->d : NULL;
 }
-static int cu_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry) { (void)e; (void)entry; return 0; }
+/* An expert's entry for the dense chain's routed experts (vk_tier.c's vkt_dev_table, then cc_moe's table): the
+ * CcExpert of its three tensors when all three are in the primary device's memory (pool 1) -- weights and the scales
+ * as the tier stores them (fmt 7: one float 2^(s-127) a 32 inputs: cc_moe with CcMoe.gs 32) -- else a zero entry,
+ * which cc_moe skips and the engine computes on the CPU (the host pool's experts, the second device's). Returns 1 (an
+ * entry written) for both; the table's count then counts the zero entries of the host pool too. */
+static int cu_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry) {
+    static_assert(sizeof(CcExpert) <= 32 * sizeof(uint32_t), "a CcExpert fits COLI_VK_XB_ENTRY words");
+    if (!entry) return 0;
+    std::memset(entry, 0, 32 * sizeof(uint32_t));
+    if (!e || !e->g || !e->u || !e->d || e->g->pool != 1 || e->u->pool != 1 || e->d->pool != 1) return 1;
+    CcExpert x;
+    std::memset(&x, 0, sizeof x);
+    x.g = e->g->w; x.u = e->u->w; x.d = e->d->w; x.gs = e->g->s; x.us = e->u->s; x.ds = e->d->s;
+    std::memcpy(entry, &x, sizeof x);
+    return 1;
+}
 
 /* the scratch for `rows` rows: x, gate (then the activation), up, y and the route weights on
  * the device, x, y and the weights in page-locked RAM. Not while a batch is in flight. */
