@@ -245,6 +245,99 @@ static void ccd_attn_k(const float *q, const float *win, const float *cmp, const
         out[ob + i] = (p.flags & 1) ? ccd_bf16r(o) : o;
     }
 }
+/* ccd_attn_k for HB heads a work-group: the heads share the window and compressed rows (one latent of hd), so each
+ * listed row is read once for HB heads instead of once a head. Every (head, row) value goes through ccd_attn_k's
+ * operations in its order -- the dot product d += q[i] * k[i] over i, the max, the exp, the denominator in list order
+ * from the sink, the output acc += w * kv over the list in order, / den -- so the bits are ccd_attn_k's.
+ * slm: HB*hd queries, then HB*cnt scores. */
+#define CCD_ATTN_HB 8
+static void ccd_attn_hb_k(const float *q, const float *win, const float *cmp, const int *list,
+                          const float *prm, float *out, CcDsAttn p, uint8_t *slm) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    float *sq = (float *)slm;                 /* [HB][hd] */
+    auto &red = CCD_LOCAL(float[CCD_ATTN_HB * 256]);
+    auto &dens = CCD_LOCAL(float[CCD_ATTN_HB]);
+    const int h0 = it.get_group(2) * CCD_ATTN_HB, s = it.get_group(1), tid = it.get_local_id(2);
+    if (s >= p.S || h0 >= p.H) return;
+    const int nh = p.H - h0 < CCD_ATTN_HB ? p.H - h0 : CCD_ATTN_HB;
+    const int hd = p.hd, n = p.cnt, lb = p.l_off + s * p.l_row;
+    float *sc = sq + CCD_ATTN_HB * hd;        /* [HB][cnt] */
+    for (int k = tid; k < nh * hd; k += 256) sq[k] = q[p.q_off + s * p.q_row + h0 * hd + k];
+    CCD_SYNC(it);
+    float best[CCD_ATTN_HB];
+#pragma unroll
+    for (int hh = 0; hh < CCD_ATTN_HB; hh++) best[hh] = -1.0e30f;
+    for (int j = tid; j < n; j += 256) {
+        const int e = list[lb + j];
+        float d[CCD_ATTN_HB];
+#pragma unroll
+        for (int hh = 0; hh < CCD_ATTN_HB; hh++) d[hh] = 0.f;
+        if (e >= 0) {
+            const float *kr = e < p.nwin ? win + p.w_off + e * hd : cmp + p.c_off + (e - p.nwin) * hd;
+            for (int i = 0; i < hd; i++) {
+                const float kv = kr[i];
+#pragma unroll
+                for (int hh = 0; hh < CCD_ATTN_HB; hh++) if (hh < nh) d[hh] += sq[hh * hd + i] * kv;
+            }
+        }
+#pragma unroll
+        for (int hh = 0; hh < CCD_ATTN_HB; hh++) {
+            if (hh >= nh) continue;
+            float v = CC_DS_NEG_INF;
+            if (e >= 0) { v = d[hh] * p.scale; if (v > best[hh]) best[hh] = v; }
+            sc[hh * n + j] = v;
+        }
+    }
+#pragma unroll
+    for (int hh = 0; hh < CCD_ATTN_HB; hh++) red[hh * 256 + tid] = best[hh];
+    CCD_SYNC(it);
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off)
+#pragma unroll
+            for (int hh = 0; hh < CCD_ATTN_HB; hh++) if (red[hh * 256 + tid + off] > red[hh * 256 + tid]) red[hh * 256 + tid] = red[hh * 256 + tid + off];
+        CCD_SYNC(it);
+    }
+#pragma unroll
+    for (int hh = 0; hh < CCD_ATTN_HB; hh++) best[hh] = red[hh * 256];
+    CCD_SYNC(it);
+    for (int j = tid; j < n; j += 256)
+#pragma unroll
+        for (int hh = 0; hh < CCD_ATTN_HB; hh++) {
+            if (hh >= nh) continue;
+            const float v = sc[hh * n + j];
+            sc[hh * n + j] = v > CC_DS_NEG_INF ? CCD_EXP(v - best[hh]) : 0.f;
+        }
+    CCD_SYNC(it);
+    if (tid < nh) {                           /* a head's denominator in list order, from the sink: ccd_attn_k's */
+        float den = CCD_EXP(prm[p.sink_off + h0 + tid] - best[tid]);
+        for (int j = 0; j < n; j++) if (list[lb + j] >= 0) den += sc[tid * n + j];
+        dens[tid] = den;
+    }
+    CCD_SYNC(it);
+    for (int i = tid; i < hd; i += 256) {
+        float acc[CCD_ATTN_HB];
+#pragma unroll
+        for (int hh = 0; hh < CCD_ATTN_HB; hh++) acc[hh] = 0.f;
+        for (int j = 0; j < n; j++) {
+            const int e = list[lb + j];
+            if (e < 0) continue;
+            const float kv = ccd_kv(win, cmp, e, p.nwin, p.w_off, p.c_off, hd, i);
+#pragma unroll
+            for (int hh = 0; hh < CCD_ATTN_HB; hh++) {
+                if (hh >= nh) continue;
+                float w = sc[hh * n + j];
+                if (p.flags & 1) w = ccd_bf16r(w);
+                acc[hh] += w * kv;
+            }
+        }
+#pragma unroll
+        for (int hh = 0; hh < CCD_ATTN_HB; hh++) {
+            if (hh >= nh) continue;
+            const float o = acc[hh] / dens[hh];
+            out[p.o_off + s * p.o_row + (h0 + hh) * hd + i] = (p.flags & 1) ? ccd_bf16r(o) : o;
+        }
+    }
+}
 /* a prompt chunk's rows (chain_dsv4_pa.comp): the scores of 64 heads a work-group on tiles of
  * 64 listed rows, in chunks of 32 floats */
 static void ccd_pa_scores_k(const float *q, const float *win, const float *cmp, const int *list,
@@ -393,9 +486,21 @@ static int cc_ds_attn(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm,
         }
         return launched(c, "ds attn (prompt)");
     }
+    const CcDsAttn pp = *p;
+    {   /* CCD_ATTN_HB heads a work-group where its local memory fits */
+        static int hb_on = -1;
+        /* opt-in (COLI_CUDA_DSV4_ATTN_HB=1): bit-identical, but DS28 measured a decode step slower -- one decode row leaves
+         * H/8 work-groups (8 on the card), and the rows' re-reads it saves were L2 hits */
+        if (hb_on < 0) { const char *eh = getenv("COLI_CUDA_DSV4_ATTN_HB"); hb_on = eh && *eh == '1'; }
+        const size_t sm8 = (size_t)CCD_ATTN_HB * ((size_t)p->hd + p->cnt) * sizeof(float);
+        if (hb_on && p->H >= 2 && sm8 <= 48 * 1024 && sm8 <= c->slm) {
+            CC_KSG(c, dim3((unsigned)((p->H + CCD_ATTN_HB - 1) / CCD_ATTN_HB), (unsigned)p->S), 256, sm8,
+                   ccd_attn_hb_k(qp, wp, cm, ls, pp_, op, pp, slm_));
+            return launched(c, "ds attn");
+        }
+    }
     const size_t smem = ((size_t)p->hd + p->cnt) * sizeof(float);
     if (smem > 48 * 1024 || smem > c->slm) return 0;
-    const CcDsAttn pp = *p;
     CC_KSG(c, dim3((unsigned)p->H, (unsigned)p->S), 256, smem, ccd_attn_k(qp, wp, cm, ls, pp_, op, pp, slm_));
     return launched(c, "ds attn");
 }
