@@ -89,6 +89,7 @@ struct ColiCudaTensor {
 
 static size_t tensor_scale_bytes(const ColiCudaTensor *t) {
     if (!t->fmt || t->fmt == 6) return 0;
+    if (t->fmt == 9) return 256 * sizeof(float) + t->scale_count;   /* the e4m3 table, then the ue8m0 tile bytes */
     return t->scale_count * (t->fmt == 7 ? sizeof(uint8_t) : sizeof(float));
 }
 
@@ -293,6 +294,7 @@ static size_t row_bytes(int fmt, int I) {
     if (fmt == 7) return (size_t)(I + 1) / 2;   /* MXFP4: e2m1 nibbles, 2 per byte */
     if (fmt == 6) return (size_t)(((int64_t)I + COLI_E8_QK - 1) / COLI_E8_QK) * COLI_E8_BBYTES;
     if (fmt == 8) return (size_t)I;             /* fp8-e4m3: raw bytes, layout of fmt=1 */
+    if (fmt == 9) return (size_t)I;             /* fp8-e4m3 with one ue8m0 a 32x32 tile (deepseek_v41's W8) */
     return 0;
 }
 
@@ -2860,6 +2862,42 @@ catch (sycl::exception const &exc) {
     try { dq().wait(); } catch (...) {}
     return sycl_caught(exc, "coli_cuda_bf16t_mv");
 }
+
+/* The FP8 matrix as a resident ColiCudaTensor, for the dense chain (cc_matmul -> coli_cuda_tensor_gemm_async):
+ * fmt 9 = e4m3 bytes [O][I] with one ue8m0 byte a 32x32 tile, the decode table and the tile bytes in `scales`
+ * (256 floats, then ((O+31)/32) x (I/32) bytes); the product is e4m3t_kernel: mv8_rows_cpu's bits. (A BF16 matrix
+ * needs no format of its own: plain bf16 rows are the GGUF type BF16, fmt 130 through coli_cuda_tensor_upload, the
+ * block decoder's float GEMV -- shared by every engine.) */
+extern "C" int coli_cuda_tensor_upload_e4t(ColiCudaTensor **tensor, const unsigned char *q, const unsigned char *s,
+                                           int O, int I, int device) try {
+    if (!tensor || fault_injected() || !q || !s || O < 1 || I < 32 || (I & 31)) return 0;
+    if (*tensor) return 1;
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    const size_t qb = (size_t)O * I, sb = (size_t)((O + 31) / 32) * (I / 32), tb = 256 * sizeof(float) + sb;
+    ColiCudaTensor *t = (ColiCudaTensor *)std::calloc(1, sizeof *t);
+    if (!t) return 0;
+    t->fmt = 9; t->I = I; t->O = O; t->device = device; t->weights_owned = 1; t->weight_bytes = qb; t->scale_count = sb;
+    float lut[256];
+    for (int b = 0; b < 256; b++) {   /* quant.h's e4m3_decode8: bits placed, times 2^120 (exact); 0x7F/0xFF NaN */
+        const uint32_t bits = ((uint32_t)(b & 0x80) << 24) | ((uint32_t)(b & 0x7f) << 20);
+        float v; std::memcpy(&v, &bits, 4); v *= 0x1p120f;
+        lut[b] = (b & 0x7f) == 0x7f ? NAN : v;
+    }
+    uint8_t *w = nullptr, *sc = nullptr;
+    if (COLI_SYCL_ALLOC(w, (uint8_t *)sycl::malloc_device(qb, dq()), qb) != 0 ||
+        COLI_SYCL_ALLOC(sc, (uint8_t *)sycl::malloc_device(tb, dq()), tb) != 0 ||
+        COLI_SYCL_TRY(dq().memcpy(w, q, qb)) != 0 || COLI_SYCL_TRY(dq().memcpy(sc, lut, sizeof lut)) != 0 ||
+        COLI_SYCL_TRY(dq().memcpy(sc + sizeof lut, s, sb).wait()) != 0) {
+        try { dq().wait(); } catch (...) {}
+        if (w) sycl::free(w, dq()); if (sc) sycl::free(sc, dq());
+        std::free(t); return 0;
+    }
+    t->weights = w; t->scales = (float *)sc;
+    *tensor = t;
+    return 1;
+}
+catch (sycl::exception const &exc) { return sycl_caught(exc, "coli_cuda_tensor_upload_e4t"); }
 
 /* coli_cuda_tuned_default (backend_cuda.h): a switch's measured default from the devices' profiles
  * (coli_sycl_tuned_default), only where every device gives the same value; the first use of each switch that
@@ -5844,6 +5882,15 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev,
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
     sycl::queue * st = (sycl::queue *)stream;
+    if (t->fmt == 9) {   /* FP8 with 32x32 ue8m0 tiles (coli_cuda_tensor_upload_e4t): no host wait */
+        const int I = t->I, O = t->O;
+        dpct::dim3 grid((unsigned)((O + 31) / 32), (unsigned)((S + E4T_ROWS - 1) / E4T_ROWS));
+        const uint8_t *dq8 = (const uint8_t *)t->weights;
+        const float *dl = t->scales;
+        const uint8_t *ds = (const uint8_t *)(t->scales + 256);
+        COLI_SG_LAUNCH((*st), ctx->sg, grid, 256, 0, e4m3t_kernel<SG>(y_dev, O, x_dev, I, dq8, ds, dl, S, I, O));
+        return cuda_ok(0, "chain e4t launch");
+    }
     if (t->fmt >= 100) return bd_tensor_gemv(ctx, t, y_dev, x_dev, S, st);   /* a GGUF's blocks: cuda_bd.cuh */
     if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288 && ((uintptr_t)x_dev & 15) == 0) {   /* x in float4 loads */
         const int sg = gemv_i8_sg(ctx, t->O, t->I), wpb = 256 / sg;

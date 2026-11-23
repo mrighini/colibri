@@ -268,6 +268,9 @@ COLI_CUDA_DLLEXPORT void coli_cuda_e4m3t_free(void *h);
 COLI_CUDA_DLLEXPORT void *coli_cuda_bf16t_upload(int device, const unsigned short *w, int O, int I);
 COLI_CUDA_DLLEXPORT int coli_cuda_bf16t_mv(void *h, float *y, int ystride, const float *x, int xstride, int S);
 COLI_CUDA_DLLEXPORT void coli_cuda_bf16t_free(void *h);
+/* the FP8 matrix as a resident tensor for the dense chain: fmt 9 (e4m3, one ue8m0 a 32x32 tile); BF16 rows are
+ * the GGUF type BF16 (fmt 130, coli_cuda_tensor_upload) */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_e4t(ColiCudaTensor **tensor, const unsigned char *q, const unsigned char *s, int O, int I, int device);
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul_i8act(ColiCudaTensor *tensor, float *y, const signed char *xq,
                      const float *sx, int S, int I, int O);
 /* The default a platform's measurements give a switch the environment leaves unset. The SYCL backend answers from
