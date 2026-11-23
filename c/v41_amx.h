@@ -7,8 +7,11 @@
  * The weights are exact in bf16 with their scales folded in: an e4m3 value times its ue8m0 tile scale, an e2m1 value
  * times its group's 2^(e-127), a bf16 weight as it is (powers of two only move the exponent, which bf16 shares with
  * float32). Decode-sized calls (rows below the threshold) and calls from inside an OpenMP region keep the AVX2 path.
- * Layout: C tiles 0..3 (2 row tiles x 2 output slabs of 16, float32), A tiles 4,5 (16 rows x 32 bf16 of the
- * activations), B tiles 6,7 (16 pairs of K x 16 outputs x 2 bf16: the VNNI pairing TDPBF16PS reads). */
+ * Layout (v2): the weights are the A operand -- 32 output rows a thread decodes row-major into bf16 (vectorized), two
+ * A tiles of 16 rows x 32 columns read straight from that slab -- and the activations the B operand, put once a call
+ * into the VNNI pairing TDPBF16PS reads (16 pairs of columns x 16 rows x 2 bf16), shared by every output. C tiles 0..3
+ * are 2 output tiles x 2 row tiles of 16x16 float32; A tiles 4,5; B tiles 6,7.
+ */
 #if defined(__x86_64__) && defined(__linux__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
 #include <cpuid.h>
@@ -16,7 +19,8 @@
 #include <unistd.h>
 #define V41_AMX_HAVE 1
 
-typedef void (*v41_amx_pack_fn)(const void *ctx, int o0, int O, int I, uint16_t *dst);
+/* decode(ctx, o0, O, I, dst): output rows o0..o0+31 (zeros past O) as bf16, row-major, I apart */
+typedef void (*v41_amx_decode_fn)(const void *ctx, int o0, int O, int I, uint16_t *dst);
 typedef struct { uint8_t palette, start_row; uint8_t rsv[14]; uint16_t colsb[16]; uint8_t rows[16]; } V41TileCfg;
 
 static int g_amx_mode = -1, g_amx_min = 16;
@@ -70,77 +74,83 @@ __attribute__((target("amx-tile"), noinline)) static void v41_amx_cfg(void) {
 }
 __attribute__((target("amx-tile"), noinline)) static void v41_amx_release(void) { _tile_release(); }
 
-/* rows [rb, re) (multiples of 16, re <= the padded row count) of one 32-output slab bp, all of K */
+/* output slab ws (32 rows of I bf16) times the row groups [tb, te) (multiples of 16) of the packed activations */
 __attribute__((target("amx-tile,amx-bf16"), noinline))
 static void v41_amx_task(float *y, int ystride, const uint16_t *xh, const uint16_t *xl, int S, int I, int O,
-                         const uint16_t *bp, int o0, int rb, int re) {
-    float c[4][256] __attribute__((aligned(64)));
+                         const uint16_t *ws, int o0, int tb, int te) {
+    float c[4][256] __attribute__((aligned(64)));   /* [output tile * 2 + row tile][16 outputs][16 rows] */
     const long as = (long)I * 2;
     const int kbs = I / 32;
-    for (int r0 = rb; r0 < re; r0 += 32) {
-        const int two = r0 + 16 < re;
+    const int two_o = o0 + 16 < O;
+    for (int t0 = tb; t0 < te; t0 += 32) {
+        const int two = t0 + 16 < te;
+        const size_t g0 = (size_t)(t0 >> 4) * kbs * 512, g1 = g0 + (size_t)kbs * 512;
         _tile_zero(0); _tile_zero(1); _tile_zero(2); _tile_zero(3);
-        const uint16_t *ah = xh + (size_t)r0 * I, *al = xl ? xl + (size_t)r0 * I : NULL;
         for (int kb = 0; kb < kbs; kb++) {
-            const uint16_t *b = bp + (size_t)kb * 1024;
-            _tile_loadd(6, b, 64);
-            _tile_loadd(7, b + 512, 64);
-            _tile_loadd(4, ah + kb * 32, as);
+            _tile_loadd(4, ws + kb * 32, as);
+            if (two_o) _tile_loadd(5, ws + (size_t)16 * I + kb * 32, as);
+            _tile_loadd(6, xh + g0 + (size_t)kb * 512, 64);
             _tile_dpbf16ps(0, 4, 6);
-            _tile_dpbf16ps(1, 4, 7);
+            if (two_o) _tile_dpbf16ps(2, 5, 6);
             if (two) {
-                _tile_loadd(5, ah + (size_t)16 * I + kb * 32, as);
-                _tile_dpbf16ps(2, 5, 6);
-                _tile_dpbf16ps(3, 5, 7);
-            }
-            if (al) {
-                _tile_loadd(4, al + kb * 32, as);
-                _tile_dpbf16ps(0, 4, 6);
+                _tile_loadd(7, xh + g1 + (size_t)kb * 512, 64);
                 _tile_dpbf16ps(1, 4, 7);
+                if (two_o) _tile_dpbf16ps(3, 5, 7);
+            }
+            if (xl) {
+                _tile_loadd(6, xl + g0 + (size_t)kb * 512, 64);
+                _tile_dpbf16ps(0, 4, 6);
+                if (two_o) _tile_dpbf16ps(2, 5, 6);
                 if (two) {
-                    _tile_loadd(5, al + (size_t)16 * I + kb * 32, as);
-                    _tile_dpbf16ps(2, 5, 6);
-                    _tile_dpbf16ps(3, 5, 7);
+                    _tile_loadd(7, xl + g1 + (size_t)kb * 512, 64);
+                    _tile_dpbf16ps(1, 4, 7);
+                    if (two_o) _tile_dpbf16ps(3, 5, 7);
                 }
             }
         }
         _tile_stored(0, c[0], 64);
-        _tile_stored(1, c[1], 64);
-        if (two) { _tile_stored(2, c[2], 64); _tile_stored(3, c[3], 64); }
-        for (int rt = 0; rt <= two; rt++)
-            for (int rr = 0; rr < 16; rr++) {
-                const int r = r0 + rt * 16 + rr;
-                if (r >= S) break;
-                float *yr = y + (size_t)r * ystride;
-                for (int half = 0; half < 2; half++) {
-                    const float *cs = c[rt * 2 + half] + rr * 16;
-                    const int ob = o0 + half * 16, n = O - ob < 16 ? O - ob : 16;
-                    for (int k = 0; k < n; k++) yr[ob + k] = cs[k];
+        if (two) _tile_stored(1, c[1], 64);
+        if (two_o) { _tile_stored(2, c[2], 64); if (two) _tile_stored(3, c[3], 64); }
+        for (int ot = 0; ot <= two_o; ot++)
+            for (int rt = 0; rt <= two; rt++) {
+                const float *cc = c[ot * 2 + rt];
+                const int ob = o0 + ot * 16, n = O - ob < 16 ? O - ob : 16;
+                for (int rr = 0; rr < 16; rr++) {
+                    const int r = t0 + rt * 16 + rr;
+                    if (r >= S) break;
+                    float *yr = y + (size_t)r * ystride + ob;
+                    for (int k = 0; k < n; k++) yr[k] = cc[k * 16 + rr];
                 }
             }
     }
 }
 
-/* y[r][o] = sum_i W(o,i) x[r][i] for S rows; pack(ctx, o0, O, I, dst) writes the 32-output slab at o0 (zeros past O)
- * in the B layout. Returns 0 (nothing written) where the call stays the AVX2 path's. */
+/* y[r][o] = sum_i W(o,i) x[r][i] for S rows; decode(ctx, o0, O, I, dst) gives 32 output rows as bf16. Returns 0
+ * (nothing written) where the call stays the AVX2 path's. */
 static int v41_amx_gemm(float *y, int ystride, const float *x, int xstride, int S, int I, int O,
-                        v41_amx_pack_fn pack, const void *ctx) {
+                        v41_amx_decode_fn decode, const void *ctx) {
     const int mode = v41_amx_on();
     if (!mode || S < g_amx_min || I < 32 || (I & 31) || O < 1 || omp_in_parallel()) return 0;
     const double t0 = now_s();
-    const int Sp = (S + 15) & ~15;
-    uint16_t *xh = aligned_alloc(64, ((size_t)Sp * I * 2 + 63) & ~(size_t)63);
-    uint16_t *xl = mode == 2 ? aligned_alloc(64, ((size_t)Sp * I * 2 + 63) & ~(size_t)63) : NULL;
+    const int Sp = (S + 15) & ~15, kbs = I / 32, ngr = Sp / 16;
+    const size_t xn = (size_t)Sp * I;   /* the packed activations: [row group][kb][16 pairs][16 rows][2] */
+    uint16_t *xh = aligned_alloc(64, (xn * 2 + 63) & ~(size_t)63);
+    uint16_t *xl = mode == 2 ? aligned_alloc(64, (xn * 2 + 63) & ~(size_t)63) : NULL;
     if (!xh || (mode == 2 && !xl)) { free(xh); free(xl); return 0; }
     #pragma omp parallel for schedule(static)
-    for (int r = 0; r < Sp; r++) {
-        uint16_t *h = xh + (size_t)r * I, *l = xl ? xl + (size_t)r * I : NULL;
-        if (r >= S) { memset(h, 0, (size_t)I * 2); if (l) memset(l, 0, (size_t)I * 2); continue; }
-        const float *xr = x + (size_t)r * xstride;
-        for (int i = 0; i < I; i++) {
-            const uint16_t b = v41_f2bf(xr[i]);
-            h[i] = b;
-            if (l) { const float hv = v41_bf2f(b); l[i] = isfinite(hv) ? v41_f2bf(xr[i] - hv) : 0; }
+    for (int gk = 0; gk < ngr * kbs; gk++) {
+        const int g = gk / kbs, kb = gk % kbs;
+        uint16_t *h = xh + ((size_t)g * kbs + kb) * 512, *l = xl ? xl + ((size_t)g * kbs + kb) * 512 : NULL;
+        for (int rr = 0; rr < 16; rr++) {
+            const int r = g * 16 + rr;
+            const float *xr = r < S ? x + (size_t)r * xstride + kb * 32 : NULL;
+            for (int k = 0; k < 32; k++) {
+                const size_t at = (size_t)(k >> 1) * 32 + rr * 2 + (k & 1);
+                if (!xr) { h[at] = 0; if (l) l[at] = 0; continue; }
+                const uint16_t b = v41_f2bf(xr[k]);
+                h[at] = b;
+                if (l) { const float hv = v41_bf2f(b); l[at] = isfinite(hv) ? v41_f2bf(xr[k] - hv) : 0; }
+            }
         }
     }
     const int nob = (O + 31) / 32, nth = omp_get_max_threads();
@@ -151,8 +161,8 @@ static int v41_amx_gemm(float *y, int ystride, const float *x, int xstride, int 
     int failed = 0;
     #pragma omp parallel
     {
-        uint16_t *bp = aligned_alloc(64, (size_t)I * 64);
-        if (!bp) {
+        uint16_t *ws = aligned_alloc(64, (size_t)I * 64);
+        if (!ws) {
             #pragma omp atomic write
             failed = 1;
         }
@@ -166,12 +176,12 @@ static int v41_amx_gemm(float *y, int ystride, const float *x, int xstride, int 
                 const int rb = rg * rows_per;
                 int re = rb + rows_per; if (re > Sp) re = Sp;
                 if (rb >= re) continue;
-                if (ob != last) { pack(ctx, ob * 32, O, I, bp); last = ob; }
-                v41_amx_task(y, ystride, xh, xl, S, I, O, bp, ob * 32, rb, re);
+                if (ob != last) { decode(ctx, ob * 32, O, I, ws); last = ob; }
+                v41_amx_task(y, ystride, xh, xl, S, I, O, ws, ob * 32, rb, re);
             }
             v41_amx_release();
         }
-        free(bp);
+        free(ws);
     }
     free(xh); free(xl);
     if (failed) return 0;
@@ -180,9 +190,68 @@ static int v41_amx_gemm(float *y, int ystride, const float *x, int xstride, int 
     g_amx_s += now_s() - t0;
     return 1;
 }
-/* the B slab's index of weight (output n of the slab, column i) */
-static inline size_t v41_amx_bidx(int n, int i) {
-    return (size_t)(i >> 5) * 1024 + (size_t)(n >> 4) * 512 + (size_t)((i & 31) >> 1) * 32 + (size_t)(n & 15) * 2 + (i & 1);
+
+/* vectorized decoders' pieces (AVX-512F/BW): 16 floats that bf16 holds exactly -> their top halves */
+__attribute__((target("avx512f,avx512bw"))) static inline void v41_amx_st16(uint16_t *d, __m512 v) {
+    _mm256_storeu_si256((__m256i *)d, _mm512_cvtepi32_epi16(_mm512_srli_epi32(_mm512_castps_si512(v), 16)));
+}
+/* 32 e2m1 values (16 bytes, low nibble first) times f -> bf16; f = the group's scale (exact) */
+__attribute__((target("avx512f,avx512bw"))) static inline void v41_amx_mx4_32(uint16_t *d, const uint8_t *q, float f) {
+    const __m128i lut2 = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12), m4 = _mm_set1_epi8(0x0F);
+    const __m128i by = _mm_loadu_si128((const __m128i *)q);
+    const __m128i lo = _mm_and_si128(by, m4), hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);
+    const __m128i n0 = _mm_shuffle_epi8(lut2, _mm_unpacklo_epi8(lo, hi)), n1 = _mm_shuffle_epi8(lut2, _mm_unpackhi_epi8(lo, hi));
+    const __m512 fv = _mm512_set1_ps(f * 0.5f);   /* the doubled values' halving rides the scale, as matmul_mxfp4 */
+    v41_amx_st16(d, _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(n0)), fv));
+    v41_amx_st16(d + 16, _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(n1)), fv));
+}
+/* 16 e4m3 bytes times f -> bf16 (quant.h's decode: bits placed, times 2^120; f folds 2^120 and the tile scale) */
+__attribute__((target("avx512f,avx512bw"))) static inline void v41_amx_e4_16(uint16_t *d, const uint8_t *q, float f) {
+    const __m512i b = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)q));
+    const __m512i bits = _mm512_or_si512(_mm512_slli_epi32(_mm512_and_si512(b, _mm512_set1_epi32(0x80)), 24),
+                                         _mm512_slli_epi32(_mm512_and_si512(b, _mm512_set1_epi32(0x7f)), 20));
+    v41_amx_st16(d, _mm512_mul_ps(_mm512_castsi512_ps(bits), _mm512_set1_ps(f)));
+}
+/* The decoders: 32 output rows as bf16, row-major (the A operand), zeros past O; I a multiple of 32. */
+typedef struct { const uint8_t *q, *s; } V41AmxFp8;     /* e4m3 [O][I], one ue8m0 a 32x32 tile [(O+31)/32][I/32] */
+typedef struct { const uint8_t *q4, *e8s; } V41Mx4;     /* e2m1 pairs [O][I/2] (low nibble first), ue8m0 [O][I/32] */
+typedef struct { const uint16_t *w; } V41AmxBf16;       /* bf16 [O][I] */
+static inline float v41_amx_e8(uint8_t e) { uint32_t u = (uint32_t)e << 23; float f; memcpy(&f, &u, 4); return f; }
+__attribute__((target("avx512f,avx512bw")))
+static void v41_amx_dec_fp8(const void *ctx, int o0, int O, int I, uint16_t *dst) {
+    const V41AmxFp8 *w = (const V41AmxFp8 *)ctx;
+    const int tiles_i = I / 32;
+    for (int n = 0; n < 32; n++) {
+        const int o = o0 + n;
+        uint16_t *d = dst + (size_t)n * I;
+        if (o >= O) { memset(d, 0, (size_t)I * 2); continue; }
+        const uint8_t *row = w->q + (size_t)o * I, *sc = w->s + (size_t)(o / 32) * tiles_i;
+        for (int t = 0; t < tiles_i; t++) {
+            const float f = 0x1p120f * v41_amx_e8(sc[t]);
+            v41_amx_e4_16(d + t * 32, row + t * 32, f);
+            v41_amx_e4_16(d + t * 32 + 16, row + t * 32 + 16, f);
+        }
+    }
+}
+__attribute__((target("avx512f,avx512bw")))
+static void v41_amx_dec_mxfp4(const void *ctx, int o0, int O, int I, uint16_t *dst) {
+    const V41Mx4 *w = (const V41Mx4 *)ctx;
+    const int rb = I / 2, ng = I / 32;
+    for (int n = 0; n < 32; n++) {
+        const int o = o0 + n;
+        uint16_t *d = dst + (size_t)n * I;
+        if (o >= O) { memset(d, 0, (size_t)I * 2); continue; }
+        const uint8_t *row = w->q4 + (size_t)o * rb, *sc = w->e8s + (size_t)o * ng;
+        for (int g = 0; g < ng; g++) v41_amx_mx4_32(d + g * 32, row + g * 16, v41_amx_e8(sc[g]));
+    }
+}
+static void v41_amx_dec_bf16(const void *ctx, int o0, int O, int I, uint16_t *dst) {
+    const V41AmxBf16 *w = (const V41AmxBf16 *)ctx;
+    for (int n = 0; n < 32; n++) {
+        const int o = o0 + n;
+        if (o < O) memcpy(dst + (size_t)n * I, w->w + (size_t)o * I, (size_t)I * 2);
+        else memset(dst + (size_t)n * I, 0, (size_t)I * 2);
+    }
 }
 #else
 #define V41_AMX_HAVE 0
