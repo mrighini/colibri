@@ -51,8 +51,8 @@ typedef struct {
     CcBuf *lw_xs, *lw_hp, *lw_ds, *lw_list, *lw_mask;
     float *lw_in, *lw_out;
     size_t lw_cap;
-    unsigned long long forwards;
-    double host_ms;
+    unsigned long long forwards, one_row;
+    double host_ms, attn_ms, ffn_ms, fwd_ms;   /* the exit report's split (v41u_report) */
 } V41U;
 static V41U *g_v41u;
 static int g_v41u_off;   /* declined for good (set up refused, or COLI_CUDA_CHAIN=0) */
@@ -147,6 +147,14 @@ static size_t v41u_plan_bytes(const Model *m, int ctx) {
  * host's) turns it off, as it does the Vulkan chain */
 /* the native checkpoint the chain takes: its W8 are e4m3 with tiles (not a GGUF's blocks) */
 static int v41u_native(const Model *m) { return !m->gguf && m->c.n_layers > 0 && !m->L[0].wq_a.gx && m->L[0].wq_a.s; }
+static void v41u_report(void) {   /* where a chain forward's time went (PLAN-scale S3) */
+    const V41U *ch = g_v41u;
+    if (!ch || !ch->ok || !ch->forwards) return;
+    const double f = (double)ch->forwards;
+    fprintf(stderr, "[CUDA] deepseek_v41 chain: %llu forwards (%llu of one row), %.2f ms each: attention+shared frames %.2f, "
+                    "routed experts on the host %.2f, FFN frames %.2f, the rest %.2f\n", ch->forwards, ch->one_row, ch->fwd_ms / f,
+            ch->attn_ms / f, ch->host_ms / f, ch->ffn_ms / f, (ch->fwd_ms - ch->attn_ms - ch->host_ms - ch->ffn_ms) / f);
+}
 static int v41u_wanted(Model *m) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN"); on = !(e && *e == '0'); }
@@ -247,6 +255,7 @@ static int v41u_setup(Model *m) {
         return 0;
     }
     ch->ok = 1;
+    atexit(v41u_report);
     fprintf(stderr, "[CUDA] deepseek_v41 chain: a prompt's %d layers on the card, layer by layer (%.1f MiB of parameters; "
                     "COLI_CUDA_CHAIN=0: the CPU)\n", L, n * 4 / 1048576.0);
     return 1;
@@ -513,9 +522,14 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     if (spec || T || !v41u_wanted(m)) return 0;
     if (!v41u_setup(m)) return 0;
     V41U *ch = g_v41u;
+    const double tfw = now_s();
     v41u_lower(m, start);   /* this forward writes from start: nothing the device holds past it is the host's */
     const int W = ch->W, LR = W + ch->K, rows = n < ch->rows ? n : ch->rows;
-    if (n <= rows) return 0;   /* a prompt of more than one chunk */
+    /* a prompt of more than one chunk; COLI_CUDA_V41_MIN=<rows>: from that many rows on (1: every step, a decode's
+     * one row too -- PLAN-scale S3) */
+    static int min_rows = -1;
+    if (min_rows < 0) { const char *e = getenv("COLI_CUDA_V41_MIN"); min_rows = e && atoi(e) > 0 ? atoi(e) : 0; }
+    if (min_rows ? n < min_rows : n <= rows) return 0;
     /* in segments of whole chunks, as even as they come, up to v41u_seg_rows each */
     const int chunks = (n + rows - 1) / rows, nseg = (n + v41u_seg_rows(ch) - 1) / v41u_seg_rows(ch);
     const int cand = v41u_cand_on(c);
@@ -628,6 +642,7 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
             const int first = tail && i > m->ptail_after && tf > s0 ? tf : s0;
             if (first >= se) continue;
             double ta = now_s();
+            const double ta0 = ta;
             XT(stream_prefetch)(i, se - first);
             for (int c0 = first; ok && c0 < se; c0 += rows) {
                 if (coli_prompt_break()) { stopped = 1; break; }
@@ -646,11 +661,13 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
                 if (ok) memcpy(ch->lw_in + (size_t)lc * D, cc_ptr(ch->h2d), (size_t)nr * D * sizeof(float));
             }
             m->t_attn += now_s() - ta;
+            ch->attn_ms += (now_s() - ta0) * 1e3;
             if (!ok || stopped) break;
             const double t1 = now_s();
             moe_run_at(m, l, &m->cache[i], "layers", i, c->n_routed, c->n_activated, ch->lw_in + (size_t)(first - s0) * D, se - first,
                        ch->lw_out + (size_t)(first - s0) * D, 0);
             ch->host_ms += (now_s() - t1) * 1e3;
+            const double tf = now_s();
             for (int c0 = first; ok && c0 < se; c0 += rows) {   /* each chunk's FFN branch into its streams */
                 const int nr = se - c0 < rows ? se - c0 : rows, lc = c0 - s0;
                 memcpy(cc_ptr(ch->routed), ch->lw_out + (size_t)lc * D, (size_t)nr * D * sizeof(float));
@@ -660,6 +677,7 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
                      cc_ops()->ew(ch->br, ch->routed, ch->ds, NULL, NULL, &add) && v41u_post(ch, m, ch->hpf, nr) &&
                      cc_copy(ch->lw_xs, (size_t)lc * HD, ch->xs, 0, (size_t)nr * HD) && cc_submit(1);
             }
+            ch->ffn_ms += (now_s() - tf) * 1e3;
         }
         /* the segment's streams and mixes (every row's, or the prompt's last) and, after the last
          * one, what the host's state gets back */
@@ -715,6 +733,8 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     else { memcpy(h + (size_t)(n - 1) * HD, outs, (size_t)HD * sizeof(float)); memcpy(pre_mix + (size_t)(n - 1) * H, pres, (size_t)H * sizeof(float)); }
     free(f.keyl); free(need); free(pc); free(wl); free(cs_); free(er); free(outs); free(pres);
     ch->forwards++;
+    if (n == 1) ch->one_row++;
+    ch->fwd_ms += (now_s() - tfw) * 1e3;
     return L;
 }
 #endif
