@@ -577,7 +577,12 @@ void coli_sycl_fprof_frame(double host_ms, double submit_ms, double wait_ms) {
         k.n++;
         if (t[i].ok) k.ns += t[i].e - t[i].s; else k.untimed++;
     }
-    if (g_fp->level >= 2 && !g_fp->dumped && b.frames == 8) {   /* one frame command by command: the eighth of its bucket */
+    static long dump_n = -1;   /* COLI_SYCL_FRAME_PROF_DUMP=<n>: the n-th frame of its bucket (default 8) */
+    if (dump_n < 0) { const char *e = getenv("COLI_SYCL_FRAME_PROF_DUMP"); dump_n = e && atol(e) > 0 ? atol(e) : 8; }
+    static long dump_c = -1;   /* COLI_SYCL_FRAME_PROF_DUMP_CMDS=<c>: only a frame of c commands */
+    if (dump_c < 0) { const char *e = getenv("COLI_SYCL_FRAME_PROF_DUMP_CMDS"); dump_c = e && atol(e) > 0 ? atol(e) : 0; }
+    if (g_fp->level >= 2 && !g_fp->dumped && b.frames == (unsigned long long)dump_n &&
+        (!dump_c || evs.size() == (size_t)dump_c)) {   /* one frame command by command */
         g_fp->dumped = 1;
         std::fprintf(stderr, "[SYCL] frame profile: frame %llu (%zu commands) command by command: index, kind, start (us from the "
                              "frame's first), duration (us), idle before it (us)\n", g_fp->frames, evs.size());

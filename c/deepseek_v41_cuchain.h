@@ -53,6 +53,24 @@ typedef struct {
     size_t lw_cap;
     unsigned long long forwards, one_row;
     double host_ms, attn_ms, ffn_ms, fwd_ms;   /* the exit report's split (v41u_report) */
+    /* V41_CHAIN_MOE=1 (the SYCL backend only, v41u_cmoe_*): a decode step's routed experts in
+     * the chain -- the router, the resident experts (cc_route kind 2, cc_moe fmt 7), the host's
+     * misses only on the CPU */
+    int cm_state;                 /* 0 not tried yet, 1 on, -1 off for good */
+    int cm_E, cm_K, cm_act, cm_check;   /* cm_check: V41_CHAIN_MOE_CHECK's (layer, step) pairs still to check */
+    float cm_lim;
+    unsigned cm_epoch;            /* the tier's epoch the device tables were last built at */
+    ColiCudaTensor **cm_gate;     /* every layer's gate [E][dim] (v41u_tb) */
+    CcBuf *cm_bias, *cm_tab;      /* every layer's gate bias (E floats) and table (E CcExpert), at i * E */
+    CcBuf *cm_lg, *cm_ids, *cm_w, *cm_hid, *cm_y, *cm_hy, *cm_yd;
+    CcExpert *cm_tabh;            /* the tables as the device holds them: g NULL, the host's miss */
+    uint32_t *cm_ent;             /* one layer's tier entries (E * COLI_VK_XB_ENTRY words) */
+    int *cm_chg;
+    unsigned char *cm_dirty;
+    float *cm_contrib, *cm_ref, *cm_sc;
+    unsigned long long cm_steps, cm_layers, cm_dev_slots, cm_host_slots, cm_reads, cm_checked, cm_route_diff;
+    double cm_dev_ms, cm_host_ms, cm_p2_ms, cm_err_max, cm_err_sum, cm_wdiff;
+    double cm_tab_ms, cm_cpu_ms, cm_cnt_ms;   /* within the above: the tables' refresh, the misses' CPU experts, vkt_dev_count */
 } V41U;
 static V41U *g_v41u;
 static int g_v41u_off;   /* declined for good (set up refused, or COLI_CUDA_CHAIN=0) */
@@ -148,12 +166,28 @@ static size_t v41u_plan_bytes(const Model *m, int ctx) {
 /* the native checkpoint the chain takes: its W8 are e4m3 with tiles (not a GGUF's blocks) */
 static int v41u_native(const Model *m) { return !m->gguf && m->c.n_layers > 0 && !m->L[0].wq_a.gx && m->L[0].wq_a.s; }
 static void v41u_report(void) {   /* where a chain forward's time went (PLAN-scale S3) */
+    { const char *fp = getenv("COLI_SYCL_FRAME_PROF"); if (fp && *fp && strcmp(fp, "0")) cc_shutdown(); }   /* its per-command books, printed once */
     const V41U *ch = g_v41u;
-    if (!ch || !ch->ok || !ch->forwards) return;
-    const double f = (double)ch->forwards;
-    fprintf(stderr, "[CUDA] deepseek_v41 chain: %llu forwards (%llu of one row), %.2f ms each: attention+shared frames %.2f, "
-                    "routed experts on the host %.2f, FFN frames %.2f, the rest %.2f\n", ch->forwards, ch->one_row, ch->fwd_ms / f,
-            ch->attn_ms / f, ch->host_ms / f, ch->ffn_ms / f, (ch->fwd_ms - ch->attn_ms - ch->host_ms - ch->ffn_ms) / f);
+    if (!ch) return;
+    if (ch->ok && ch->forwards) {
+        const double f = (double)ch->forwards;
+        fprintf(stderr, "[CUDA] deepseek_v41 chain: %llu forwards (%llu of one row), %.2f ms each: attention+shared frames %.2f, "
+                        "routed experts on the host %.2f, FFN frames %.2f, the rest %.2f\n", ch->forwards, ch->one_row, ch->fwd_ms / f,
+                ch->attn_ms / f, ch->host_ms / f, ch->ffn_ms / f, (ch->fwd_ms - ch->attn_ms - ch->host_ms - ch->ffn_ms) / f);
+    }
+    if (ch->cm_layers) {   /* V41_CHAIN_MOE's decode steps */
+        const double s = ch->cm_steps ? (double)ch->cm_steps : 1.0, ly = (double)ch->cm_layers;
+        fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: %llu decode steps (%llu layer steps), of a layer's %d slots %.2f resident, "
+                        "%.2f host misses; per step: attention+shared+router+resident experts frames %.2f ms, host misses %.2f ms, "
+                        "parts-2+FFN frames %.2f ms; tables read %llu times\n", ch->cm_steps, ch->cm_layers, ch->cm_K,
+                ch->cm_dev_slots / ly, ch->cm_host_slots / ly, ch->cm_dev_ms / s, ch->cm_host_ms / s, ch->cm_p2_ms / s, ch->cm_reads);
+        fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: within those, per step: the tables' refresh %.2f ms, the misses' CPU experts "
+                        "%.2f ms, vkt_dev_count %.2f ms\n", ch->cm_tab_ms / s, ch->cm_cpu_ms / s, ch->cm_cnt_ms / s);
+    }
+    if (ch->cm_checked)
+        fprintf(stderr, "[CUDA] deepseek_v41 chain MoE check: %llu pairs, max rel err %.3g, mean %.3g (the CPU's routing differed "
+                        "in %llu, max route weight diff %.3g)\n", ch->cm_checked, ch->cm_err_max, ch->cm_err_sum / (double)ch->cm_checked,
+                ch->cm_route_diff, ch->cm_wdiff);
 }
 static int v41u_wanted(Model *m) {
     static int on = -1;
@@ -510,6 +544,234 @@ static int v41u_state_pull(V41U *ch, Model *m, int start, int E, const size_t *p
     return ok;
 }
 
+/* ---- V41_CHAIN_MOE: a decode step's routed experts in the chain (PLAN-scale S3c) ------------
+ * Opt-in (V41_CHAIN_MOE=1), the SYCL backend only (cc_moe's fmt 7 and act 1 are its), a decode
+ * step's one row through the chain only. Per layer, in the attention+shared frame: the gate's
+ * logits from the normalized FFN input (nrm), DeepSeek's router (cc_route kind 2: moe_gate's
+ * arithmetic), the experts the tier holds on this device (cc_moe parts 1, the tier's tables).
+ * Then the host computes the misses (the table's zero entries) on the CPU, moe_vk_cpu's
+ * w * expert(x) per slot, summed in rank order into hy; then a frame: y = hy + each resident
+ * slot's w * down in rank order (cc_moe parts 2), and the FFN add with y in place of the host's
+ * routed row. moe_run_at(with_shared 0) is what it stands for: the routed experts only, the
+ * shared expert on the device (v41u_shared). Anything refused: today's host step for good.
+ * V41_CHAIN_MOE_CHECK=n: the first n (layer, step) pairs also through moe_run_at, compared. */
+#if defined(COLI_CUDA) && defined(COLI_SYCL)
+#define V41U_CMOE 1
+#ifndef COLI_VK_XB_ENTRY
+#define COLI_VK_XB_ENTRY 32
+#endif
+static void v41u_cmoe_off(V41U *ch, const char *why) {
+    if (ch->cm_state >= 0)
+        fprintf(stderr, "[CUDA] deepseek_v41 chain MoE (V41_CHAIN_MOE): %s; the host computes the routed experts\n", why);
+    ch->cm_state = -1;
+}
+/* layer i's table from the tier: each entry's first sizeof(CcExpert) bytes are a CcExpert on
+ * this backend (zero: not resident on this device) */
+static int v41u_cmoe_read(V41U *ch, int i) {
+    const int E = ch->cm_E;
+    if (XT(dev_table)(i, ch->cm_ent) < 0) return 0;
+    CcExpert *t = ch->cm_tabh + (size_t)i * E;
+    for (int e = 0; e < E; e++) memcpy(&t[e], ch->cm_ent + (size_t)e * COLI_VK_XB_ENTRY, sizeof(CcExpert));
+    return 1;
+}
+/* At a frame's start, nothing in flight (every chain frame here is waited for, no tier batch is
+ * out): the tier settles, and the layers whose entries changed since the tables were built
+ * (vkt_dev_changes; every layer when it cannot say, or whole) are read again and go up. Called
+ * before each layer's frame, since the host's misses (vkt_note) and vkt_dev_count are quiescent
+ * points that may move residents between two layers. 0 = refused. */
+static int v41u_cmoe_tables(V41U *ch, Model *m, int whole) {
+    const int L = m->c.n_layers, E = ch->cm_E;
+    XT(settle)();
+    const unsigned ep = XT(epoch)();
+    if (!whole && ep == ch->cm_epoch) return 1;
+    memset(ch->cm_dirty, whole ? 1 : 0, (size_t)L);
+    if (!whole) {
+        const int nc = XT(dev_changes)(ch->cm_epoch, ch->cm_chg, L * E);
+        if (nc < 0) memset(ch->cm_dirty, 1, (size_t)L);
+        for (int k = 0; k < nc; k++) {
+            const int l = ch->cm_chg[k] / E;
+            if (l >= 0 && l < L) ch->cm_dirty[l] = 1;   /* a DSpark stage's (an extra layer) is not ours */
+        }
+    }
+    int any = 0;
+    for (int i = 0; i < L; i++) any |= ch->cm_dirty[i];
+    if (!any) { ch->cm_epoch = ep; return 1; }
+    const size_t ef = sizeof(CcExpert) / sizeof(float);   /* cc_write's offsets are in floats */
+    int ok = cc_begin();
+    const int opened = ok;
+    for (int i = 0; ok && i < L; i++) {
+        if (!ch->cm_dirty[i]) continue;
+        ok = v41u_cmoe_read(ch, i) &&
+             cc_write(ch->cm_tab, (size_t)i * E * ef, ch->cm_tabh + (size_t)i * E, (size_t)E * sizeof(CcExpert));
+    }
+    if (opened) ok = cc_submit(1) && ok;
+    if (!ok) return 0;
+    ch->cm_reads++;
+    ch->cm_epoch = ep;
+    return 1;
+}
+/* once: V41_CHAIN_MOE=1 and everything it needs, else off for good (said once, why) */
+static int v41u_cmoe_setup(V41U *ch, Model *m) {
+    if (ch->cm_state) return ch->cm_state > 0;
+    const char *on = getenv("V41_CHAIN_MOE");
+    if (!(on && atoi(on) > 0)) { ch->cm_state = -2; return 0; }   /* not asked: silent */
+    Cfg *c = &m->c;
+    const int L = c->n_layers, D = c->dim, I = c->moe_inter, E = c->n_routed, K = c->n_activated;
+    const char *why = NULL;
+    if (sizeof(CcExpert) % sizeof(float) || sizeof(CcExpert) > COLI_VK_XB_ENTRY * sizeof(uint32_t)) why = "CcExpert's size";
+    else if (!cc_moe_ready()) why = "the backend has no cc_route / cc_moe";
+    else if (!xt_cuda() || !XT(ready)()) why = "the expert tier is not on this device";
+    else if (XT(layers)() < L) why = "the tier does not serve every layer";
+    else if (m->gx) why = "a GGUF's experts (cc_moe fmt 7 is the checkpoint's MXFP4)";
+    else if (E < 1 || E > CC_ROUTE_EMAX || K < 1 || K > CC_ROUTE_KMAX || K > MOE_TOPK_MAX || K > E) why = "the router's shape";
+    else if (D % 32 || I % 32 || D > CC_MOE_DIM_MAX || I > CC_MOE_DIM_MAX) why = "the experts' shape";
+    ch->cm_E = E; ch->cm_K = K;
+    ch->cm_act = c->swiglu_limit > 0.0f;   /* act 1: deepseek_v41.c's swiglu_into clamps; act 0 without a limit */
+    ch->cm_lim = c->swiglu_limit > 0.0f ? c->swiglu_limit : 0.0f;
+    float *bias = NULL;
+    if (!why && (!(ch->cm_gate = (ColiCudaTensor **)calloc((size_t)L, sizeof *ch->cm_gate)) ||
+                 !(ch->cm_tabh = (CcExpert *)calloc((size_t)L * E, sizeof(CcExpert))) ||
+                 !(ch->cm_ent = (uint32_t *)calloc((size_t)E * COLI_VK_XB_ENTRY, sizeof(uint32_t))) ||
+                 !(ch->cm_chg = (int *)malloc((size_t)L * E * sizeof(int))) || !(ch->cm_dirty = (unsigned char *)calloc((size_t)L, 1)) ||
+                 !(ch->cm_contrib = (float *)malloc((size_t)K * D * sizeof(float))) ||
+                 !(ch->cm_ref = (float *)malloc((size_t)D * sizeof(float))) || !(ch->cm_sc = (float *)malloc((size_t)E * sizeof(float))) ||
+                 !(bias = (float *)malloc((size_t)L * E * sizeof(float)))))
+        why = "memory";
+    for (int i = 0; !why && i < L; i++) {
+        Layer *l = &m->L[i];
+        if (!l->gate_bias.w) { why = "a layer without a gate bias"; break; }
+        memcpy(bias + (size_t)i * E, l->gate_bias.w, (size_t)E * sizeof(float));
+        if (!(ch->cm_gate[i] = v41u_tb(&l->gate_w))) {
+            fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: layer %d's gate not on the device (the dense budget %.2f of %.2f GiB used)\n",
+                    i, g_cud.used / 1073741824.0, g_cud.budget / 1073741824.0);
+            why = "a gate the device's dense budget does not take";
+        }
+    }
+    if (!why && !(v41u_res(&ch->cm_bias, (size_t)L * E, CC_DEV) &&
+                  cc_reserve(&ch->cm_tab, (size_t)L * E * sizeof(CcExpert), CC_DEV) && v41u_res(&ch->cm_lg, (size_t)E, CC_DEV) &&
+                  cc_reserve(&ch->cm_ids, (size_t)K * sizeof(int), CC_DOWN) && v41u_res(&ch->cm_w, (size_t)K, CC_DOWN) &&
+                  v41u_res(&ch->cm_hid, cc_moe_hid_floats(1, K, D, I, E), CC_DEV) && v41u_res(&ch->cm_y, (size_t)D, CC_DEV) &&
+                  v41u_res(&ch->cm_hy, (size_t)D, CC_UP) && v41u_res(&ch->cm_yd, (size_t)D, CC_DOWN)))
+        why = "device memory for the router and the experts' rows";
+    if (!why && !(cc_begin() && cc_write(ch->cm_bias, 0, bias, (size_t)L * E * sizeof(float)) && cc_submit(1)))
+        why = "the gate biases did not reach the device";
+    free(bias);
+    if (!why && !v41u_cmoe_tables(ch, m, 1)) why = "the tier's tables (vkt_dev_table) refused";
+    if (why) { v41u_cmoe_off(ch, why); return 0; }
+    const char *ck = getenv("V41_CHAIN_MOE_CHECK");
+    ch->cm_check = ck && atoi(ck) > 0 ? atoi(ck) : 0;
+    int res = 0;
+    for (size_t j = 0; j < (size_t)L * E; j++) res += ch->cm_tabh[j].g != NULL;
+    ch->cm_state = 1;
+    fprintf(stderr, "[CUDA] deepseek_v41 chain MoE (V41_CHAIN_MOE): a decode step's router and resident experts in the chain, "
+                    "the misses on the CPU (%d of %d experts resident now%s)\n", res, L * E, ch->cm_check ? "; V41_CHAIN_MOE_CHECK on" : "");
+    if (ch->cm_check) fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: checking the first %d (layer, step) pairs against moe_run_at\n", ch->cm_check);
+    return 1;
+}
+static CcMoe v41u_cmoe_args(const V41U *ch, const Model *m, int i, int parts) {
+    const Cfg *c = &m->c;
+    CcMoe p;
+    memset(&p, 0, sizeof p);
+    p.S = 1; p.K = ch->cm_K; p.D = c->dim; p.I = c->moe_inter; p.fmt = 7; p.gs = 32; p.act = ch->cm_act; p.parts = parts;
+    p.t_off = i * ch->cm_E; p.x_off = 0; p.x_row = c->dim; p.i_off = 0; p.i_row = ch->cm_K; p.w_off = 0; p.w_row = ch->cm_K;
+    p.y_off = 0; p.y_row = c->dim; p.h_off = 0; p.E = ch->cm_E; p.planar = 0; p.fmt_d = 0; p.lay_S = 0; p.lay_s0 = 0;
+    p.act_lim = ch->cm_lim;
+    return p;
+}
+/* layer i's router and resident experts, appended to the open attention+shared frame (nrm: the
+ * normalized FFN input the host step reads as h2d) */
+static int v41u_cmoe_dev(V41U *ch, Model *m, int i) {
+    const Cfg *c = &m->c;
+    const int E = ch->cm_E, K = ch->cm_K;
+    CcRoute r;
+    memset(&r, 0, sizeof r);
+    r.S = 1; r.E = E; r.K = K; r.kind = 2;
+    r.l_off = 0; r.l_row = E; r.b_off = i * E; r.has_bias = 1;   /* moe_gate: the bias for the pick only */
+    r.i_off = 0; r.i_row = K; r.w_off = 0; r.w_row = K;
+    r.n_group = 0; r.topk_group = 0;
+    r.norm = c->norm_topk_prob && K > 1 ? 1 : 0;   /* moe_gate: by the sum + 1e-20 only with norm_topk_prob */
+    r.temp = c->gate_temp; r.scale = c->route_scale; r.norm_eps = 1e-20f;
+    CcMoe p = v41u_cmoe_args(ch, m, i, 1);
+    return cc_matmul(ch->cm_gate[i], ch->nrm, 0, ch->cm_lg, 0, 1) && cc_route(ch->cm_lg, ch->cm_bias, ch->cm_ids, ch->cm_w, &r) &&
+           cc_moe(ch->cm_tab, ch->nrm, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_y, ch->cm_hy, &p);
+}
+/* The host's part of layer i after the device's frame: the routing it made (ids, w back to the
+ * host), the misses -- slots whose expert the device's table does not hold -- on the CPU
+ * (moe_vk_cpu: w * expert(x) per slot, through the expert cache, each passed to the tier as
+ * moe_vk_block's are), hy = their sum in rank order; the books moe_vk_block keeps. x: the host's
+ * copy of the same normalized FFN input. A version 1, synchronous: the frame was waited for
+ * before this; later the frame's resident experts can overlap this (cc_signal after cc_route,
+ * the host's misses while cc_moe parts 1 runs, cc_wait_host before parts 2). */
+static void v41u_cmoe_host(V41U *ch, Model *m, int i, const float *x, int *ids, float *w) {
+    const int D = m->c.dim, E = ch->cm_E, K = ch->cm_K;
+    memcpy(ids, cc_ptr(ch->cm_ids), (size_t)K * sizeof(int));
+    memcpy(w, cc_ptr(ch->cm_w), (size_t)K * sizeof(float));
+    const CcExpert *t = ch->cm_tabh + (size_t)i * E;
+    uint8_t want[CC_ROUTE_KMAX];
+    int nmiss = 0;
+    rt_count(i, ids, K);   /* the history (moe_vk_block's, backbone only; -1 is skipped) */
+    for (int k = 0; k < K; k++) {
+        const int e = ids[k], valid = e >= 0 && e < E, dev = valid && t[e].g != NULL;
+        want[k] = valid && !dev;
+        nmiss += want[k];
+        if (dev) { ehit_mark(m, i, e); ch->cm_dev_slots++; }   /* expert_slots_at marks the misses */
+    }
+    ch->cm_host_slots += (unsigned long long)nmiss;
+    float *hy = (float *)cc_ptr(ch->cm_hy);
+    memset(hy, 0, (size_t)D * sizeof(float));
+    if (!nmiss) return;
+    const double tc0 = now_s();
+    moe_vk_cpu(m, &m->cache[i], "layers", i, K, x, 1, ids, w, want, ch->cm_contrib);
+    ch->cm_cpu_ms += (now_s() - tc0) * 1e3;
+    for (int k = 0; k < K; k++) {   /* rank order, as moe_vk_block's sum */
+        if (!want[k]) continue;
+        const float *cv = ch->cm_contrib + (size_t)k * D;
+        for (int d = 0; d < D; d++) hy[d] += cv[d];
+    }
+}
+/* After layer i's parts-2+FFN frame (nothing in flight): the device's books for the step
+ * (vkt_dev_count: heat, routed and served; it may move residents, which the next layer's
+ * v41u_cmoe_tables picks up), and V41_CHAIN_MOE_CHECK's comparison with moe_run_at on the same
+ * input. The check's moe_run_at is a second, real step: it goes through the cache and the tier
+ * (issue, join, notes), so a checked run's hit counts and the tier's heat are not a plain run's. */
+static void v41u_cmoe_after(V41U *ch, Model *m, Layer *l, int i, const float *x, const int *ids, const float *w, int checked) {
+    const Cfg *c = &m->c;
+    const int D = c->dim, E = ch->cm_E, K = ch->cm_K;
+    int valid = 1;
+    for (int k = 0; k < K; k++) valid &= ids[k] >= 0 && ids[k] < E;
+    if (valid) XT(dev_count)(i, 1, K, ids);
+    if (!checked) return;
+    const float *y = (const float *)cc_ptr(ch->cm_yd);
+    moe_run_at(m, l, &m->cache[i], "layers", i, E, K, x, 1, ch->cm_ref, 0);
+    double mx = 0.0, md = 0.0;
+    for (int d = 0; d < D; d++) {
+        const double r = fabs((double)ch->cm_ref[d]), df = fabs((double)ch->cm_ref[d] - (double)y[d]);
+        if (r > mx) mx = r;
+        if (df > md || df != df) md = df;
+    }
+    const double rel = mx > 0.0 ? md / mx : md;
+    if (rel > ch->cm_err_max || rel != rel) ch->cm_err_max = rel;
+    ch->cm_err_sum += rel;
+    ch->cm_checked++;
+    /* the CPU's own routing of the same row (moe_run_at's: mvb_rows, moe_gate), against the device's */
+    int cid[MOE_TOPK_MAX];
+    float cw[MOE_TOPK_MAX];
+    mvb_rows(ch->cm_sc, E, &l->gate_w, x, D, 1);
+    moe_gate(m, l, E, K, ch->cm_sc, cid, cw);
+    int same = 1;
+    for (int k = 0; k < K; k++) {
+        same &= cid[k] == ids[k];
+        const double wd = fabs((double)cw[k] - (double)w[k]);
+        if (cid[k] == ids[k] && wd > ch->cm_wdiff) ch->cm_wdiff = wd;
+    }
+    if (!same) ch->cm_route_diff++;
+    if (ch->cm_checked <= 4 || rel > 1e-2)
+        fprintf(stderr, "[CUDA] deepseek_v41 chain MoE check: layer %d, rel err %.3g%s\n", i, rel, same ? "" : " (the CPU routed otherwise)");
+}
+#else
+#define V41U_CMOE 0
+#endif
+
 /* Every layer for a prompt's n rows of streams h (positions start..): the streams after the
  * last layer and its FFN mix back into h and pre_mix (every row when all, else the last), the
  * host's state as the CPU would have left it. Returns the layers run (all of them), 0: not
@@ -629,6 +891,13 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     int tf = 0;
     if (tail) while (tf < n && tf + (n - tf < rows ? n - tf : rows) <= n - m->ptail_rows) tf += rows;
     int stopped = 0;
+    /* V41_CHAIN_MOE: a decode step's routed experts in the chain (v41u_cmoe_*); off: moe_run_at */
+    int cmoe = 0;
+#if V41U_CMOE
+    cmoe = ok && n == 1 && v41u_cmoe_setup(ch, m);
+    if (cmoe) ch->cm_steps++;
+#endif
+    (void)cmoe;
     for (int s0 = 0; ok && !stopped && s0 < n; s0 += per) {   /* a segment's rows through every layer */
         const int se = s0 + per < n ? s0 + per : n;
         f.s0 = s0;
@@ -644,6 +913,17 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
             double ta = now_s();
             const double ta0 = ta;
             XT(stream_prefetch)(i, se - first);
+#if V41U_CMOE
+            const double tt0 = now_s();
+            const int tabs_ok = !cmoe || v41u_cmoe_tables(ch, m, 0);
+            if (cmoe) ch->cm_tab_ms += (now_s() - tt0) * 1e3;
+            if (!tabs_ok) {   /* the tier's residents moved: this layer's frame reads the new tables */
+                if (cc_lost()) { ok = 0; break; }
+                v41u_cmoe_off(ch, "the tier's tables refused");
+                cmoe = 0;
+            }
+            const int cm_layer = cmoe;   /* this layer's routed experts in the chain */
+#endif
             for (int c0 = first; ok && c0 < se; c0 += rows) {
                 if (coli_prompt_break()) { stopped = 1; break; }
                 const int nr = se - c0 < rows ? se - c0 : rows, pb = start + c0, lc = c0 - s0;
@@ -657,27 +937,79 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
                      v41u_pre(ch, m, ch->fnf[i], ch->o_hcf[i], ch->hpf, ch->hpa, ch->o_fn[i], nr) &&
                      cc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && v41u_shared(ch, m, l, nr) &&
                      cc_copy(ch->lw_xs, (size_t)lc * HD, ch->xs, 0, (size_t)nr * HD) && cc_copy(ch->lw_hp, (size_t)lc * hr, ch->hpf, 0, (size_t)nr * hr) &&
-                     cc_copy(ch->lw_ds, (size_t)lc * D, ch->ds, 0, (size_t)nr * D) && cc_submit(1);
+                     cc_copy(ch->lw_ds, (size_t)lc * D, ch->ds, 0, (size_t)nr * D);
+#if V41U_CMOE
+                /* the router and the resident experts in the same frame; refused (not a lost device): the host step from here on */
+                if (ok && cmoe && !v41u_cmoe_dev(ch, m, i)) {
+                    if (cc_lost()) ok = 0;
+                    else { v41u_cmoe_off(ch, "the device's router or experts refused (cc_matmul/cc_route/cc_moe parts 1)"); cmoe = 0; }
+                }
+#endif
+                ok = ok && cc_submit(1);
                 if (ok) memcpy(ch->lw_in + (size_t)lc * D, cc_ptr(ch->h2d), (size_t)nr * D * sizeof(float));
             }
             m->t_attn += now_s() - ta;
             ch->attn_ms += (now_s() - ta0) * 1e3;
             if (!ok || stopped) break;
             const double t1 = now_s();
+#if V41U_CMOE
+            int cm_ids[CC_ROUTE_KMAX];
+            float cm_w[CC_ROUTE_KMAX];
+            if (cm_layer && cmoe) ch->cm_dev_ms += (t1 - ta0) * 1e3;
+            if (cmoe) {   /* n == 1: one chunk, its row at lw_in's 0 */
+                v41u_cmoe_host(ch, m, i, ch->lw_in, cm_ids, cm_w);
+                ch->cm_host_ms += (now_s() - t1) * 1e3;
+            } else
+#endif
             moe_run_at(m, l, &m->cache[i], "layers", i, c->n_routed, c->n_activated, ch->lw_in + (size_t)(first - s0) * D, se - first,
                        ch->lw_out + (size_t)(first - s0) * D, 0);
             ch->host_ms += (now_s() - t1) * 1e3;
             const double tf = now_s();
+            int cm_checked = 0;
             for (int c0 = first; ok && c0 < se; c0 += rows) {   /* each chunk's FFN branch into its streams */
                 const int nr = se - c0 < rows ? se - c0 : rows, lc = c0 - s0;
-                memcpy(cc_ptr(ch->routed), ch->lw_out + (size_t)lc * D, (size_t)nr * D * sizeof(float));
+                CcBuf *rin = ch->routed;   /* the routed row the add reads: the host's, or the device's y */
                 CcEw add = {CC_EW_ADD, nr * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-                ok = cc_begin() && cc_copy(ch->xs, 0, ch->lw_xs, (size_t)lc * HD, (size_t)nr * HD) &&
+                ok = 1;
+#if V41U_CMOE
+                if (cmoe) {   /* y = hy + the resident slots' w * down in rank order (cc_moe parts 2), then the add from y */
+                    CcMoe p2 = v41u_cmoe_args(ch, m, i, 2);
+                    cm_checked = ch->cm_check > 0;
+                    ok = cc_begin();
+                    if (ok && cc_moe(ch->cm_tab, ch->nrm, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_y, ch->cm_hy, &p2) &&
+                        (!cm_checked || cc_copy(ch->cm_yd, 0, ch->cm_y, 0, (size_t)D))) rin = ch->cm_y;
+                    else if (ok) {   /* refused: this layer's routed row from moe_run_at after all, the host step from here on */
+                        ok = !cc_lost() && cc_submit(1);
+                        if (ok) {
+                            v41u_cmoe_off(ch, "the device's experts refused (cc_moe parts 2)");
+                            cmoe = 0; cm_checked = 0;
+                            moe_run_at(m, l, &m->cache[i], "layers", i, c->n_routed, c->n_activated, ch->lw_in, 1, ch->lw_out, 0);
+                        }
+                    }
+                }
+#endif
+                if (ok && rin == ch->routed) {
+                    memcpy(cc_ptr(ch->routed), ch->lw_out + (size_t)lc * D, (size_t)nr * D * sizeof(float));
+                    ok = cc_begin();
+                }
+                ok = ok && cc_copy(ch->xs, 0, ch->lw_xs, (size_t)lc * HD, (size_t)nr * HD) &&
                      cc_copy(ch->hpf, 0, ch->lw_hp, (size_t)lc * hr, (size_t)nr * hr) && cc_copy(ch->ds, 0, ch->lw_ds, (size_t)lc * D, (size_t)nr * D) &&
-                     cc_ops()->ew(ch->br, ch->routed, ch->ds, NULL, NULL, &add) && v41u_post(ch, m, ch->hpf, nr) &&
+                     cc_ops()->ew(ch->br, rin, ch->ds, NULL, NULL, &add) && v41u_post(ch, m, ch->hpf, nr) &&
                      cc_copy(ch->lw_xs, (size_t)lc * HD, ch->xs, 0, (size_t)nr * HD) && cc_submit(1);
             }
             ch->ffn_ms += (now_s() - tf) * 1e3;
+#if V41U_CMOE
+            if (ok && cmoe) {
+                ch->cm_p2_ms += (now_s() - tf) * 1e3;
+                ch->cm_layers++;
+                if (cm_checked) ch->cm_check--;
+                { const double tn0 = now_s();
+                  v41u_cmoe_after(ch, m, l, i, ch->lw_in, cm_ids, cm_w, cm_checked);
+                  if (!cm_checked) ch->cm_cnt_ms += (now_s() - tn0) * 1e3; }
+            }
+#else
+            (void)cm_checked;
+#endif
         }
         /* the segment's streams and mixes (every row's, or the prompt's last) and, after the last
          * one, what the host's state gets back */

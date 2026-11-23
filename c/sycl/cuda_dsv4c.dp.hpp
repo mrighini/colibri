@@ -109,27 +109,31 @@ static void ccd_mhc_split_k(const float *x, const float *mx, float *hp, const fl
         hp[hb + i] = ccd_sig(ms[i] * prm[pb] + prm[pb + 3 + i]) + p.hc_eps;
         hp[hb + H + i] = 2.f * ccd_sig(ms[H + i] * prm[pb + 1] + prm[pb + 3 + H + i]);
     }
+    /* the comb matrix in registers (H <= 8): the same operations in the same order as on hp[] itself, one write back --
+     * each step was a dependent global access (~0.44 ms a call on a decode row, DS25's profile) */
     const int cb = hb + 2 * H, mo = 2 * H;
+    float cm[64];
     for (int row = 0; row < H; row++) {
         float mxv = -3.0e38f;
         for (int col = 0; col < H; col++) {
             float v = ms[mo + row * H + col] * prm[pb + 2] + prm[pb + 3 + mo + row * H + col];
-            hp[cb + row * H + col] = v;
+            cm[row * H + col] = v;
             if (v > mxv) mxv = v;
         }
         float sum = 0.f;
-        for (int col = 0; col < H; col++) { float v = CCD_EXP(hp[cb + row * H + col] - mxv); hp[cb + row * H + col] = v; sum += v; }
-        for (int col = 0; col < H; col++) hp[cb + row * H + col] = hp[cb + row * H + col] / sum + p.hc_eps;
+        for (int col = 0; col < H; col++) { float v = CCD_EXP(cm[row * H + col] - mxv); cm[row * H + col] = v; sum += v; }
+        for (int col = 0; col < H; col++) cm[row * H + col] = cm[row * H + col] / sum + p.hc_eps;
     }
     float sums[8];
-    for (int col = 0; col < H; col++) { float sm = 0.f; for (int row = 0; row < H; row++) sm += hp[cb + row * H + col]; sums[col] = sm; }
-    for (int row = 0; row < H; row++) for (int col = 0; col < H; col++) hp[cb + row * H + col] /= sums[col] + p.hc_eps;
+    for (int col = 0; col < H; col++) { float sm = 0.f; for (int row = 0; row < H; row++) sm += cm[row * H + col]; sums[col] = sm; }
+    for (int row = 0; row < H; row++) for (int col = 0; col < H; col++) cm[row * H + col] /= sums[col] + p.hc_eps;
     for (int it2 = 1; it2 < p.iters; it2++) {
-        for (int row = 0; row < H; row++) { float sm = 0.f; for (int col = 0; col < H; col++) sm += hp[cb + row * H + col]; sums[row] = sm; }
-        for (int row = 0; row < H; row++) for (int col = 0; col < H; col++) hp[cb + row * H + col] /= sums[row] + p.hc_eps;
-        for (int col = 0; col < H; col++) { float sm = 0.f; for (int row = 0; row < H; row++) sm += hp[cb + row * H + col]; sums[col] = sm; }
-        for (int row = 0; row < H; row++) for (int col = 0; col < H; col++) hp[cb + row * H + col] /= sums[col] + p.hc_eps;
+        for (int row = 0; row < H; row++) { float sm = 0.f; for (int col = 0; col < H; col++) sm += cm[row * H + col]; sums[row] = sm; }
+        for (int row = 0; row < H; row++) for (int col = 0; col < H; col++) cm[row * H + col] /= sums[row] + p.hc_eps;
+        for (int col = 0; col < H; col++) { float sm = 0.f; for (int row = 0; row < H; row++) sm += cm[row * H + col]; sums[col] = sm; }
+        for (int row = 0; row < H; row++) for (int col = 0; col < H; col++) cm[row * H + col] /= sums[col] + p.hc_eps;
     }
+    for (int k = 0; k < H * H; k++) hp[cb + k] = cm[k];
 }
 static void ccd_mhc_ew_k(int mode, const float *x, const float *mx, const float *hp, float *y, CcMhc p) {
     auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
