@@ -960,6 +960,19 @@ static size_t v41_b16_preload(const WB *w) {
 #define V41_E4(...)
 static void v41_e4_start(int dev) { (void)dev; }
 #endif
+#include "v41_mv8_512.h"   /* the FP8 trunk on AVX-512 with the AVX2 loop's bits (V41_MV8_512=0 keeps AVX2) */
+#if V41_MV8_512_HAVE
+static int v41_mv8_512_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V41_MV8_512");
+        __builtin_cpu_init();
+        on = !(e && *e == '0') && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+             __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("fma");
+    }
+    return on;
+}
+#endif
 #include "v41_amx.h"   /* V41_AMX: the prompt pass's products on AMX-BF16 tiles (opt-in, not the AVX2 bits) */
 #if V41_AMX_HAVE
 #define V41_AMX_FP8(y, ys, w, x, xs, rows) \
@@ -987,8 +1000,21 @@ static void mv8_rows_cpu(float *y, int ystride, const W8 *w, const float *x, int
     int block = mv_block_rows(I);
     for (int r0 = 0; r0 < rows; r0 += block) {
         int nr = rows - r0 < block ? rows - r0 : block;
+#if V41_MV8_512_HAVE
+        const int pairs = !(I % FP8_TILE) && FP8_TILE == 32 && v41_mv8_512_on();
+#else
+        const int pairs = 0;
+#endif
         #pragma omp parallel for schedule(static)
         for (int o = 0; o < w->O; o++) {
+#if V41_MV8_512_HAVE
+            /* v41_mv8_512.h: output o and o+1 in one zmm, the same operations as below (an odd o is its partner's;
+             * an odd count's last output stays below) */
+            if (pairs) {
+                if (o & 1) continue;
+                if (o + 1 < w->O) { v41_mv8_pair(y, ystride, w->q, w->s, I, o, x, xstride, r0, nr); continue; }
+            }
+#endif
             const uint8_t *row = w->q + (size_t)o * I;
             const uint8_t *scale = w->s + (size_t)(o / FP8_TILE) * tiles_i;
             float sum[MV_ROWS_MAX];
