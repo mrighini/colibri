@@ -360,6 +360,8 @@ int main(int argc, char **argv) {
     test_attn(2, 2, 64, 8, 12, 2900, 0); test_attn(3, 4, 64, 8, 5, 13, 1);
     test_attn(40, 64, 512, 128, 700, 640, 0); test_attn(9, 70, 128, 8, 90, 200, 0);
     test_attn(12, 8, 64, 8, 40, 2900, 0); test_attn(40, 64, 512, 128, 700, 640, 1);
+    /* a decode row's split over its list (S 1, flags 0): DeepSeek V4.1's shape, an odd one, a list with holes */
+    test_attn(1, 64, 512, 128, 700, 640, 0); test_attn(1, 7, 96, 8, 300, 200, 0); test_attn(1, 64, 512, 128, 2000, 1500, 0);
     printf("rope\n"); test_rope(0); test_rope(1);
     printf("compress\n"); test_compress(4, 0, 0, 23); test_compress(4, 1, 1, 23); test_compress(128, 0, 1, 300);
     printf("index\n");

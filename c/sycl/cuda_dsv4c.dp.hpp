@@ -458,6 +458,68 @@ static void ccd_pa_out_k(const float *win, const float *cmp, const int *list, co
 #define CC_DS_PA_MIN 8
 #define CC_DS_PA_MB 64
 static CcBuf *g_ccd_scr, *g_ccd_den;
+static CcBuf *g_ccd_spl;   /* the split decode attention's partials: H x splits x (hd + 2) floats */
+/* A decode row's attention split over its list (flash decoding; S == 1, flags 0): pass 1, a work-group a (head, slice of
+ * the list), its scores as ccd_attn_k's dot products, the slice's max m, l = sum exp(v - m) and acc[i] = sum exp(v - m) *
+ * kv[i] over its rows in list order; pass 2, a work-group a head, M = the max of the sink and the slices', den =
+ * exp(sink - M) + sum l exp(m - M), out = sum acc exp(m - M) / den. Not ccd_attn_k's bits (the sums meet per slice):
+ * quality-gated; the multi-row and prompt forms keep theirs. */
+static void ccd_attn_sp1_k(const float *q, const float *win, const float *cmp, const int *list, float *spl, CcDsAttn p,
+                           int per, uint8_t *slm) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    float *sq = (float *)slm, *sc = sq + p.hd;   /* hd queries, then per scores */
+    auto &red = CCD_LOCAL(float[256]);
+    const int h = it.get_group(2), sp = it.get_group(1), tid = it.get_local_id(2), ns = it.get_group_range(1);
+    const int hd = p.hd, j0 = sp * per, j1 = sycl::min(p.cnt, j0 + per), lb = p.l_off;
+    for (int i = tid; i < hd; i += 256) sq[i] = q[p.q_off + h * hd + i];
+    CCD_SYNC(it);
+    float best = -1.0e30f;
+    for (int j = j0 + tid; j < j1; j += 256) {
+        const int e = list[lb + j];
+        float v = CC_DS_NEG_INF;
+        if (e >= 0) {
+            const float *kr = e < p.nwin ? win + p.w_off + e * hd : cmp + p.c_off + (e - p.nwin) * hd;
+            float d = 0.f;
+            for (int i = 0; i < hd; i++) d += sq[i] * kr[i];
+            v = d * p.scale;
+            if (v > best) best = v;
+        }
+        sc[j - j0] = v;
+    }
+    red[tid] = best;
+    CCD_SYNC(it);
+    for (int off = 128; off > 0; off >>= 1) { if (tid < off && red[tid + off] > red[tid]) red[tid] = red[tid + off]; CCD_SYNC(it); }
+    const float m = red[0];
+    CCD_SYNC(it);
+    for (int j = j0 + tid; j < j1; j += 256) { const float v = sc[j - j0]; sc[j - j0] = v > CC_DS_NEG_INF ? CCD_EXP(v - m) : 0.f; }
+    CCD_SYNC(it);
+    float *o = spl + ((size_t)h * ns + sp) * (hd + 2);
+    if (tid == 0) { float l = 0.f; for (int j = j0; j < j1; j++) if (list[lb + j] >= 0) l += sc[j - j0]; o[hd] = m; o[hd + 1] = l; }
+    for (int i = tid; i < hd; i += 256) {
+        float acc = 0.f;
+        for (int j = j0; j < j1; j++) {
+            const int e = list[lb + j];
+            if (e < 0) continue;
+            acc += sc[j - j0] * ccd_kv(win, cmp, e, p.nwin, p.w_off, p.c_off, hd, i);
+        }
+        o[i] = acc;
+    }
+}
+static void ccd_attn_sp2_k(const float *spl, const float *prm, float *out, CcDsAttn p, int ns) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int h = it.get_group(2), tid = it.get_local_id(2), hd = p.hd;
+    const float *b = spl + (size_t)h * ns * (hd + 2);
+    const float sink = prm[p.sink_off + h];
+    float M = sink;
+    for (int k = 0; k < ns; k++) { const float mk = b[(size_t)k * (hd + 2) + hd]; if (b[(size_t)k * (hd + 2) + hd + 1] > 0.f && mk > M) M = mk; }
+    float den = CCD_EXP(sink - M);
+    for (int k = 0; k < ns; k++) { const float lk = b[(size_t)k * (hd + 2) + hd + 1]; if (lk > 0.f) den += lk * CCD_EXP(b[(size_t)k * (hd + 2) + hd] - M); }
+    for (int i = tid; i < hd; i += 256) {
+        float acc = 0.f;
+        for (int k = 0; k < ns; k++) { const float lk = b[(size_t)k * (hd + 2) + hd + 1]; if (lk > 0.f) acc += b[(size_t)k * (hd + 2) + i] * CCD_EXP(b[(size_t)k * (hd + 2) + hd] - M); }
+        out[p.o_off + h * hd + i] = acc / den;
+    }
+}
 static int cc_ds_attn(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p) {
     CcCtx *c = live();
     if (!c || !p || !q || !win || !list || !prm || !out || p->S < 1 || p->H < 1 || p->hd < 1 || p->hd > 1024 ||
@@ -487,6 +549,20 @@ static int cc_ds_attn(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm,
         return launched(c, "ds attn (prompt)");
     }
     const CcDsAttn pp = *p;
+    {   /* a decode row (S 1, flags 0): split over the list (COLI_CUDA_DSV4_ATTN_SPLIT=0: off) */
+        static int sp_on = -1;
+        if (sp_on < 0) { const char *es = getenv("COLI_CUDA_DSV4_ATTN_SPLIT"); sp_on = !(es && *es == '0'); }
+        const int per = 64, ns = (p->cnt + per - 1) / per;
+        const size_t sm1 = ((size_t)p->hd + per) * sizeof(float);
+        if (sp_on && p->S == 1 && !(p->flags & 1) && ns >= 2 && ns <= 64 && sm1 <= c->slm &&
+            cc_reserve(&g_ccd_spl, (size_t)p->H * ns * (p->hd + 2) * sizeof(float), CC_DEV)) {
+            float *sl = fpw(g_ccd_spl);
+            const int nsp = ns;
+            if (!CC_KSG(c, dim3((unsigned)p->H, (unsigned)ns), 256, sm1, ccd_attn_sp1_k(qp, wp, cm, ls, sl, pp, per, slm_))) return launched(c, "ds attn split");
+            CC_K(c, dim3((unsigned)p->H), 256, ccd_attn_sp2_k(sl, pp_, op, pp, nsp));
+            return launched(c, "ds attn split");
+        }
+    }
     {   /* CCD_ATTN_HB heads a work-group where its local memory fits */
         static int hb_on = -1;
         /* opt-in (COLI_CUDA_DSV4_ATTN_HB=1): bit-identical, but DS28 measured a decode step slower -- one decode row leaves
