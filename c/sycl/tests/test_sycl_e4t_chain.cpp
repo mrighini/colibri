@@ -82,7 +82,8 @@ static void shape(int dev, int O, int I, int S) {
     /* COLI_SYCL_E4T_FAST (default 1): rows <= 4 take the fast product, held to a tolerance (max |err| / max |ref| < 1e-5);
      * otherwise (and with COLI_SYCL_E4T_FAST=0) the exact kernel, byte for byte */
     const char *fe = getenv("COLI_SYCL_E4T_FAST");
-    const bool fast = !(fe && *fe == '0') && S <= 4;
+    const char *xe = getenv("COLI_SYCL_E4T_XMX");   /* 1: rows 2..8 on the matrix engines, held to the same tolerance */
+    const bool fast = !(fe && *fe == '0') && (S <= 4 || (xe && *xe == '1' && S <= 8));
     size_t diff = 0;
     double me = 0, mr = 0;
     for (size_t k = 0; k < y.size(); k++) {

@@ -5,6 +5,7 @@
  * of the stream-ordered allocator, the matrix engines' GEMMs (coli_sycl_xmx.cpp) in place of the
  * tensor-core kernels, which are gone. The C ABI (backend_cuda.h) is the CUDA build's. */
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <dpct/dpct.hpp>   /* dim3, atomic_fetch_add, byte_level_permute, dp4a: the helpers the migration kept */
 #include "backend_cuda.h"
 #define COLI_CUDA_CHAIN_NO_WRAPPERS
@@ -3023,6 +3024,110 @@ static void e4t_fastob_k(float *y, int y_row, const float *x, int x_row, int x_g
             y[(size_t)r * y_row + o] = v;
         }
     }
+}
+/* e4t_xmx_k: fmt9 for 2..8 rows on the matrix engines (DPAS), sub-group 16, 16 outputs a sub-group. The weights' e4m3
+ * bytes go to f16 exactly by placing their bits (sign at 15, the 7 others at 13..7: the byte's value times 2^-8 for all
+ * finite codes, e = 0 included, as subnormal halves) into the packed B tile in local memory; the rows' activations, times
+ * 2^-4, split into hi = half(v) and lo = half(v - hi) (A tiles, rows past S zero), so A_hi B + A_lo B in f32 carries
+ * ~22 bits of each activation. A 32-column tile is two k-steps of 16, four DPAS (hi and lo each), its sum then times the
+ * tile's ue8m0 scale and 2^12 into the accumulator. KS sub-groups split a row's tiles; the partials meet in local memory
+ * in g order. Not the CPU's bits and not the fast kernels': quality-gated (the test holds it to their tolerance). NG
+ * matrices as e4t_fastg_k's contract (ol a multiple of 16). COLI_SYCL_E4T_XMX=1 turns it on (default off until measured). */
+namespace e4jm = sycl::ext::oneapi::experimental::matrix;
+namespace e4jmi = sycl::ext::intel::experimental::matrix;
+#define E4X_ROWS 8
+template <int KS>
+static void e4t_xmx_k(float *y, int y_row, const float *x, int x_row, int x_grp, E4tGrp gp, int S, int I, int ol, int NG,
+                      uint8_t *slm) {
+    using MA = e4jm::joint_matrix<sycl::sub_group, sycl::half, e4jm::use::a, 8, 16, e4jm::layout::row_major>;
+    using MB = e4jm::joint_matrix<sycl::sub_group, sycl::half, e4jm::use::b, 16, 16, e4jm::layout::ext_intel_packed>;
+    using MC = e4jm::joint_matrix<sycl::sub_group, float, e4jm::use::accumulator, 8, 16>;
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lane = (int)sg.get_local_linear_id(), sgi = (int)sg.get_group_linear_id();
+    constexpr int NSG = 16, BPW = NSG / KS;   /* sub-groups a work-group, output blocks a work-group */
+    const int bl = sgi / KS, g = sgi % KS, O = NG * ol, o0 = (item.get_group(2) * BPW + bl) * 16;
+    const bool live = o0 < O;
+    /* local memory: per sub-group [A_hi 8x32][A_lo 8x32][B 2 x (8 packed rows x 32 halves)] halves, then the partials */
+    sycl::half *base = (sycl::half *)slm + (size_t)sgi * 1024;
+    sycl::half *ahi = base, *alo = base + 256, *bt = base + 512;
+    float *pt = (float *)((sycl::half *)slm + (size_t)NSG * 1024);   /* [NSG][8][16] */
+    MC acc;
+    e4jm::joint_matrix_fill(sg, acc, 0.f);
+    if (live) {
+        const int k = o0 / ol, oo0 = o0 - k * ol, tiles = I >> 5;
+        const int on = o0 + lane < O ? oo0 + lane : (O - 1) - k * ol;   /* a tail lane reads the last row, stores nothing */
+        const uint8_t *wrow = gp.q[k] + (size_t)on * I;
+        const uint8_t *srow = gp.sc[k] + (size_t)(oo0 >> 5) * tiles;
+        const float *xk = x + (size_t)k * x_grp;
+        const int t0 = g * tiles / KS, t1 = (g + 1) * tiles / KS;
+        const int ar = lane >> 1, ac = (lane & 1) * 16;   /* this lane's activation share: row ar, columns ac .. ac+15 */
+        uint32_t *bw = (uint32_t *)bt;
+        auto lp = [](sycl::half *p) { return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p); };
+        for (int t = t0; t < t1; t++) {
+            /* B: lane n's 32 bytes of row n -> halves, packed (k, k+1) a word at [k/2][n] of the k-step's tile */
+            const sycl::uint4 q0 = *(const sycl::uint4 *)(wrow + (size_t)t * 32), q1 = *(const sycl::uint4 *)(wrow + (size_t)t * 32 + 16);
+            const uint32_t wd[8] = { q0.x(), q0.y(), q0.z(), q0.w(), q1.x(), q1.y(), q1.z(), q1.w() };
+#pragma unroll
+            for (int p = 0; p < 16; p++) {   /* byte pair (2p, 2p+1) of the 32 */
+                const uint32_t w = wd[p >> 1] >> ((p & 1) * 16), b0 = w & 0xffu, b1 = (w >> 8) & 0xffu;
+                const uint32_t h0 = ((b0 & 0x7fu) << 7) | ((b0 & 0x80u) << 8), h1 = ((b1 & 0x7fu) << 7) | ((b1 & 0x80u) << 8);
+                bw[(p >> 3) * 128 + (p & 7) * 16 + lane] = h0 | (h1 << 16);
+            }
+            /* A: activations times 2^-4, hi and lo; rows past S zero */
+            const float *xr = xk + (size_t)ar * x_row + (size_t)t * 32 + ac;
+#pragma unroll
+            for (int c = 0; c < 16; c++) {
+                const float v = ar < S ? xr[c] * 0.0625f : 0.f;
+                const sycl::half h = (sycl::half)v;
+                ahi[ar * 32 + ac + c] = h;
+                alo[ar * 32 + ac + c] = (sycl::half)(v - (float)h);
+            }
+            sycl::group_barrier(sg);
+            MC ct;
+            e4jm::joint_matrix_fill(sg, ct, 0.f);
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                MA ma, mlo; MB mb;
+                e4jm::joint_matrix_load(sg, mb, lp(bt + h * 256), 32);
+                e4jm::joint_matrix_load(sg, ma, lp(ahi + h * 16), 32);
+                e4jm::joint_matrix_mad(sg, ct, ma, mb, ct);
+                e4jm::joint_matrix_load(sg, mlo, lp(alo + h * 16), 32);
+                e4jm::joint_matrix_mad(sg, ct, mlo, mb, ct);
+            }
+            const float sc = sycl::bit_cast<float>((uint32_t)srow[t] << 23) * 4096.f;
+            e4jm::joint_matrix_apply(sg, acc, ct, [=](float &a, float &c) { a += c * sc; });
+            sycl::group_barrier(sg);
+        }
+    }
+    e4jmi::joint_matrix_apply(sg, acc, [=](float &v, size_t r, size_t c) { pt[(size_t)sgi * 128 + r * 16 + c] = v; });
+    item.barrier(sycl::access::fence_space::local_space);
+    if (live && g == 0 && o0 + lane < O) {
+        for (int r = 0; r < S && r < E4X_ROWS; r++) {
+            float v = 0.f;
+            for (int kk = 0; kk < KS; kk++) v += pt[(size_t)(bl * KS + kk) * 128 + r * 16 + lane];
+            y[(size_t)r * y_row + o0 + lane] = v;
+        }
+    }
+}
+static int e4t_xmx_on(const DeviceContext *ctx) {
+    const char *e = std::getenv("COLI_SYCL_E4T_XMX");
+    return e && *e == '1' && coli_sycl_profile_for(ctx->device).has_xmx;
+}
+/* 1 launched, 0 not taken (shape) */
+static int e4t_xmx_launch(sycl::queue &q, float *y, int y_row, const float *x, int x_row, int x_grp, const E4tGrp &gp, int S,
+                          int I, int ol, int NG) {
+    if (S < 2 || S > E4X_ROWS || (I & 31) || I < 32 || (NG > 1 && (ol & 15))) return 0;
+    const int O = NG * ol, blocks = (O + 15) / 16, tiles = I / 32;
+    int ks = 1;
+    while (ks < 16 && (long)blocks * ks < 4096 && tiles >= ks * 2) ks *= 2;
+    const int bpw = 16 / ks;
+    dpct::dim3 grid((unsigned)((blocks + bpw - 1) / bpw), 1u);
+    const size_t slm = (size_t)16 * 1024 * sizeof(sycl::half) + (size_t)16 * 128 * sizeof(float);
+    #define E4X_L(K_) COLI_SG_LAUNCH(q, 16, grid, 256, slm, e4t_xmx_k<K_>(y, y_row, x, x_row, x_grp, gp, S, I, ol, NG, dpct_local))
+    if (ks == 16) E4X_L(16); else if (ks == 8) E4X_L(8); else if (ks == 4) E4X_L(4); else if (ks == 2) E4X_L(2); else E4X_L(1);
+    #undef E4X_L
+    return 1;
 }
 static int e4t_ob_on(void) { const char *e = std::getenv("COLI_SYCL_E4T_OB"); return !(e && *e == '0'); }
 static int e4t_ob_ks(int I) { int ks = 8; while (ks > 1 && I / (16 * 16 * ks) < 2) ks >>= 1; return ks; }
@@ -6270,6 +6375,11 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev,
         const uint8_t *ds = (const uint8_t *)(t->scales + 256);
         static int fast_env = -1;   /* COLI_SYCL_E4T_FAST: 1 (default) the decode rows' fast product (not the CPU's bits), 0 exact */
         if (fast_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_FAST"); fast_env = !(e && *e == '0'); }
+        if (fast_env && S >= 2 && S <= E4X_ROWS && e4t_xmx_on(ctx) && ((uintptr_t)dq8 & 15) == 0) {
+            E4tGrp gpx;
+            for (int k = 0; k < E4TG_MAX; k++) { gpx.q[k] = dq8; gpx.sc[k] = ds; }
+            if (e4t_xmx_launch(*st, y_dev, O, x_dev, I, 0, gpx, S, I, O, 1)) return cuda_ok(0, "chain e4t xmx launch");
+        }
         if (fast_env && S <= E4T_FAST_ROWS && ((uintptr_t)dq8 & 15) == 0 && ((uintptr_t)x_dev & 15) == 0) {
             if (S >= 2 && e4t_ob_on()) {
                 E4tGrp gp1;
@@ -6477,6 +6587,8 @@ extern "C" int coli_cuda_tensor_gemm_grp_async(ColiCudaTensor *const *t, int ng,
     DeviceContext *ctx = find_ctx(dev);
     if (!select_ctx(ctx)) return 0;
     sycl::queue *st = (sycl::queue *)stream;
+    if (S >= 2 && e4t_xmx_on(ctx) && e4t_xmx_launch(*st, y_dev, y_row, x_dev, x_row, x_grp, gp, S, I, ol, ng))
+        return cuda_ok(0, "chain e4t grouped xmx launch") ? 1 : 0;
     if (S >= 2 && e4t_ob_on()) {
         e4t_ob_launch(*st, y_dev, y_row, x_dev, x_row, x_grp, gp, S, I, ol, ng);
         return cuda_ok(0, "chain e4t grouped ob launch") ? 1 : 0;
