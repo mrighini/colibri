@@ -366,7 +366,7 @@ int main(int argc, char **argv) {
     if (!T || T->size < offsetof(ColiCudaChainOps, ds_engram) + sizeof T->ds_engram || !T->ds_engram) { printf("FAIL: the backend has no V4 ops\n"); return 1; }
     if (!T->init(dev) || !T->ready()) { printf("FAIL: no chain context\n"); return 1; }
     printf("mhc\n");
-    test_mhc(4, 64, 20); test_mhc(4, 5120 / 8, 20); test_mhc(2, 33, 3); test_mhc(8, 40, 20); test_mhc(3, 17, 5);
+    test_mhc(4, 64, 20); test_mhc(4, 5120 / 8, 20); test_mhc(2, 33, 3);
     printf("attention\n");
     test_attn(1, 4, 64, 8, 5, 13, 0); test_attn(3, 2, 512, 128, 40, 300, 0); test_attn(2, 3, 100, 6, 9, 20, 0);
     test_attn(2, 2, 64, 8, 12, 2900, 0); test_attn(3, 4, 64, 8, 5, 13, 1);
@@ -380,6 +380,8 @@ int main(int argc, char **argv) {
     test_index(1, 63, 4, 64, 128, 8, 4, 2, 0); test_index(5, 40, 4, 8, 16, 6, 3, 2, 1); test_index(3, 900, 4, 64, 128, 512, 16, 8, 0);
     test_index(2, 130, 1, 4, 8, 20, 5, 3, 1);
     printf("engram\n"); test_engram(3, 4, 64); test_engram(2, 4, 5120);
+    /* last, so the cases above draw the same random numbers as before: the constant-H split at H 8 and the generic H 3 */
+    printf("mhc (more)\n"); test_mhc(8, 40, 20); test_mhc(3, 17, 5);
     T->shutdown();
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails != 0;
