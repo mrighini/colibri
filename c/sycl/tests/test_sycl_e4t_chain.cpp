@@ -209,6 +209,8 @@ int main(int argc, char **argv) {
     timed(dev[0]);
     timed(dev[0], 4);
     timed_ref(dev[0]);
+    timed(dev[0], 2); timed(dev[0], 3);   /* last: the 2- and 3-row timings (the RNG streams above unchanged) */
+    grouped(dev[0], 8, 1024, 4096, 2);
     std::printf(fails ? "E4T SUITE FAIL\n" : "E4T SUITE PASS\n");
     return fails ? 1 : 0;
 }
