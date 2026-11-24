@@ -3028,9 +3028,8 @@ static void e4t_fastob_k(float *y, int y_row, const float *x, int x_row, int x_g
 /* e4t_xmx_k: fmt9 for 2..8 rows on the matrix engines (DPAS), sub-group 16, 16 outputs a sub-group. The weights' e4m3
  * bytes go to f16 exactly by placing their bits (sign at 15, the 7 others at 13..7: the byte's value times 2^-8 for all
  * finite codes, e = 0 included, as subnormal halves) into the packed B tile in local memory; the rows' activations, times
- * 2^-4, split into hi = half(v) and lo = half((v - hi) 2^11) (A tiles, rows past S zero; lo scaled so it stays a normal
- * half: unscaled it fell into the subnormals and the sums kept only half precision, DS43's FAIL), A_lo B in its own f32
- * tile times 2^-11 added to A_hi B: ~22 bits of each activation. A 32-column tile is two k-steps of 16, four DPAS (hi and lo each), its sum then times the
+ * 2^-4, split into hi = half(v) and lo = half(v - hi) (A tiles, rows past S zero), so A_hi B + A_lo B in f32 carries
+ * ~22 bits of each activation. A 32-column tile is two k-steps of 16, four DPAS (hi and lo each), its sum then times the
  * tile's ue8m0 scale and 2^12 into the accumulator. KS sub-groups split a row's tiles; the partials meet in local memory
  * in g order. Not the CPU's bits and not the fast kernels': quality-gated (the test holds it to their tolerance). NG
  * matrices as e4t_fastg_k's contract (ol a multiple of 16). COLI_SYCL_E4T_XMX=1 turns it on (default off until measured). */
@@ -3082,12 +3081,11 @@ static void e4t_xmx_k(float *y, int y_row, const float *x, int x_row, int x_grp,
                 const float v = ar < S ? xr[c] * 0.0625f : 0.f;
                 const sycl::half h = (sycl::half)v;
                 ahi[ar * 32 + ac + c] = h;
-                alo[ar * 32 + ac + c] = (sycl::half)((v - (float)h) * 2048.f);   /* lo times 2^11: kept a normal half */
+                alo[ar * 32 + ac + c] = (sycl::half)(v - (float)h);
             }
             sycl::group_barrier(sg);
-            MC ct, cl;
+            MC ct;
             e4jm::joint_matrix_fill(sg, ct, 0.f);
-            e4jm::joint_matrix_fill(sg, cl, 0.f);
 #pragma unroll
             for (int h = 0; h < 2; h++) {
                 MA ma, mlo; MB mb;
@@ -3095,9 +3093,8 @@ static void e4t_xmx_k(float *y, int y_row, const float *x, int x_row, int x_grp,
                 e4jm::joint_matrix_load(sg, ma, lp(ahi + h * 16), 32);
                 e4jm::joint_matrix_mad(sg, ct, ma, mb, ct);
                 e4jm::joint_matrix_load(sg, mlo, lp(alo + h * 16), 32);
-                e4jm::joint_matrix_mad(sg, cl, mlo, mb, cl);
+                e4jm::joint_matrix_mad(sg, ct, mlo, mb, ct);
             }
-            e4jm::joint_matrix_apply(sg, ct, cl, [=](float &c, float &l) { c += l * (1.f / 2048.f); });
             const float sc = sycl::bit_cast<float>((uint32_t)srow[t] << 23) * 4096.f;
             e4jm::joint_matrix_apply(sg, acc, ct, [=](float &a, float &c) { a += c * sc; });
             sycl::group_barrier(sg);
