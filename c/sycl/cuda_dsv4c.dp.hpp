@@ -217,6 +217,65 @@ static void ccd_mhc_split_t(const float *x, const float *mx, float *hp, const fl
 #pragma unroll
     for (int k = 0; k < H * H; k++) hp[cb + k] = cm[k];
 }
+/* ccd_mhc_split_t for H*H <= 16 (H 2 and 4), the Sinkhorn spread over a sub-group: lane l < H*H holds the comb's element
+ * (l / H, l % H); every row or column sum gathers its H elements with select_from_group in ccd_mhc_split_t's order (from
+ * 0.f, index ascending) and each lane divides its own element -- the same operations on the same values, so the same
+ * bits, with the ~2*iters*H*H dependent IEEE divisions (-fp-model=precise) 16 at a time instead of one work-item's
+ * (DS36: 91 us a call on 4 rows). The pre and post weights go one a lane too. COLI_SYCL_MHC_GENERIC=1: the generic. */
+template <int H>
+static void ccd_mhc_split_sg(const float *x, const float *mx, float *hp, const float *prm, CcMhc p) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    auto &red = CCD_LOCAL(float[256]);
+    auto &ms = CCD_LOCAL(float[96]);
+    constexpr int nm = (2 + H) * H, HH = H * H;
+    static_assert(HH <= 16, "the comb in one sub-group");
+    const int s = it.get_group(2), tid = it.get_local_id(2), HD = H * p.D;
+    const int xb = p.x_off + s * p.x_row;
+    float a = 0.f;
+    for (int i = tid; i < HD; i += 256) { float v = x[xb + i]; a += v * v; }
+    red[tid] = a;
+    CCD_SYNC(it);
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        CCD_SYNC(it);
+    }
+    const float r = 1.f / sycl::sqrt(red[0] / (float)HD + p.eps);
+    for (int i = tid; i < nm; i += 256) ms[i] = mx[p.m_off + s * p.m_row + i] * r;
+    CCD_SYNC(it);
+    if (sg.get_group_linear_id() != 0) return;   /* the first sub-group (16 or 32 lanes) goes on, whole */
+    const int l = (int)sg.get_local_linear_id(), lc = l < HH ? l : 0, row = lc / H, col = lc % H;
+    const int hb = p.hp_off + s * p.hp_row, pb = p.prm_off;
+    if (l < H) {
+        hp[hb + l] = ccd_sig(ms[l] * prm[pb] + prm[pb + 3 + l]) + p.hc_eps;
+        hp[hb + H + l] = 2.f * ccd_sig(ms[H + l] * prm[pb + 1] + prm[pb + 3 + H + l]);
+    }
+    constexpr int mo = 2 * H;
+    float c = ms[mo + lc] * prm[pb + 2] + prm[pb + 3 + mo + lc];
+    float mxv = -3.0e38f;
+#pragma unroll
+    for (int k = 0; k < H; k++) { const float v = sycl::select_from_group(sg, c, row * H + k); if (v > mxv) mxv = v; }
+    c = CCD_EXP(c - mxv);
+    float sum = 0.f;
+#pragma unroll
+    for (int k = 0; k < H; k++) sum += sycl::select_from_group(sg, c, row * H + k);
+    c = c / sum + p.hc_eps;
+    float sm = 0.f;
+#pragma unroll
+    for (int k = 0; k < H; k++) sm += sycl::select_from_group(sg, c, k * H + col);
+    c /= sm + p.hc_eps;
+    for (int it2 = 1; it2 < p.iters; it2++) {
+        sm = 0.f;
+#pragma unroll
+        for (int k = 0; k < H; k++) sm += sycl::select_from_group(sg, c, row * H + k);
+        c /= sm + p.hc_eps;
+        sm = 0.f;
+#pragma unroll
+        for (int k = 0; k < H; k++) sm += sycl::select_from_group(sg, c, k * H + col);
+        c /= sm + p.hc_eps;
+    }
+    if (l < HH) hp[hb + 2 * H + l] = c;
+}
 static int ccd_mhc_generic(void) {   /* read at each launch: the test runs both kernels in one process */
     const char *e = getenv("COLI_SYCL_MHC_GENERIC");
     return e && atoi(e) > 0;
@@ -258,8 +317,8 @@ static int cc_mhc(int mode, CcBuf *x, CcBuf *m, CcBuf *hp, CcBuf *prm, CcBuf *y,
     if (mode == CC_MHC_SPLIT) {
         if (!m || !hp || !prm || p->S < 1 || p->H < 1 || p->H > 8 || (2 + p->H) * p->H > 96) return 0;
         float *hw = fpw(hp);
-        if (!ccd_mhc_generic() && p->H == 4) CC_K(c, dim3((unsigned)p->S), 256, ccd_mhc_split_t<4>(xp, mp, hw, pp_, pp));
-        else if (!ccd_mhc_generic() && p->H == 2) CC_K(c, dim3((unsigned)p->S), 256, ccd_mhc_split_t<2>(xp, mp, hw, pp_, pp));
+        if (!ccd_mhc_generic() && p->H == 4) CC_KSG(c, dim3((unsigned)p->S), 256, 0, ccd_mhc_split_sg<4>(xp, mp, hw, pp_, pp));   /* a fixed sub-group width (16 or 32) */
+        else if (!ccd_mhc_generic() && p->H == 2) CC_KSG(c, dim3((unsigned)p->S), 256, 0, ccd_mhc_split_sg<2>(xp, mp, hw, pp_, pp));
         else if (!ccd_mhc_generic() && p->H == 8) CC_K(c, dim3((unsigned)p->S), 256, ccd_mhc_split_t<8>(xp, mp, hw, pp_, pp));
         else CC_K(c, dim3((unsigned)p->S), 256, ccd_mhc_split_k(xp, mp, hw, pp_, pp));
         return launched(c, "mhc split");

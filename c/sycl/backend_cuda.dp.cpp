@@ -2828,6 +2828,59 @@ static void e4t_fast_k(float *y, int ystride, const float *x, int xstride, const
         if (lane == 0) y[(size_t)r * ystride + o] = v;
     }
 }
+/* e4t_fastk_k: e4t_fast_k with a row split over KS sub-groups (DS36: the decode's small matrices -- 1024 x 4096, 512 and
+ * 1280 x 5120 -- ran at 150-240 GB/s: a sub-group a row filled about a quarter of the card's threads, each lane a few
+ * loads). Sub-group g of a row takes the row's 16-column chunks g*SG + lane, stepping KS*SG; each reduces over its lanes
+ * as e4t_fast_k does, and the row's KS partials are added in g order from local memory (a fixed order: the same bits on
+ * every run, not e4t_fast_k's bits -- held to the same tolerance against the exact kernel). COLI_SYCL_E4T_KS: 1 =
+ * e4t_fast_k, 2/4/8 forces KS; unset picks KS so the launch has >= 4096 sub-groups, every sub-group a chunk at least. */
+template <int SG, int KS>
+static void e4t_fastk_k(float *y, int ystride, const float *x, int xstride, const uint8_t *q, const uint8_t *sc, int S,
+                        int I, int O, uint8_t *slm) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lane = sg.get_local_linear_id(), sgi = (int)sg.get_group_linear_id();
+    const int rows_wg = (int)(item.get_local_range(2) / SG) / KS, slot = sgi / KS, g = sgi % KS;
+    const int o = item.get_group(2) * rows_wg + slot;
+    const int tiles = I >> 5, nr = S < E4T_FAST_ROWS ? S : E4T_FAST_ROWS;
+    float acc[E4T_FAST_ROWS] = {0.f, 0.f, 0.f, 0.f};
+    if (o < O) {
+        const uint8_t *row = q + (size_t)o * I, *srow = sc + (size_t)(o >> 5) * tiles;
+        for (int c0 = (g * SG + lane) * 16; c0 < I; c0 += KS * SG * 16) {
+            const sycl::uint4 b = *(const sycl::uint4 *)(row + c0);
+            const uint32_t wd[4] = { b.x(), b.y(), b.z(), b.w() };
+            float w[16];
+#pragma unroll
+            for (int c = 0; c < 16; c++) w[c] = e4t_dec((wd[c >> 2] >> ((c & 3) * 8)) & 0xffu);
+            const float tl = sycl::bit_cast<float>((uint32_t)srow[c0 >> 5] << 23);
+#pragma unroll
+            for (int r = 0; r < E4T_FAST_ROWS; r++) {
+                if (r >= nr) break;
+                const sycl::float4 *x4 = (const sycl::float4 *)(x + (size_t)r * xstride + c0);
+                float part = 0.f;
+#pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const sycl::float4 f = x4[v];
+                    part += w[4 * v] * f.x() + w[4 * v + 1] * f.y() + w[4 * v + 2] * f.z() + w[4 * v + 3] * f.w();
+                }
+                acc[r] += part * tl;
+            }
+        }
+    }
+    float *pt = (float *)slm;   /* [rows_wg][KS][E4T_FAST_ROWS] */
+#pragma unroll
+    for (int r = 0; r < E4T_FAST_ROWS; r++) {
+        const float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+        if (lane == 0) pt[(slot * KS + g) * E4T_FAST_ROWS + r] = v;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (g == 0 && lane < nr && o < O) {
+        float v = 0.f;
+#pragma unroll
+        for (int k = 0; k < KS; k++) v += pt[(slot * KS + k) * E4T_FAST_ROWS + lane];
+        y[(size_t)lane * ystride + o] = v;
+    }
+}
 extern "C" void *coli_cuda_e4m3t_upload(int device, const unsigned char *q, const unsigned char *s, int O, int I) try {
     if (fault_injected() || !q || !s || O < 1 || I < 32 || (I & 31)) return NULL;
     DeviceContext *ctx = find_ctx(device);
@@ -6063,9 +6116,24 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev,
         static int fast_env = -1;   /* COLI_SYCL_E4T_FAST: 1 (default) the decode rows' fast product (not the CPU's bits), 0 exact */
         if (fast_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_FAST"); fast_env = !(e && *e == '0'); }
         if (fast_env && S <= E4T_FAST_ROWS && ((uintptr_t)dq8 & 15) == 0 && ((uintptr_t)x_dev & 15) == 0) {
-            const int sgw = ctx->sg, rpw = 256 / sgw;
-            dpct::dim3 grid((unsigned)((O + rpw - 1) / rpw), 1u);
-            COLI_SG_LAUNCH((*st), sgw, grid, 256, 0, e4t_fast_k<SG>(y_dev, O, x_dev, I, dq8, ds, S, I, O));
+            const int sgw = ctx->sg, nsg = 256 / sgw;
+            static int ks_env = -1;
+            if (ks_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_KS"); ks_env = e ? std::atoi(e) : 0; }
+            int ks = 1;
+            if (ks_env == 1 || ks_env == 2 || ks_env == 4 || ks_env == 8) ks = ks_env;
+            else while (ks < 8 && ks * 2 <= nsg && (long)O * ks < 4096 && I / (16 * sgw) >= ks * 2) ks *= 2;
+            if (ks > nsg || I / (16 * sgw) < ks) ks = 1;
+            if (ks == 1) {
+                dpct::dim3 grid((unsigned)((O + nsg - 1) / nsg), 1u);
+                COLI_SG_LAUNCH((*st), sgw, grid, 256, 0, e4t_fast_k<SG>(y_dev, O, x_dev, I, dq8, ds, S, I, O));
+            } else {
+                const int rows_wg = nsg / ks;
+                dpct::dim3 grid((unsigned)((O + rows_wg - 1) / rows_wg), 1u);
+                const size_t slm = (size_t)nsg * E4T_FAST_ROWS * sizeof(float);
+                if (ks == 2) COLI_SG_LAUNCH((*st), sgw, grid, 256, slm, e4t_fastk_k<SG, 2>(y_dev, O, x_dev, I, dq8, ds, S, I, O, dpct_local));
+                else if (ks == 4) COLI_SG_LAUNCH((*st), sgw, grid, 256, slm, e4t_fastk_k<SG, 4>(y_dev, O, x_dev, I, dq8, ds, S, I, O, dpct_local));
+                else COLI_SG_LAUNCH((*st), sgw, grid, 256, slm, e4t_fastk_k<SG, 8>(y_dev, O, x_dev, I, dq8, ds, S, I, O, dpct_local));
+            }
             return cuda_ok(0, "chain e4t fast launch");
         }
         /* outputs a work-group: their tile chains run side by side (the fold is the kernel's serial part); COLI_SYCL_E4T_OUTS
