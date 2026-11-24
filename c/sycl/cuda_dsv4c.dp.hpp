@@ -668,6 +668,102 @@ static void ccd_attn_sp2_k(const float *spl, const float *prm, float *out, CcDsA
         out[p.o_off + h * hd + i] = acc / den;
     }
 }
+/* ccd_attn_sp1r_k / ccd_attn_sp2r_k: the split decode attention for R rows of different conversations in one launch
+ * (row r's window and compressed rows at its own offsets wo[r], co[r]; its query, list and output rows r rows on), and
+ * the scores taken a sub-group a list entry (its lanes over hd, reduce_over_group) instead of a work-item an entry
+ * (ccd_attn_sp1_k: 64 of 256 work-items busy, each a serial dot of hd). DS37: 8 launches a 4-row layer, 19 % of the
+ * frame. Pass 1 is otherwise ccd_attn_sp1_k's (the slice's max, exp, l in list order, acc in list order), pass 2
+ * ccd_attn_sp2_k's. Quality-gated as the split is: the dot products sum in another order than ccd_attn_k's. One row
+ * (cc_ds_attn S 1) goes here too; COLI_CUDA_DSV4_ATTN_V2=0: ccd_attn_sp1_k / sp2_k and a launch pair a row. */
+#define CCD_ROWS_MAX 8
+struct CcdRowOffs { int w[CCD_ROWS_MAX], c[CCD_ROWS_MAX]; };
+template <int SG>
+static void ccd_attn_sp1r_k(const float *q, const float *win, const float *cmp, const int *list, float *spl, CcDsAttn p,
+                            CcdRowOffs ro, int per, uint8_t *slm) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    float *sq = (float *)slm, *sc = sq + p.hd;
+    auto &red = CCD_LOCAL(float[256]);
+    const int h = it.get_group(2), sp = it.get_group(1), r = it.get_group(0), tid = it.get_local_id(2), ns = it.get_group_range(1), H = it.get_group_range(2);
+    const int lane = (int)sg.get_local_linear_id(), sgi = (int)sg.get_group_linear_id(), nsg = 256 / SG;
+    const int hd = p.hd, j0 = sp * per, j1 = sycl::min(p.cnt, j0 + per), lb = p.l_off + r * p.l_row, wo = ro.w[r], co = ro.c[r];
+    for (int i = tid; i < hd; i += 256) sq[i] = q[p.q_off + r * p.q_row + h * hd + i];
+    CCD_SYNC(it);
+    for (int j = j0 + sgi; j < j1; j += nsg) {   /* uniform in the sub-group */
+        const int e = list[lb + j];
+        float v = CC_DS_NEG_INF;
+        if (e >= 0) {
+            const float *kr = e < p.nwin ? win + wo + e * hd : cmp + co + (e - p.nwin) * hd;
+            float d = 0.f;
+            for (int i = lane; i < hd; i += SG) d += sq[i] * kr[i];
+            d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
+            v = d * p.scale;
+        }
+        if (lane == 0) sc[j - j0] = v;
+    }
+    CCD_SYNC(it);
+    float best = -1.0e30f;
+    for (int j = j0 + tid; j < j1; j += 256) { const float v = sc[j - j0]; if (v > CC_DS_NEG_INF && v > best) best = v; }
+    red[tid] = best;
+    CCD_SYNC(it);
+    for (int off = 128; off > 0; off >>= 1) { if (tid < off && red[tid + off] > red[tid]) red[tid] = red[tid + off]; CCD_SYNC(it); }
+    const float m = red[0];
+    CCD_SYNC(it);
+    for (int j = j0 + tid; j < j1; j += 256) { const float v = sc[j - j0]; sc[j - j0] = v > CC_DS_NEG_INF ? CCD_EXP(v - m) : 0.f; }
+    CCD_SYNC(it);
+    float *o = spl + (((size_t)r * H + h) * ns + sp) * (hd + 2);
+    if (tid == 0) { float l = 0.f; for (int j = j0; j < j1; j++) if (list[lb + j] >= 0) l += sc[j - j0]; o[hd] = m; o[hd + 1] = l; }
+    for (int i = tid; i < hd; i += 256) {
+        float acc = 0.f;
+        for (int j = j0; j < j1; j++) {
+            const int e = list[lb + j];
+            if (e < 0) continue;
+            acc += sc[j - j0] * ccd_kv(win, cmp, e, p.nwin, wo, co, hd, i);
+        }
+        o[i] = acc;
+    }
+}
+static void ccd_attn_sp2r_k(const float *spl, const float *prm, float *out, CcDsAttn p, int ns) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int h = it.get_group(2), r = it.get_group(1), H = it.get_group_range(2), tid = it.get_local_id(2), hd = p.hd;
+    const float *b = spl + ((size_t)r * H + h) * ns * (hd + 2);
+    const float sink = prm[p.sink_off + h];
+    float M = sink;
+    for (int k = 0; k < ns; k++) { const float mk = b[(size_t)k * (hd + 2) + hd]; if (b[(size_t)k * (hd + 2) + hd + 1] > 0.f && mk > M) M = mk; }
+    float den = CCD_EXP(sink - M);
+    for (int k = 0; k < ns; k++) { const float lk = b[(size_t)k * (hd + 2) + hd + 1]; if (lk > 0.f) den += lk * CCD_EXP(b[(size_t)k * (hd + 2) + hd] - M); }
+    for (int i = tid; i < hd; i += 256) {
+        float acc = 0.f;
+        for (int k = 0; k < ns; k++) { const float lk = b[(size_t)k * (hd + 2) + hd + 1]; if (lk > 0.f) acc += b[(size_t)k * (hd + 2) + i] * CCD_EXP(b[(size_t)k * (hd + 2) + hd] - M); }
+        out[p.o_off + r * p.o_row + h * hd + i] = acc / den;
+    }
+}
+static int ccd_attn_v2(void) { const char *e = getenv("COLI_CUDA_DSV4_ATTN_V2"); return !(e && *e == '0'); }
+/* n decode rows (p: row 0's, S ignored; rows r: q_off + r q_row, l_off + r l_row, o_off + r o_row; window / compressed rows
+ * at wo[r] / co[r]) in one launch pair: 1, -1 not taken (flags, list length, local memory, n), 0 a failure */
+static int ccd_attn_rows(CcCtx *c, const float *qp, const float *wp, const float *cm, const int *ls, const float *pp_, float *op,
+                         const CcDsAttn *p, const int *wo, const int *co, int n) {
+    const int per = 64, ns = (p->cnt + per - 1) / per;
+    const size_t sm1 = ((size_t)p->hd + per) * sizeof(float);
+    if (n < 1 || n > CCD_ROWS_MAX || (p->flags & 1) || ns < 2 || ns > 64 || sm1 > c->slm) return -1;
+    if (!cc_reserve(&g_ccd_spl, (size_t)n * p->H * ns * (p->hd + 2) * sizeof(float), CC_DEV)) return 0;
+    CcdRowOffs ro;
+    for (int r = 0; r < CCD_ROWS_MAX; r++) { ro.w[r] = r < n ? wo[r] : 0; ro.c[r] = r < n ? co[r] : 0; }
+    float *sl = fpw(g_ccd_spl);
+    const CcDsAttn pp = *p; const int nsp = ns;
+    if (!CC_KSG(c, dim3((unsigned)p->H, (unsigned)ns, (unsigned)n), 256, sm1, ccd_attn_sp1r_k<SG>(qp, wp, cm, ls, sl, pp, ro, per, slm_)))
+        return launched(c, "ds attn rows");
+    CC_K(c, dim3((unsigned)p->H, (unsigned)n), 256, ccd_attn_sp2r_k(sl, pp_, op, pp, nsp));
+    return launched(c, "ds attn rows");
+}
+static int cc_ds_attn_rows(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p,
+                           const int *wo, const int *co, int n) {
+    CcCtx *c = live();
+    if (!c || !p || !q || !win || !list || !prm || !out || !wo || !co || p->H < 1 || p->hd < 1 || p->hd > 1024 || p->cnt < 1 ||
+        p->cnt > 3072) return 0;
+    if (!ccd_attn_v2()) return -1;
+    return ccd_attn_rows(c, fp(q), fp(win), fp(cmp ? cmp : win), reinterpret_cast<const int *>(fp(list)), fp(prm), fpw(out), p, wo, co, n);
+}
 static int cc_ds_attn(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p) {
     CcCtx *c = live();
     if (!c || !p || !q || !win || !list || !prm || !out || p->S < 1 || p->H < 1 || p->hd < 1 || p->hd > 1024 ||
@@ -702,6 +798,10 @@ static int cc_ds_attn(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm,
         if (sp_on < 0) { const char *es = getenv("COLI_CUDA_DSV4_ATTN_SPLIT"); sp_on = !(es && *es == '0'); }
         const int per = 64, ns = (p->cnt + per - 1) / per;
         const size_t sm1 = ((size_t)p->hd + per) * sizeof(float);
+        if (sp_on && p->S == 1 && ccd_attn_v2()) {
+            const int r = ccd_attn_rows(c, qp, wp, cm, ls, pp_, op, p, &p->w_off, &p->c_off, 1);
+            if (r >= 0) return r;
+        }
         if (sp_on && p->S == 1 && !(p->flags & 1) && ns >= 2 && ns <= 64 && sm1 <= c->slm &&
             cc_reserve(&g_ccd_spl, (size_t)p->H * ns * (p->hd + 2) * sizeof(float), CC_DEV)) {
             float *sl = fpw(g_ccd_spl);

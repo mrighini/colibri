@@ -15,6 +15,7 @@
  * COLI_GPUS=N, --list prints every GPU's profile and exits: sycl_test_args.h). Needs a device:
  * make SYCL=1 sycl-dsv4c-check, or make SYCL=1 cuda_dsv4c_test and run the binary. */
 #include <cstdio>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -175,6 +176,48 @@ static void test_attn(int S, int H, int hd, int nwin, int ncmp, int cnt, int fla
         ck(ok && same, m);
     }
     for (CcBuf *b : {qb, wb, cb, sb, lb, ob, o0}) T->free(b);
+}
+
+/* ds_attn_rows: n decode rows of different conversations (each its own window and compressed rows) in one call, against
+ * n one-row ds_attn calls (the same kernel: bit for bit) and against the old split kernel (COLI_CUDA_DSV4_ATTN_V2=0:
+ * the split's quality bound) */
+static void test_attn_rows(int n, int H, int hd, int nwin, int ncmp, int cnt) {
+    const int qrow = H * hd + 3, lrow = cnt + 2, orow = H * hd + 3;
+    std::vector<float> q = fvec((size_t)n * qrow, 1.f), win = fvec((size_t)n * nwin * hd + 5, 1.f), cmp = fvec((size_t)n * ncmp * hd + 7, 1.f),
+                       sink = fvec((size_t)H + 2, 2.f);
+    std::vector<int> list((size_t)n * lrow), wo(n), co(n);
+    for (int r = 0; r < n; r++) { wo[r] = 5 + r * nwin * hd; co[r] = 7 + r * ncmp * hd; }
+    for (int r = 0; r < n; r++)
+        for (int j = 0; j < lrow; j++) { int x = (int)(rnd() % 5); list[r * lrow + j] = x == 0 ? -1 : x < 3 ? (int)(rnd() % (unsigned)nwin) : nwin + (int)(rnd() % (unsigned)ncmp); }
+    CcBuf *qb = upf(q), *wb = upf(win), *cb = upf(cmp), *sb = upf(sink), *lb = up(list.data(), list.size() * 4);
+    CcBuf *oa = T->buf((size_t)n * orow * 4, CC_DEV), *ob = T->buf((size_t)n * orow * 4, CC_DEV), *oc = T->buf((size_t)n * orow * 4, CC_DEV);
+    char m[200];
+    if (!(T->size >= offsetof(ColiCudaChainOps, ds_attn_rows) + sizeof T->ds_attn_rows && T->ds_attn_rows)) { ck(0, "ds_attn_rows in the table"); return; }
+    CcDsAttn p = {1, H, hd, cnt, 1, lrow, nwin, wo[0], co[0], 1, qrow, 2, orow, 1, 0, 1.f / sqrtf((float)hd)};
+    int ok = T->begin() && T->ds_attn_rows(qb, wb, cb, lb, sb, oa, &p, wo.data(), co.data(), n) == 1 && T->submit(1);
+    ok = ok && T->begin();
+    for (int r = 0; ok && r < n; r++) {
+        CcDsAttn a = p; a.l_off = 1 + r * lrow; a.q_off = 1 + r * qrow; a.o_off = 2 + r * orow; a.w_off = wo[r]; a.c_off = co[r];
+        ok = T->ds_attn(qb, wb, cb, lb, sb, ob, &a);
+    }
+    ok = ok && T->submit(1);
+    setenv("COLI_CUDA_DSV4_ATTN_V2", "0", 1);
+    ok = ok && T->begin();
+    for (int r = 0; ok && r < n; r++) {
+        CcDsAttn a = p; a.l_off = 1 + r * lrow; a.q_off = 1 + r * qrow; a.o_off = 2 + r * orow; a.w_off = wo[r]; a.c_off = co[r];
+        ok = T->ds_attn(qb, wb, cb, lb, sb, oc, &a);
+    }
+    ok = ok && T->submit(1);
+    unsetenv("COLI_CUDA_DSV4_ATTN_V2");
+    auto ga = down<float>(oa, (size_t)n * orow), gb = down<float>(ob, (size_t)n * orow), gc = down<float>(oc, (size_t)n * orow);
+    size_t diff = 0; double e = 0;
+    for (int r = 0; r < n; r++) {
+        for (int i = 0; i < H * hd; i++) diff += memcmp(&ga[(size_t)r * orow + 2 + i], &gb[(size_t)r * orow + 2 + i], 4) != 0;
+        double x = relerr(&ga[(size_t)r * orow + 2], &gc[(size_t)r * orow + 2], (size_t)H * hd, 1e-3); if (x > e) e = x;
+    }
+    snprintf(m, sizeof m, "attn rows n %d H %d hd %d cnt %d: one call vs a call a row %zu values differ; vs the old split rel err %.2e", n, H, hd, cnt, diff, e);
+    ck(ok && diff == 0 && e < 2e-4, m);
+    for (CcBuf *b : {qb, wb, cb, sb, lb, oa, ob, oc}) T->free(b);
 }
 
 static void test_rope(int flags) {
@@ -382,6 +425,7 @@ int main(int argc, char **argv) {
     printf("engram\n"); test_engram(3, 4, 64); test_engram(2, 4, 5120);
     /* last, so the cases above draw the same random numbers as before: the constant-H split at H 8 and the generic H 3 */
     printf("mhc (more)\n"); test_mhc(8, 40, 20); test_mhc(3, 17, 5);
+    printf("attention rows\n"); test_attn_rows(4, 64, 512, 128, 700, 640); test_attn_rows(3, 7, 96, 8, 300, 200); test_attn_rows(2, 64, 512, 128, 2000, 1500);
     T->shutdown();
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails != 0;

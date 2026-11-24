@@ -1525,7 +1525,20 @@ static int v41u_attention_rows(V41U *ch, Model *m, int i, int S, const int *slot
             ok = ok && cc_ds_topk(ch->isc, ch->lw_list, &tp);
         }
     }
-    for (int t = 0; ok && t < S; t++) {   /* the sparse attention: a slot's row on that slot's regions */
+    int done = 0;
+    if (ok && S > 1) {   /* the rows' attention in one call where the backend has it (cc_ds_attn_rows), each on its slot's regions */
+        int wo[V41U_ROWS_MAX], co[V41U_ROWS_MAX];
+        for (int t = 0; t < S; t++) {
+            wo[t] = (int)v41u_wo(ch, slots[t]);
+            co[t] = r > 0 ? (int)v41u_co(ch, c->index_owner[i], slots[t]) : 0;
+        }
+        CcDsAttn a = {1, nh, hd, W + (r > 0 ? ch->K : 0), 0, LR, ch->Wd, wo[0], co[0], 0, qrow, 0, qrow, (int)ch->o_sink[i], 0,
+                      1.0f / sqrtf((float)hd)};
+        const int ra = cc_ds_attn_rows(ch->q, ch->win[i], r > 0 ? ch->ckv[c->index_owner[i]] : NULL, ch->lw_list, ch->prm, ch->heads, &a, wo, co, S);
+        if (ra == 0) ok = 0;
+        done = ra == 1;
+    }
+    for (int t = 0; ok && !done && t < S; t++) {   /* the sparse attention: a slot's row on that slot's regions */
         const int sl = slots[t];
         CcDsAttn a = {1, nh, hd, W + (r > 0 ? ch->K : 0), t * LR, LR, ch->Wd, (int)v41u_wo(ch, sl),
                       r > 0 ? (int)v41u_co(ch, c->index_owner[i], sl) : 0, t * qrow, qrow, t * qrow, qrow, (int)ch->o_sink[i], 0,

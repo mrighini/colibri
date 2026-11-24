@@ -3989,5 +3989,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_dnconv_mx, cc_dnrec_mx,
     cc_attn_h_mx, cc_copy_regions_h_mx,
     cc_matmul_grp,
+    cc_ds_attn_rows,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
