@@ -12,6 +12,7 @@
 #include "sycl_test_args.h"
 #include <chrono>
 #include <cmath>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -121,9 +122,20 @@ static void grouped(int dev, int ng, int ol, int I, int S) {
     require(ok && T->copy_regions(gb, yg, r2.data(), S * ng) && T->submit(1), "per-matrix matmuls");
     require(T->read(ga, 0, ya.data(), ya.size() * 4) && T->read(gb, 0, yb.data(), yb.size() * 4), "read back (grouped)");
     size_t diff = 0;
-    for (size_t i = 0; i < ya.size(); i++) diff += std::memcmp(&ya[i], &yb[i], 4) != 0;
-    std::printf("GRP %d x %dx%d S=%d: grouped vs per-matrix, %zu of %zu values differ\n", ng, ol, I, S, diff, ya.size());
-    if (diff) fails++;
+    double me = 0, mr = 0;
+    for (size_t i = 0; i < ya.size(); i++) {
+        diff += std::memcmp(&ya[i], &yb[i], 4) != 0;
+        me = std::fmax(me, std::fabs((double)ya[i] - yb[i])); mr = std::fmax(mr, std::fabs((double)yb[i]));
+    }
+    /* below COLI_SYCL_E4T_OB_MIN rows (default 3; the grouped launch takes the 4-output kernel from 2) a lone matrix runs the
+     * KS rows kernel: two kernels by design, held to the fast products' tolerance; otherwise the same bits */
+    const char *om = getenv("COLI_SYCL_E4T_OB_MIN");
+    const int obmin = om && *om ? std::max(2, std::atoi(om)) : 3;
+    const bool two = S >= 2 && S < obmin;
+    const double rel = mr > 0 ? me / mr : me;
+    if (two) std::printf("GRP %d x %dx%d S=%d: grouped vs per-matrix (two kernels), max|err|/max|ref| %.3g\n", ng, ol, I, S, rel);
+    else std::printf("GRP %d x %dx%d S=%d: grouped vs per-matrix, %zu of %zu values differ\n", ng, ol, I, S, diff, ya.size());
+    if (two ? !(rel < 1e-5) : diff != 0) fails++;
     for (int mode = 0; mode < 2; mode++) {
         const int n = 200;
         const auto t0 = std::chrono::steady_clock::now();
