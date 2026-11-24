@@ -164,6 +164,16 @@ static void suite(int dev, int D, int I) {
                          T->begin() && T->moe(t12, xb, ib, wb, hb, yb, hyb, &m2) && T->submit(1);
                 }
                 ok = ok && T->read(yb, 0, y.data(), y.size() * 4);
+                size_t hdiff = 0;
+                if (!split) {   /* the half-bits decode (FMT 77, the default) against mx4_d2's (COLI_SYCL_MX4_HALF=0): the same bits */
+                    std::vector<float> y0(y.size());
+                    setenv("COLI_SYCL_MX4_HALF", "0", 1);
+                    ok = ok && T->begin() && T->moe(t3, xb, ib, wb, hb, yb, NULL, &m) && T->submit(1) && T->read(yb, 0, y0.data(), y0.size() * 4);
+                    unsetenv("COLI_SYCL_MX4_HALF");
+                    for (int s = 0; s < S; s++)
+                        for (int d = 0; d < D; d++) hdiff += std::memcmp(&y[8 + (size_t)s * D + d], &y0[8 + (size_t)s * D + d], 4) != 0;
+                    std::printf("MOE7   half-bits decode vs mx4_d2: %zu of %zu values differ\n", hdiff, (size_t)S * D);
+                }
                 double me = 0, mr = 0;
                 long nh = 0;
                 for (int s = 0; s < S; s++) {
@@ -181,7 +191,7 @@ static void suite(int dev, int D, int I) {
                 }
                 const double rel = mr > 0 ? me / mr : me;
                 const bool reached = act == 0 || nh > 0;   /* act 1 must have met its limit, or it tested nothing */
-                const bool pass = ok && rel < 2e-5 && reached;
+                const bool pass = ok && rel < 2e-5 && reached && hdiff == 0;
                 std::printf("MOE7 D=%d I=%d S=%d K=%d %s act=%d%s parts=%s: max|err|/max|ref| = %.3g (max|ref| %.4g)%s %s\n", D, I, S, K,
                             fs ? "scales f32 (the tier's, gs 32)" : "scales ue8m0 (gs 0)", act,
                             act ? " lim=7" : "", split ? "1+2 host rows" : "3", rel, mr,

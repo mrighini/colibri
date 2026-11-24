@@ -6825,6 +6825,22 @@ __dpct_inline__ float mg_dot4m(unsigned w, const sycl::float4 a,
            a.w() * mx4_d2(w >> 12) + b.x() * mx4_d2(w >> 16) + b.y() * mx4_d2(w >> 20) +
            b.z() * mx4_d2(w >> 24) + b.w() * mx4_d2(w >> 28);
 }
+/* fmt 7 the cheap way (FMT 77 in the moe_gv kernels): an e2m1 nibble's bits placed into a half -- magnitude bits
+ * (e1 e0 m) at the half's bits 11..9, the sign at bit 15 -- is the nibble's value times 2^-14 for all 16 codes (e > 0:
+ * (1 + m/2) 2^(e-15) vs (1 + m/2) 2^(e-1); e = 0: m 2^-15 vs m 2^-1), so twice that times 2^-15: mx4_d2's value times
+ * 2^-15 exactly. Two nibbles (i, i+4) of a word a mask, a shift and an or, then the hardware's half2 -> float2. The
+ * kernels multiply the group's scale by 2^15 (exact), so every product and sum is mx4_d2's times a power of two: the
+ * same bits. ~4 operations a weight instead of ~7 (DS41: the experts' kernels bound by the decode). */
+__dpct_inline__ sycl::float2 mg_h2(unsigned w) {
+    const unsigned u = ((w & 0x00070007u) << 9) | ((w & 0x00080008u) << 12);
+    return sycl::bit_cast<sycl::half2>(u).convert<float, sycl::rounding_mode::automatic>();
+}
+__dpct_inline__ float mg_dot4h(unsigned w, const sycl::float4 a, const sycl::float4 b) {
+    const sycl::float2 p0 = mg_h2(w), p1 = mg_h2(w >> 4), p2 = mg_h2(w >> 8), p3 = mg_h2(w >> 12);
+    return a.x() * p0.x() + a.y() * p1.x() + a.z() * p2.x() + a.w() * p3.x() + b.x() * p0.y() + b.y() * p1.y() +
+           b.z() * p2.y() + b.w() * p3.y();
+}
+static int mx4_half_on(void) { const char *e = std::getenv("COLI_SYCL_MX4_HALF"); return !(e && *e == '0'); }   /* read a launch: the test runs both */
 /* one 16-byte step q of a row against the staged row: 16 int8 or 32 int4 weights, or 32 e2m1
  * ones (fmt 7: doubled, unscaled; the caller multiplies by the group's mx4_moe_scale) */
 template <int FMT>
@@ -6836,6 +6852,11 @@ __dpct_inline__ float mg_step(sycl::uint4 v, int q, const sycl::float4 *xs) {
                mg_dot8w(v.w(), xs[mgx(b + 3)]);
     }
     int b = q * 8;
+    if (FMT == 77)
+        return mg_dot4h(v.x(), xs[mgx(b)], xs[mgx(b + 1)]) +
+               mg_dot4h(v.y(), xs[mgx(b + 2)], xs[mgx(b + 3)]) +
+               mg_dot4h(v.z(), xs[mgx(b + 4)], xs[mgx(b + 5)]) +
+               mg_dot4h(v.w(), xs[mgx(b + 6)], xs[mgx(b + 7)]);
     if (FMT == 7)
         return mg_dot4m(v.x(), xs[mgx(b)], xs[mgx(b + 1)]) +
                mg_dot4m(v.y(), xs[mgx(b + 2)], xs[mgx(b + 3)]) +
@@ -6895,16 +6916,17 @@ static void moe_gv_gu_k(const CcExpert *__restrict__ tab,
                 if (FMT == 4) {
                     int gi = o * ng + (q * 32) / p.gs;
                     g += mg_step<FMT>(vg, q, xs) * ke[k].gs[gi]; uu += mg_step<FMT>(vu, q, xs) * ke[k].us[gi];
-                } else if (FMT == 7) {   /* step q is group q: nq ue8m0 bytes a row */
+                } else if (FMT == 7 || FMT == 77) {   /* step q is group q: nq ue8m0 bytes a row; 77: the scale times 2^15 */
                     size_t gi = (size_t)o * nq + q;
-                    g += mg_step<FMT>(vg, q, xs) * mx4_sc(ke[k].gs, gi, p.gs);
-                    uu += mg_step<FMT>(vu, q, xs) * mx4_sc(ke[k].us, gi, p.gs);
+                    const float f = FMT == 77 ? 32768.f : 1.f;
+                    g += mg_step<FMT>(vg, q, xs) * (mx4_sc(ke[k].gs, gi, p.gs) * f);
+                    uu += mg_step<FMT>(vu, q, xs) * (mx4_sc(ke[k].us, gi, p.gs) * f);
                 } else { g += mg_step<FMT>(vg, q, xs); uu += mg_step<FMT>(vu, q, xs); }
             }
         }
         g = mg_lanes_sum(g, lpr); uu = mg_lanes_sum(uu, lpr);
         if (ql == 0 && live) {
-            if (FMT != 4 && FMT != 7) { g *= ke[k].gs[o]; uu *= ke[k].us[o]; }
+            if (FMT != 4 && FMT != 7 && FMT != 77) { g *= ke[k].gs[o]; uu *= ke[k].us[o]; }
             hid[((size_t)s * p.K + k) * p.I + o] = moe_act(g, uu, p);
         }
     }
@@ -6947,11 +6969,12 @@ static void moe_gv_dn_k(const CcExpert *__restrict__ tab,
                 float d = mg_step<FMT>(wd[q], q, xs);
                 v += FMT == 4 ? d * ex.ds[oc * ng + (q * 32) / p.gs]
                    : FMT == 7 ? d * mx4_sc(ex.ds, (size_t)oc * nq + q, p.gs)
+                   : FMT == 77 ? d * (mx4_sc(ex.ds, (size_t)oc * nq + q, p.gs) * 32768.f)
                    : d;
             }
         }
         v = mg_lanes_sum(v, lpr);
-        if (ql == 0 && live) hid[dn + (size_t)j * p.D + o] = FMT != 4 && FMT != 7 ? v * ex.ds[oc] : v;
+        if (ql == 0 && live) hid[dn + (size_t)j * p.D + o] = FMT != 4 && FMT != 7 && FMT != 77 ? v * ex.ds[oc] : v;
     }
 }
 static int moe_gv_sg(const DeviceContext *ctx) {
@@ -7375,7 +7398,8 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
         if (!x) return 0;
         int ok = rows ? moe_xmx_launch(prof, tab, x, ids, hid, m, p, st)
                : moe_gv_ok(p) ? (p->fmt == 1 ? moe_gv_launch<1>(tab, x, ids, hid, p, st) : p->fmt == 2 ? moe_gv_launch<2>(tab, x, ids, hid, p, st)
-                                : p->fmt == 7 ? moe_gv_launch<7>(tab, x, ids, hid, p, st) : moe_gv_launch<4>(tab, x, ids, hid, p, st))
+                                : p->fmt == 7 ? (mx4_half_on() ? moe_gv_launch<77>(tab, x, ids, hid, p, st) : moe_gv_launch<7>(tab, x, ids, hid, p, st))
+                                : moe_gv_launch<4>(tab, x, ids, hid, p, st))
                : p->fmt == 1 ? moe_launch<1>(tab, x, ids, hid, p, st) : p->fmt == 2 ? moe_launch<2>(tab, x, ids, hid, p, st)
                : p->fmt == 4 ? moe_launch<4>(tab, x, ids, hid, p, st) : p->fmt == 7 ? moe_launch<7>(tab, x, ids, hid, p, st)
                : moe_launch<8>(tab, x, ids, hid, p, st);
