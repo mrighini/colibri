@@ -3025,6 +3025,13 @@ static void e4t_fastob_k(float *y, int y_row, const float *x, int x_row, int x_g
     }
 }
 static int e4t_ob_on(void) { const char *e = std::getenv("COLI_SYCL_E4T_OB"); return !(e && *e == '0'); }
+/* the fewest rows an ungrouped product takes e4t_fastob_k (COLI_SYCL_E4T_OB_MIN, default 3): at 2 rows the KS-split rows
+ * kernel is 4-25 % faster on every trunk shape (DS44's test), at 3-4 the 4-output one on most; the grouped launch keeps 2 */
+static int e4t_ob_min(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = std::getenv("COLI_SYCL_E4T_OB_MIN"); m = e && *e ? std::atoi(e) : 3; if (m < 2) m = 2; }
+    return m;
+}
 static int e4t_ob_ks(int I) { int ks = 8; while (ks > 1 && I / (16 * 16 * ks) < 2) ks >>= 1; return ks; }
 /* the launch: NG matrices (1: an ungrouped one), outputs O = NG * ol, at sub-group 16 */
 static void e4t_ob_launch(sycl::queue &q, float *y, int y_row, const float *x, int x_row, int x_grp, const E4tGrp &gp, int S,
@@ -6271,7 +6278,7 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev,
         static int fast_env = -1;   /* COLI_SYCL_E4T_FAST: 1 (default) the decode rows' fast product (not the CPU's bits), 0 exact */
         if (fast_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_FAST"); fast_env = !(e && *e == '0'); }
         if (fast_env && S <= E4T_FAST_ROWS && ((uintptr_t)dq8 & 15) == 0 && ((uintptr_t)x_dev & 15) == 0) {
-            if (S >= 2 && e4t_ob_on()) {
+            if (S >= e4t_ob_min() && e4t_ob_on()) {
                 E4tGrp gp1;
                 for (int k = 0; k < E4TG_MAX; k++) { gp1.q[k] = dq8; gp1.sc[k] = ds; }
                 e4t_ob_launch(*st, y_dev, O, x_dev, I, 0, gp1, S, I, O, 1);
