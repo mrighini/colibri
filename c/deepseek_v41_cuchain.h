@@ -452,6 +452,13 @@ static int v41u_wo_a(V41U *ch, Model *m, Layer *l, int nr) {
     const Cfg *c = &m->c; const W8 *w = &l->wo_a;
     const int og = c->o_groups, ol = c->o_lora, pg = w->I;
     int ok = 1;
+    if (og <= 16 && nr <= 4) {   /* the groups in one launch (cc_matmul_grp): heads' row s is [og][pg], grp's [og][ol] */
+        ColiCudaTensor *tg[16];
+        int all = 1;
+        for (int k = 0; k < og; k++) all &= (tg[k] = v41u_woa(w, k, ol)) != NULL;
+        const int r = all ? cc_matmul_grp(tg, og, ch->heads, 0, og * pg, pg, ch->grp, 0, og * ol, nr) : -1;
+        if (r >= 0) return r;
+    }
     if (nr == 1) {
         for (int k = 0; ok && k < og; k++) ok = cc_ops()->matmul(v41u_woa(w, k, ol), ch->heads, (size_t)k * pg, ch->grp, (size_t)k * ol, 1);
         return ok;

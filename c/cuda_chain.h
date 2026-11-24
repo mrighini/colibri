@@ -505,6 +505,10 @@ typedef struct ColiCudaChainOps {
      * caller's n calls), 0 a failure */
     int  (*attn_h_mx)(CcBuf *q, CcBuf *const *kc, CcBuf *const *vc, const int *pos, const int *cap, int n, CcBuf *o, CcBuf *gate, const CcAttn *p);
     int  (*copy_regions_h_mx)(CcBuf *const *dst, int n, CcBuf *src, const CcRegion *r, int per);
+    /* matmul_grp: n matrices of one shape (O x I each) in one launch, matrix k's input row r at x + xo + r x_row +
+     * k x_grp, its output row r at y + yo + r y_row + k O (DeepSeek V4.1's wo_a groups). 1 done, -1 not taken (the
+     * caller's matmul a matrix), 0 a failure */
+    int  (*matmul_grp)(ColiCudaTensor *const *t, int n, CcBuf *x, size_t xo, int x_row, int x_grp, CcBuf *y, size_t yo, int y_row, int S);
 } ColiCudaChainOps;
 #define CC_MX_N 16   /* conversations a dnconv_mx / dnrec_mx launch takes (KV_SLOTS' limit) */
 #define CC_MX_ATTN_N 8   /* conversations an attn_h_mx call takes: a decode step's rows in the backend's attention */
@@ -722,6 +726,11 @@ static inline int cc_attn_h_mx(CcBuf *q, CcBuf *const *kc, CcBuf *const *vc, con
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, attn_h_mx) + sizeof t->attn_h_mx && t->attn_h_mx
            ? t->attn_h_mx(q, kc, vc, pos, cap, n, o, gate, p) : -1;
+}
+static inline int cc_matmul_grp(ColiCudaTensor *const *tt, int n, CcBuf *x, size_t xo, int x_row, int x_grp, CcBuf *y, size_t yo, int y_row, int S) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, matmul_grp) + sizeof t->matmul_grp && t->matmul_grp
+           ? t->matmul_grp(tt, n, x, xo, x_row, x_grp, y, yo, y_row, S) : -1;
 }
 static inline int cc_copy_regions_h_mx(CcBuf *const *dst, int n, CcBuf *src, const CcRegion *r, int per) {
     const ColiCudaChainOps *t = cc_ops();

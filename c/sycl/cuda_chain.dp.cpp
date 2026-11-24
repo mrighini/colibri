@@ -49,6 +49,8 @@
  * no transfer, no synchronization. */
 extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O);
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
+extern "C" int coli_cuda_tensor_gemm_grp_async(ColiCudaTensor *const *t, int ng, float *y_dev, int y_row, const float *x_dev,
+                                               int x_row, int x_grp, int S, void *stream);
 extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream);
 extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *ids_dev, float *y_dev, const float *x_dev, int n, void *stream);
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
@@ -2322,6 +2324,24 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     }
     return 1;
 }
+static int cc_matmul_grp(ColiCudaTensor *const *t, int n, CcBuf *x, size_t xo, int x_row, int x_grp, CcBuf *y, size_t yo, int y_row, int S) {
+    CcCtx *c = live();
+    if (!c || !t || n < 1 || !x || !y || S < 1) return 0;
+    int fmt, I, O;
+    if (!t[0] || !coli_cuda_tensor_shape(t[0], &fmt, &I, &O) || coli_cuda_tensor_device(t[0]) != c->device) return -1;
+    if ((xo + (size_t)(S - 1) * x_row + (size_t)(n - 1) * x_grp + I) * 4 > x->bytes ||
+        (yo + (size_t)(S - 1) * y_row + (size_t)n * O) * 4 > y->bytes) return 0;
+    const int r = coli_cuda_tensor_gemm_grp_async(t, n, y->d + yo, y_row, x->d + xo, x_row, x_grp, S, (void *)c->stream);
+    if (r == 0) { cc_mark_lost(c); return 0; }
+    if (r < 0) return -1;
+    g_st.matmuls++; g_st.ops++;
+    if (coli_sycl_fprof_flag) {
+        char k[64];
+        std::snprintf(k, sizeof k, "matmul %d x %dx%d fmt%d (grouped)", n, O, I, fmt);
+        coli_sycl_fprof_name(k);
+    }
+    return 1;
+}
 static int cc_addnorm(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p) {
     CcCtx *c = live();
     if (!c || !x || !t || !w || !y || !p || p->rows < 1 || p->D < 1) return 0;
@@ -3968,5 +3988,6 @@ static const ColiCudaChainOps g_cc_ops = {
     nullptr /* fetch_done_at */,
     cc_dnconv_mx, cc_dnrec_mx,
     cc_attn_h_mx, cc_copy_regions_h_mx,
+    cc_matmul_grp,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

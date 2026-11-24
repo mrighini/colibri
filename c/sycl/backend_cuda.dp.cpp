@@ -2881,6 +2881,62 @@ static void e4t_fastk_k(float *y, int ystride, const float *x, int xstride, cons
         y[(size_t)lane * ystride + o] = v;
     }
 }
+/* e4t_fastg_k: one launch for NG fmt9 matrices of the same shape (ol x I) whose inputs are NG slices of each row --
+ * DeepSeek V4.1's wo_a output groups (8 of 1024 x 4096: 8 launches at the ~10-12 us floor, DS37). Output o of
+ * [0, NG*ol) is group k = o / ol's row o % ol; its input is row r's slice x + r*x_row + k*x_grp; y[r*y_row + o]. A
+ * group's row is e4t_fastk_k's arithmetic (KS sub-groups a row, their partials added in g order), so the result is
+ * the per-group launches' with the same KS. */
+#define E4TG_MAX 16
+struct E4tGrp { const uint8_t *q[E4TG_MAX]; const uint8_t *sc[E4TG_MAX]; };
+template <int SG, int KS>
+static void e4t_fastg_k(float *y, int y_row, const float *x, int x_row, int x_grp, E4tGrp gp, int S, int I, int ol,
+                        int NG, uint8_t *slm) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lane = sg.get_local_linear_id(), sgi = (int)sg.get_group_linear_id();
+    const int rows_wg = (int)(item.get_local_range(2) / SG) / KS, slot = sgi / KS, g = sgi % KS;
+    const int o = item.get_group(2) * rows_wg + slot, O = NG * ol;
+    const int tiles = I >> 5, nr = S < E4T_FAST_ROWS ? S : E4T_FAST_ROWS;
+    float acc[E4T_FAST_ROWS] = {0.f, 0.f, 0.f, 0.f};
+    if (o < O) {
+        const int k = o / ol, oo = o - k * ol;
+        const uint8_t *row = gp.q[k] + (size_t)oo * I, *srow = gp.sc[k] + (size_t)(oo >> 5) * tiles;
+        const float *xk = x + (size_t)k * x_grp;
+        for (int c0 = (g * SG + lane) * 16; c0 < I; c0 += KS * SG * 16) {
+            const sycl::uint4 b = *(const sycl::uint4 *)(row + c0);
+            const uint32_t wd[4] = { b.x(), b.y(), b.z(), b.w() };
+            float w[16];
+#pragma unroll
+            for (int c = 0; c < 16; c++) w[c] = e4t_dec((wd[c >> 2] >> ((c & 3) * 8)) & 0xffu);
+            const float tl = sycl::bit_cast<float>((uint32_t)srow[c0 >> 5] << 23);
+#pragma unroll
+            for (int r = 0; r < E4T_FAST_ROWS; r++) {
+                if (r >= nr) break;
+                const sycl::float4 *x4 = (const sycl::float4 *)(xk + (size_t)r * x_row + c0);
+                float part = 0.f;
+#pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const sycl::float4 f = x4[v];
+                    part += w[4 * v] * f.x() + w[4 * v + 1] * f.y() + w[4 * v + 2] * f.z() + w[4 * v + 3] * f.w();
+                }
+                acc[r] += part * tl;
+            }
+        }
+    }
+    float *pt = (float *)slm;
+#pragma unroll
+    for (int r = 0; r < E4T_FAST_ROWS; r++) {
+        const float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+        if (lane == 0) pt[(slot * KS + g) * E4T_FAST_ROWS + r] = v;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (g == 0 && lane < nr && o < O) {
+        float v = 0.f;
+#pragma unroll
+        for (int kk = 0; kk < KS; kk++) v += pt[(slot * KS + kk) * E4T_FAST_ROWS + lane];
+        y[(size_t)lane * y_row + o] = v;
+    }
+}
 extern "C" void *coli_cuda_e4m3t_upload(int device, const unsigned char *q, const unsigned char *s, int O, int I) try {
     if (fault_injected() || !q || !s || O < 1 || I < 32 || (I & 31)) return NULL;
     DeviceContext *ctx = find_ctx(device);
@@ -6121,7 +6177,7 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev,
             if (ks_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_KS"); ks_env = e ? std::atoi(e) : 0; }
             int ks = 1;
             if (ks_env == 1 || ks_env == 2 || ks_env == 4 || ks_env == 8) ks = ks_env;
-            else while (ks < 8 && ks * 2 <= nsg && (long)O * ks < 4096 && I / (16 * sgw) >= ks * 2) ks *= 2;
+            else if (I / (16 * sgw) >= 8) ks = 2;   /* DS37: KS 2 best wherever a row has >= 8 chunks a lane; shorter rows KS 1 */
             if (ks > nsg || I / (16 * sgw) < ks) ks = 1;
             if (ks == 1) {
                 dpct::dim3 grid((unsigned)((O + nsg - 1) / nsg), 1u);
@@ -6296,6 +6352,34 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev,
     return cuda_ok(0, "chain gemm launch");
 }
 catch (sycl::exception const &exc) { return sycl_caught(exc, "coli_cuda_tensor_gemm_async"); }
+/* NG fmt9 matrices of one shape, inputs as slices of each row (e4t_fastg_k): 1 launched, -1 not taken (another format or
+ * shape, more than E4T_FAST_ROWS rows, the fast product off, misaligned: the caller's launch a matrix), 0 a failure */
+extern "C" int coli_cuda_tensor_gemm_grp_async(ColiCudaTensor *const *t, int ng, float *y_dev, int y_row, const float *x_dev,
+                                               int x_row, int x_grp, int S, void *stream) try {
+    if (fault_injected()) return 0;
+    if (!t || ng < 1 || ng > E4TG_MAX || !y_dev || !x_dev || S < 1) return 0;
+    const char *fe = std::getenv("COLI_SYCL_E4T_FAST"), *ge = std::getenv("COLI_SYCL_E4T_GRP");
+    if ((fe && *fe == '0') || (ge && *ge == '0') || S > E4T_FAST_ROWS) return -1;
+    E4tGrp gp;
+    const int I = t[0] ? t[0]->I : 0, ol = t[0] ? t[0]->O : 0, dev = t[0] ? t[0]->device : -1;
+    for (int k = 0; k < ng; k++) {
+        if (!t[k] || t[k]->fmt != 9 || t[k]->I != I || t[k]->O != ol || t[k]->device != dev) return -1;
+        gp.q[k] = (const uint8_t *)t[k]->weights; gp.sc[k] = (const uint8_t *)(t[k]->scales + 256);
+        if (((uintptr_t)gp.q[k] & 15) != 0) return -1;
+    }
+    for (int k = ng; k < E4TG_MAX; k++) { gp.q[k] = gp.q[0]; gp.sc[k] = gp.sc[0]; }
+    if (((uintptr_t)x_dev & 15) || (x_row & 3) || (x_grp & 3) || (I & 31) || I < 32) return -1;
+    DeviceContext *ctx = find_ctx(dev);
+    if (!select_ctx(ctx)) return 0;
+    sycl::queue *st = (sycl::queue *)stream;
+    const int sgw = ctx->sg, nsg = 256 / sgw, ks = I / (16 * sgw) >= 8 ? 2 : 1, rows_wg = nsg / ks, O = ng * ol;
+    dpct::dim3 grid((unsigned)((O + rows_wg - 1) / rows_wg), 1u);
+    const size_t slm = (size_t)nsg * E4T_FAST_ROWS * sizeof(float);
+    if (ks == 2) COLI_SG_LAUNCH((*st), sgw, grid, 256, slm, e4t_fastg_k<SG, 2>(y_dev, y_row, x_dev, x_row, x_grp, gp, S, I, ol, ng, dpct_local));
+    else COLI_SG_LAUNCH((*st), sgw, grid, 256, slm, e4t_fastg_k<SG, 1>(y_dev, y_row, x_dev, x_row, x_grp, gp, S, I, ol, ng, dpct_local));
+    return cuda_ok(0, "chain e4t grouped launch") ? 1 : 0;
+}
+catch (sycl::exception const &exc) { return sycl_caught(exc, "coli_cuda_tensor_gemm_grp_async"); }
 
 /* A resident tensor's device copy for the dense chain's routed experts (cuda_chain.cu's
  * table of CcExpert): its weights, its scales and the scales' group size (fmt 4). */

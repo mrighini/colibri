@@ -12,6 +12,7 @@
 #include "sycl_test_args.h"
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -96,6 +97,48 @@ static void shape(int dev, int O, int I, int S) {
     T->free(xb); T->free(yb);
     coli_cuda_tensor_free(t);
 }
+/* matmul_grp (DeepSeek V4.1's wo_a groups): ng matrices of ol x I in one launch, inputs slices of each row, against
+ * one T->matmul a matrix: the same bits (the same KS, the same arithmetic a row); then both timed (GRP-TIME) */
+static void grouped(int dev, int ng, int ol, int I, int S) {
+    std::vector<std::vector<uint8_t>> q(ng), s(ng);
+    std::vector<ColiCudaTensor *> t(ng, nullptr);
+    for (int k = 0; k < ng; k++) { make(q[k], s[k], ol, I); require(coli_cuda_tensor_upload_e4t(&t[k], q[k].data(), s[k].data(), ol, I, dev), "upload_e4t (grouped)"); }
+    std::vector<float> x((size_t)S * ng * I), ya((size_t)S * ng * ol), yb((size_t)S * ng * ol);
+    for (auto &v : x) v = (float)((int)(rnd() % 20001) - 10000) / 3371.0f;
+    CcBuf *xb = up(x), *ga = T->buf(ya.size() * 4, CC_DEV), *gb = T->buf(yb.size() * 4, CC_DEV), *xg = T->buf(x.size() * 4, CC_DEV),
+          *yg = T->buf(ya.size() * 4, CC_DEV);
+    require(T->size >= offsetof(ColiCudaChainOps, matmul_grp) + sizeof T->matmul_grp && T->matmul_grp, "matmul_grp in the table");
+    require(T->begin() && T->matmul_grp(t.data(), ng, xb, 0, ng * I, I, ga, 0, ng * ol, S) == 1 && T->submit(1), "matmul_grp");
+    /* the per-matrix way: group-major copies (k, s), a matmul a group, back to row-major */
+    std::vector<CcRegion> r1((size_t)S * ng), r2((size_t)S * ng);
+    for (int r = 0; r < S; r++)
+        for (int k = 0; k < ng; k++) {
+            r1[r * ng + k] = CcRegion{(size_t)k * S * I + (size_t)r * I, (size_t)r * ng * I + (size_t)k * I, (size_t)I};
+            r2[r * ng + k] = CcRegion{(size_t)r * ng * ol + (size_t)k * ol, (size_t)k * S * ol + (size_t)r * ol, (size_t)ol};
+        }
+    int ok = T->begin() && T->copy_regions(xg, xb, r1.data(), S * ng);
+    for (int k = 0; ok && k < ng; k++) ok = T->matmul(t[k], xg, (size_t)k * S * I, yg, (size_t)k * S * ol, S);
+    require(ok && T->copy_regions(gb, yg, r2.data(), S * ng) && T->submit(1), "per-matrix matmuls");
+    require(T->read(ga, 0, ya.data(), ya.size() * 4) && T->read(gb, 0, yb.data(), yb.size() * 4), "read back (grouped)");
+    size_t diff = 0;
+    for (size_t i = 0; i < ya.size(); i++) diff += std::memcmp(&ya[i], &yb[i], 4) != 0;
+    std::printf("GRP %d x %dx%d S=%d: grouped vs per-matrix, %zu of %zu values differ\n", ng, ol, I, S, diff, ya.size());
+    if (diff) fails++;
+    for (int mode = 0; mode < 2; mode++) {
+        const int n = 200;
+        const auto t0 = std::chrono::steady_clock::now();
+        require(T->begin(), "begin (timed)");
+        for (int it = 0; it < n; it++) {
+            if (mode == 0) require(T->matmul_grp(t.data(), ng, xb, 0, ng * I, I, ga, 0, ng * ol, S) == 1, "grouped (timed)");
+            else for (int k = 0; k < ng; k++) require(T->matmul(t[k], xg, (size_t)k * S * I, yg, (size_t)k * S * ol, S), "per-matrix (timed)");
+        }
+        require(T->submit(1), "submit (timed)");
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / n;
+        std::printf("GRP-TIME %d x %dx%d S=%d %s: %.1f us\n", ng, ol, I, S, mode == 0 ? "one launch" : "a launch a matrix", us);
+    }
+    for (CcBuf *b : {xb, ga, gb, xg, yg}) T->free(b);
+    for (auto *tt : t) coli_cuda_tensor_free(tt);
+}
 static void timed(int dev) {   /* one row, the trunk's shapes, many launches in a frame */
     const int sh[][2] = { {1024, 5120}, {32768, 1024}, {576, 5120}, {1024, 4096}, {5120, 8192}, {2048, 5120}, {5120, 2048} };
     for (auto &p : sh) {
@@ -160,6 +203,7 @@ int main(int argc, char **argv) {
     const int sh[][3] = { {64, 32, 1}, {1024, 5120, 1}, {1024, 5120, 4}, {577, 5120, 3}, {32768, 1024, 1}, {576, 5120, 8},
                           {1024, 4096, 9}, {5120, 8192, 2}, {2048, 5120, 32}, {5120, 2048, 7}, {33, 96, 17} };
     for (auto &p : sh) shape(dev[0], p[0], p[1], p[2]);
+    grouped(dev[0], 8, 1024, 4096, 1); grouped(dev[0], 8, 1024, 4096, 4); grouped(dev[0], 3, 64, 96, 2);
     timed(dev[0]);
     timed_ref(dev[0]);
     std::printf(fails ? "E4T SUITE FAIL\n" : "E4T SUITE PASS\n");
