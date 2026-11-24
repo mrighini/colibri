@@ -2930,6 +2930,54 @@ static void bf16t_kernel(float *y, int ystride, const float *x, int xstride, con
         }
     }
 }
+/* bf16t2_kernel: the same bits as bf16t_kernel with one work-item an output: its eight accumulators (lane j of 8 there:
+ * columns j, j+8, ... in order, fma from +0) live in that work-item, which reads its row 16 bytes at a time (8 columns:
+ * one step of each accumulator) instead of 2 bytes a lane; then the same tree, ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)).
+ * DS34: bf16t_kernel ran the lm head (129280 x 5120) at ~150 GB/s, 8 ms of a 4-row decode step. Rows BF2_ROWS a pass
+ * (32 accumulators a work-item at 4), sub-group 16 for the registers. COLI_SYCL_BF16T_V1=1: bf16t_kernel. */
+#define BF2_ROWS 4
+template <int SG>
+static void bf16t2_kernel(float *y, int ystride, const float *x, int xstride, const uint16_t *w, int S, int I, int O) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int o = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+    const int r0 = item.get_group(1) * BF2_ROWS;
+    const int nr = S - r0 < BF2_ROWS ? S - r0 : BF2_ROWS;
+    if (o >= O) return;   /* no sub-group operation below */
+    const uint32_t *row = (const uint32_t *)(w + (size_t)o * I);
+    float acc[BF2_ROWS][8];
+#pragma unroll
+    for (int r = 0; r < BF2_ROWS; r++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) acc[r][j] = 0.0f;
+#pragma unroll 4
+    for (int i = 0; i < I; i += 8) {
+        const sycl::uint4 q = *(const sycl::uint4 *)(row + (i >> 1));
+        const uint32_t wd[4] = { q.x(), q.y(), q.z(), q.w() };
+        float wv[8];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            wv[2 * k] = sycl::bit_cast<float>(wd[k] << 16);
+            wv[2 * k + 1] = sycl::bit_cast<float>(wd[k] & 0xffff0000u);
+        }
+#pragma unroll
+        for (int r = 0; r < BF2_ROWS; r++) {
+            if (r < nr) {
+                const float *xr = x + (size_t)(r0 + r) * xstride + i;
+#pragma unroll
+                for (int j = 0; j < 8; j++) acc[r][j] = sycl::fma(wv[j], xr[j], acc[r][j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < BF2_ROWS; r++) {
+        if (r < nr) {
+            const float a0 = acc[r][0] + acc[r][4], a1 = acc[r][1] + acc[r][5], a2 = acc[r][2] + acc[r][6], a3 = acc[r][3] + acc[r][7];
+            const float b0 = a0 + a2, b1 = a1 + a3;
+            y[(size_t)(r0 + r) * ystride + o] = b0 + b1;
+        }
+    }
+}
+static int bf16t_v1(void) { const char *e = getenv("COLI_SYCL_BF16T_V1"); return e && atoi(e) > 0; }
 extern "C" void *coli_cuda_bf16t_upload(int device, const unsigned short *w, int O, int I) try {
     if (fault_injected() || !w || O < 1 || I < 8 || (I & 7)) return NULL;
     DeviceContext *ctx = find_ctx(device);
@@ -2965,10 +3013,15 @@ extern "C" int coli_cuda_bf16t_mv(void *h, float *y, int ystride, const float *x
     if (xstride == I) { if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(ctx->dx, x, xb)), "bf16t input upload")) return 0; }
     else for (int r = 0; r < S; r++)
         if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(ctx->dx + (size_t)r * I, x + (size_t)r * xstride, (size_t)I * 4)), "bf16t input upload")) return 0;
-    const int outs_per_wg = 256 / 8;
-    dpct::dim3 grid((unsigned)((O + outs_per_wg - 1) / outs_per_wg), (unsigned)((S + E4T_ROWS - 1) / E4T_ROWS));
     float *dy = ctx->dy; const float *dx = ctx->dx; const uint16_t *dw = t->w;
-    COLI_SG_LAUNCH(dq(), ctx->sg, grid, 256, 0, bf16t_kernel<SG>(dy, O, dx, I, dw, S, I, O));
+    if (bf16t_v1()) {
+        const int outs_per_wg = 256 / 8;
+        dpct::dim3 grid((unsigned)((O + outs_per_wg - 1) / outs_per_wg), (unsigned)((S + E4T_ROWS - 1) / E4T_ROWS));
+        COLI_SG_LAUNCH(dq(), ctx->sg, grid, 256, 0, bf16t_kernel<SG>(dy, O, dx, I, dw, S, I, O));
+    } else {
+        dpct::dim3 grid((unsigned)((O + 255) / 256), (unsigned)((S + BF2_ROWS - 1) / BF2_ROWS));
+        COLI_SG_LAUNCH(dq(), 16, grid, 256, 0, bf16t2_kernel<SG>(dy, O, dx, I, dw, S, I, O));
+    }
     if (!cuda_ok(0, "bf16t launch")) return 0;
     if (ystride == O) { if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(y, dy, yb).wait()), "bf16t output download")) return 0; }
     else {
