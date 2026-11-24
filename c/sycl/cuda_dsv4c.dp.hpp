@@ -135,6 +135,92 @@ static void ccd_mhc_split_k(const float *x, const float *mx, float *hp, const fl
     }
     for (int k = 0; k < H * H; k++) hp[cb + k] = cm[k];
 }
+/* ccd_mhc_split_k with H a constant (DeepSeek V4.1's hc_mult 4, and 2 / 8): every loop unrolls, so the comb matrix and
+ * the sums stay in registers -- with a run-time H, cm[64] / sums[8] are indexed dynamically and live in private
+ * (scratch) memory, each Sinkhorn step a dependent memory access (DS33: 175 us a call, 10.6 % of a decode's device
+ * time on 1-4 work-groups). The operations are ccd_mhc_split_k's, one for one, in its order (-fp-model=precise: no
+ * reassociation), so the bits are its bits. COLI_SYCL_MHC_GENERIC=1: ccd_mhc_split_k. */
+template <int H>
+static void ccd_mhc_split_t(const float *x, const float *mx, float *hp, const float *prm, CcMhc p) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto &red = CCD_LOCAL(float[256]);
+    auto &ms = CCD_LOCAL(float[96]);
+    constexpr int nm = (2 + H) * H;
+    const int s = it.get_group(2), tid = it.get_local_id(2), HD = H * p.D;
+    const int xb = p.x_off + s * p.x_row;
+    float a = 0.f;
+    for (int i = tid; i < HD; i += 256) { float v = x[xb + i]; a += v * v; }
+    red[tid] = a;
+    CCD_SYNC(it);
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        CCD_SYNC(it);
+    }
+    const float r = 1.f / sycl::sqrt(red[0] / (float)HD + p.eps);
+    for (int i = tid; i < nm; i += 256) ms[i] = mx[p.m_off + s * p.m_row + i] * r;
+    CCD_SYNC(it);
+    if (tid != 0) return;
+    const int hb = p.hp_off + s * p.hp_row, pb = p.prm_off;
+    float pr[3 + nm];
+#pragma unroll
+    for (int i = 0; i < 3 + nm; i++) pr[i] = prm[pb + i];
+#pragma unroll
+    for (int i = 0; i < H; i++) {
+        hp[hb + i] = ccd_sig(ms[i] * pr[0] + pr[3 + i]) + p.hc_eps;
+        hp[hb + H + i] = 2.f * ccd_sig(ms[H + i] * pr[1] + pr[3 + H + i]);
+    }
+    const int cb = hb + 2 * H;
+    constexpr int mo = 2 * H;
+    float cm[H * H];
+#pragma unroll
+    for (int row = 0; row < H; row++) {
+        float mxv = -3.0e38f;
+#pragma unroll
+        for (int col = 0; col < H; col++) {
+            float v = ms[mo + row * H + col] * pr[2] + pr[3 + mo + row * H + col];
+            cm[row * H + col] = v;
+            if (v > mxv) mxv = v;
+        }
+        float sum = 0.f;
+#pragma unroll
+        for (int col = 0; col < H; col++) { float v = CCD_EXP(cm[row * H + col] - mxv); cm[row * H + col] = v; sum += v; }
+#pragma unroll
+        for (int col = 0; col < H; col++) cm[row * H + col] = cm[row * H + col] / sum + p.hc_eps;
+    }
+    float sums[H];
+#pragma unroll
+    for (int col = 0; col < H; col++) { float sm = 0.f;
+#pragma unroll
+        for (int row = 0; row < H; row++) sm += cm[row * H + col]; sums[col] = sm; }
+#pragma unroll
+    for (int row = 0; row < H; row++)
+#pragma unroll
+        for (int col = 0; col < H; col++) cm[row * H + col] /= sums[col] + p.hc_eps;
+    for (int it2 = 1; it2 < p.iters; it2++) {
+#pragma unroll
+        for (int row = 0; row < H; row++) { float sm = 0.f;
+#pragma unroll
+            for (int col = 0; col < H; col++) sm += cm[row * H + col]; sums[row] = sm; }
+#pragma unroll
+        for (int row = 0; row < H; row++)
+#pragma unroll
+            for (int col = 0; col < H; col++) cm[row * H + col] /= sums[row] + p.hc_eps;
+#pragma unroll
+        for (int col = 0; col < H; col++) { float sm = 0.f;
+#pragma unroll
+            for (int row = 0; row < H; row++) sm += cm[row * H + col]; sums[col] = sm; }
+#pragma unroll
+        for (int row = 0; row < H; row++)
+#pragma unroll
+            for (int col = 0; col < H; col++) cm[row * H + col] /= sums[col] + p.hc_eps;
+    }
+#pragma unroll
+    for (int k = 0; k < H * H; k++) hp[cb + k] = cm[k];
+}
+static int ccd_mhc_generic(void) {   /* read at each launch: the test runs both kernels in one process */
+    const char *e = getenv("COLI_SYCL_MHC_GENERIC");
+    return e && atoi(e) > 0;
+}
 static void ccd_mhc_ew_k(int mode, const float *x, const float *mx, const float *hp, float *y, CcMhc p) {
     auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long i = (long long)it.get_group(2) * it.get_local_range(2) + it.get_local_id(2);
@@ -172,7 +258,10 @@ static int cc_mhc(int mode, CcBuf *x, CcBuf *m, CcBuf *hp, CcBuf *prm, CcBuf *y,
     if (mode == CC_MHC_SPLIT) {
         if (!m || !hp || !prm || p->S < 1 || p->H < 1 || p->H > 8 || (2 + p->H) * p->H > 96) return 0;
         float *hw = fpw(hp);
-        CC_K(c, dim3((unsigned)p->S), 256, ccd_mhc_split_k(xp, mp, hw, pp_, pp));
+        if (!ccd_mhc_generic() && p->H == 4) CC_K(c, dim3((unsigned)p->S), 256, ccd_mhc_split_t<4>(xp, mp, hw, pp_, pp));
+        else if (!ccd_mhc_generic() && p->H == 2) CC_K(c, dim3((unsigned)p->S), 256, ccd_mhc_split_t<2>(xp, mp, hw, pp_, pp));
+        else if (!ccd_mhc_generic() && p->H == 8) CC_K(c, dim3((unsigned)p->S), 256, ccd_mhc_split_t<8>(xp, mp, hw, pp_, pp));
+        else CC_K(c, dim3((unsigned)p->S), 256, ccd_mhc_split_k(xp, mp, hw, pp_, pp));
         return launched(c, "mhc split");
     }
     size_t n;

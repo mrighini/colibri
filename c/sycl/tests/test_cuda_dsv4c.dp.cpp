@@ -97,6 +97,18 @@ static void test_mhc(int H, int D, int iters) {
                  em = relerr(mean.data(), rmean.data(), mean.size(), 1e-3);
     char m[200]; snprintf(m, sizeof m, "mhc H %d D %d iters %d: split %.2e collapse %.2e write back %.2e mean %.2e", H, D, iters, es, ec, eo, em);
     ck(ok && es < 5e-7 && ec < 2e-4 && eo < 2e-4 && em < 1e-6, m);   /* fma sums: float rounding, not the CPU's order */
+    {   /* the split with H a constant (ccd_mhc_split_t) against the run-time-H kernel: the same bits */
+        CcBuf *hg = T->buf((size_t)S * hrow * 4, CC_DEV);
+        setenv("COLI_SYCL_MHC_GENERIC", "1", 1);
+        int okg = T->begin() && T->mhc(CC_MHC_SPLIT, xb, mb, hg, pb, NULL, &sp) && T->submit(1);
+        unsetenv("COLI_SYCL_MHC_GENERIC");
+        auto hpg = down<float>(hg, (size_t)S * hrow);
+        size_t diff = 0;
+        for (size_t i = 0; i < hp.size(); i++) diff += memcmp(&hp[i], &hpg[i], 4) != 0;
+        snprintf(m, sizeof m, "mhc split H %d iters %d: constant-H kernel vs generic, %zu of %zu values differ", H, iters, diff, hp.size());
+        ck(okg && diff == 0, m);
+        T->free(hg);
+    }
     const int n = 333;
     std::vector<float> ga = fvec(n, 3.f), ua = fvec(n, 3.f), rr(n);
     for (int i = 0; i < n; i++) { float gg = ga[i] > lim ? lim : ga[i], uu = ua[i] < -lim ? -lim : (ua[i] > lim ? lim : ua[i]); rr[i] = gg / (1.f + expf(-gg)) * uu; }
@@ -354,7 +366,7 @@ int main(int argc, char **argv) {
     if (!T || T->size < offsetof(ColiCudaChainOps, ds_engram) + sizeof T->ds_engram || !T->ds_engram) { printf("FAIL: the backend has no V4 ops\n"); return 1; }
     if (!T->init(dev) || !T->ready()) { printf("FAIL: no chain context\n"); return 1; }
     printf("mhc\n");
-    test_mhc(4, 64, 20); test_mhc(4, 5120 / 8, 20); test_mhc(2, 33, 3);
+    test_mhc(4, 64, 20); test_mhc(4, 5120 / 8, 20); test_mhc(2, 33, 3); test_mhc(8, 40, 20); test_mhc(3, 17, 5);
     printf("attention\n");
     test_attn(1, 4, 64, 8, 5, 13, 0); test_attn(3, 2, 512, 128, 40, 300, 0); test_attn(2, 3, 100, 6, 9, 20, 0);
     test_attn(2, 2, 64, 8, 12, 2900, 0); test_attn(3, 4, 64, 8, 5, 13, 1);

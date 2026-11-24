@@ -845,7 +845,7 @@ static void mv8_rows_cpu(float *y, int ystride, const W8 *w, const float *x, int
  * computed on the CPU too and compared byte for byte (a count on stderr at exit; any difference printed). */
 typedef struct { const void *q; int O, I, no, bf; void *h; } V41E4;   /* bf: a BF16 matrix (coli_cuda_bf16t) */
 static V41E4 *g_e4_map; static size_t g_e4_cap;
-static int g_e4_on, g_e4_rows = 32, g_e4_dev, g_b16_on, g_e4_fp8;   /* g_e4_fp8: the FP8 trunk too (V41_TRUNK_GPU) */
+static int g_e4_on, g_e4_rows = 32, g_e4_dev, g_b16_on, g_e4_fp8, g_e4_head_only;   /* g_e4_fp8: the FP8 trunk too (V41_TRUNK_GPU) */
 static pthread_t g_e4_thread;
 static size_t g_e4_used, g_e4_budget = (size_t)-1;
 static unsigned long long g_e4_calls, g_e4_mats, g_e4_chk_left, g_e4_chk_calls, g_e4_chk_bad;
@@ -860,19 +860,22 @@ static void v41_e4_report(void) {
     fprintf(stderr, "\n");
 }
 static void v41_e4_start(int dev) {
-    const char *e = getenv("V41_TRUNK_GPU"), *bf0 = getenv("V41_BF16_GPU");
+    const char *e = getenv("V41_TRUNK_GPU"), *bf0 = getenv("V41_BF16_GPU"), *hd0 = getenv("V41_HEAD_GPU");
     g_e4_fp8 = e && atoi(e) > 0;
-    if (!g_e4_fp8 && !(bf0 && atoi(bf0) > 0)) return;
+    const int head = hd0 && atoi(hd0) > 0;
+    if (!g_e4_fp8 && !(bf0 && atoi(bf0) > 0) && !head) return;
     g_e4_cap = 4096; g_e4_map = calloc(g_e4_cap, sizeof *g_e4_map);
     if (!g_e4_map) return;
     const char *r = getenv("V41_TRUNK_GPU_ROWS"); if (r && atoi(r) > 0) g_e4_rows = atoi(r);
     const char *gb = getenv("V41_TRUNK_GPU_GB"); if (gb && atof(gb) > 0) g_e4_budget = (size_t)(atof(gb) * 1073741824.0);
     const char *ck = getenv("V41_E4_CHECK"); if (ck && atoll(ck) > 0) g_e4_chk_left = (unsigned long long)atoll(ck);
     const char *bf = getenv("V41_BF16_GPU"); g_b16_on = bf && atoi(bf) > 0;
+    /* V41_HEAD_GPU=1: the lm head alone on the device (BF16, mvb's bits), nothing else of the trunk */
+    if (head && !g_b16_on) { g_b16_on = 1; g_e4_head_only = !g_e4_fp8; }
     g_e4_dev = dev; g_e4_thread = pthread_self(); g_e4_on = 1;
     atexit(v41_e4_report);
     fprintf(stderr, "[v41] trunk on device %d:%s%s (rows <= %d%s)\n", dev, g_e4_fp8 ? " FP8 (V41_TRUNK_GPU)" : "",
-            g_b16_on ? " BF16 (V41_BF16_GPU)" : "", g_e4_rows, g_e4_chk_left ? ", checked against the CPU" : "");
+            g_e4_head_only ? " the lm head (V41_HEAD_GPU)" : g_b16_on ? " BF16 (V41_BF16_GPU)" : "", g_e4_rows, g_e4_chk_left ? ", checked against the CPU" : "");
 }
 static V41E4 *v41_e4_find(const void *q, int O, int I, int bf) {
     size_t i = ((uintptr_t)q >> 4) * 11400714819323198485ull % g_e4_cap;
@@ -5268,6 +5271,11 @@ static void v41_seq_alloc(Model *m, V41Seq *q, int with_state) {
  * lowered to their positions), then the row at a time runs the step for real and the two sets of
  * logits are compared (v41u_rows_compare; the exit report's summary). Its routed experts go through
  * the cache and the tier twice, so a checked run's hit counts and the tier's heat are not a plain run's. */
+/* the head of n rows: one device call (V41_HEAD_GPU / V41_BF16_GPU, mvb_cpu's bits), else mvb row by row */
+static void v41_head_rows(float *lg, int V, const WB *w, const float *x, int dim, int n) {
+    V41_B16(lg, V, w, x, dim, n)
+    for (int t = 0; t < n; t++) mvb(lg + (size_t)t * V, w, x + (size_t)t * dim);
+}
 static int v41_rows_chain(Model *m, const int *slots, const int *ids, int n, float *logits) {
     if (!v41u_rows_wanted(m, slots, n)) return 0;
     Cfg *c = &m->c;
@@ -5297,7 +5305,7 @@ static int v41_rows_chain(Model *m, const int *slots, const int *ids, int n, flo
     if (done) {   /* the head per row, forward_full's arithmetic */
         const double th = now_s();
         float *collapsed = xmalloc((size_t)dim * sizeof(float), "collapsed stream");
-        float *normed = xmalloc((size_t)dim * sizeof(float), "final norm");
+        float *normed = xmalloc((size_t)n * dim * sizeof(float), "final norm");
         for (int t = 0; t < n; t++) {
             const float *mix = pre_mix + (size_t)t * hc;
             for (int i = 0; i < dim; i++) {
@@ -5305,9 +5313,9 @@ static int v41_rows_chain(Model *m, const int *slots, const int *ids, int n, flo
                 for (int copy = 0; copy < hc; copy++) sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
                 collapsed[i] = sum;
             }
-            rms_into(normed, collapsed, m->norm.w, dim, c->norm_eps);
-            mvb(lg + (size_t)t * V, &m->head, normed);
+            rms_into(normed + (size_t)t * dim, collapsed, m->norm.w, dim, c->norm_eps);
         }
+        v41_head_rows(lg, V, &m->head, normed, dim, n);
         free(normed); free(collapsed);
         v41u_rows_head((now_s() - th) * 1e3);
     }
@@ -6807,7 +6815,7 @@ static size_t v41_cu_wb(const WB *w) {
 static void v41_e4_preload_model(Model *m) {
     if (!g_e4_on) return;
     Cfg *c = &m->c;
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; !g_e4_head_only && i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         const W8 *w[] = { &l->wq_a, &l->wq_b, &l->wkv, &l->wo_b, &l->idx_wq_b, &l->sh_w1, &l->sh_w3, &l->sh_w2, &l->eng_wkv };
         for (size_t k = 0; k < sizeof w / sizeof *w; k++) v41_e4_preload(w[k]);
