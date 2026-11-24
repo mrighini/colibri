@@ -2937,6 +2937,105 @@ static void e4t_fastg_k(float *y, int y_row, const float *x, int x_row, int x_gr
         y[(size_t)lane * y_row + o] = v;
     }
 }
+/* e4t_fastob_k: fmt9 for 2..E4T_FAST_ROWS rows, OB outputs a sub-group: a lane loads its 16-column chunk of the rows'
+ * activations once into registers and uses it for OB output rows (e4t_fastk_k reloaded it for every output: DS38/DS41,
+ * ~150 GB/s at 4 rows, L1-bound). KS sub-groups split a row as in e4t_fastk_k; each (output, row)'s partials are added in
+ * g order from local memory: a fixed order, not e4t_fastk_k's bits (another lane-to-chunk map at sub-group 16), held to the
+ * same tolerance. KS is chosen from I alone (>= 2 chunks a lane), so a grouped launch (NG matrices of ol rows, inputs as
+ * slices: e4t_fastg_k's contract) and a launch a matrix give the same bits. COLI_SYCL_E4T_OB=0: e4t_fastk_k / fastg_k. */
+#define E4TOB 4
+template <int SG, int KS>
+static void e4t_fastob_k(float *y, int y_row, const float *x, int x_row, int x_grp, E4tGrp gp, int S, int I, int ol,
+                         int NG, uint8_t *slm) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lane = sg.get_local_linear_id(), sgi = (int)sg.get_group_linear_id();
+    const int slots = (int)(item.get_local_range(2) / SG) / KS, slot = sgi / KS, g = sgi % KS;
+    const int O = NG * ol, o0 = (item.get_group(2) * slots + slot) * E4TOB;
+    const int tiles = I >> 5, nr = S < E4T_FAST_ROWS ? S : E4T_FAST_ROWS;
+    float acc[E4TOB][E4T_FAST_ROWS];
+#pragma unroll
+    for (int j = 0; j < E4TOB; j++)
+#pragma unroll
+        for (int r = 0; r < E4T_FAST_ROWS; r++) acc[j][r] = 0.f;
+    const uint8_t *row[E4TOB], *srow[E4TOB];
+    int xo[E4TOB];
+#pragma unroll
+    for (int j = 0; j < E4TOB; j++) {
+        const int o = o0 + j < O ? o0 + j : O - 1, k = o / ol, oo = o - k * ol;
+        row[j] = gp.q[k] + (size_t)oo * I; srow[j] = gp.sc[k] + (size_t)(oo >> 5) * tiles; xo[j] = k * x_grp;
+    }
+    const bool same = xo[0] == xo[E4TOB - 1];   /* the OB rows in one group: one activation chunk serves them all */
+    for (int c0 = (g * SG + lane) * 16; c0 < I; c0 += KS * SG * 16) {
+        float xv[E4T_FAST_ROWS][16];
+        if (same) {
+#pragma unroll
+            for (int r = 0; r < E4T_FAST_ROWS; r++) {
+                if (r >= nr) break;
+                const sycl::float4 *x4 = (const sycl::float4 *)(x + (size_t)r * x_row + xo[0] + c0);
+#pragma unroll
+                for (int v = 0; v < 4; v++) { const sycl::float4 f = x4[v]; xv[r][4 * v] = f.x(); xv[r][4 * v + 1] = f.y(); xv[r][4 * v + 2] = f.z(); xv[r][4 * v + 3] = f.w(); }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < E4TOB; j++) {
+            if (!same) {
+#pragma unroll
+                for (int r = 0; r < E4T_FAST_ROWS; r++) {
+                    if (r >= nr) break;
+                    const sycl::float4 *x4 = (const sycl::float4 *)(x + (size_t)r * x_row + xo[j] + c0);
+#pragma unroll
+                    for (int v = 0; v < 4; v++) { const sycl::float4 f = x4[v]; xv[r][4 * v] = f.x(); xv[r][4 * v + 1] = f.y(); xv[r][4 * v + 2] = f.z(); xv[r][4 * v + 3] = f.w(); }
+                }
+            }
+            const sycl::uint4 b = *(const sycl::uint4 *)(row[j] + c0);
+            const uint32_t wd[4] = { b.x(), b.y(), b.z(), b.w() };
+            float w[16];
+#pragma unroll
+            for (int c = 0; c < 16; c++) w[c] = e4t_dec((wd[c >> 2] >> ((c & 3) * 8)) & 0xffu);
+            const float tl = sycl::bit_cast<float>((uint32_t)srow[j][c0 >> 5] << 23);
+#pragma unroll
+            for (int r = 0; r < E4T_FAST_ROWS; r++) {
+                if (r >= nr) break;
+                float part = 0.f;
+#pragma unroll
+                for (int v = 0; v < 4; v++)
+                    part += w[4 * v] * xv[r][4 * v] + w[4 * v + 1] * xv[r][4 * v + 1] + w[4 * v + 2] * xv[r][4 * v + 2] + w[4 * v + 3] * xv[r][4 * v + 3];
+                acc[j][r] += part * tl;
+            }
+        }
+    }
+    float *pt = (float *)slm;   /* [slots][KS][OB][rows] */
+#pragma unroll
+    for (int j = 0; j < E4TOB; j++)
+#pragma unroll
+        for (int r = 0; r < E4T_FAST_ROWS; r++) {
+            const float v = sycl::reduce_over_group(sg, acc[j][r], sycl::plus<float>());
+            if (lane == 0) pt[((slot * KS + g) * E4TOB + j) * E4T_FAST_ROWS + r] = v;
+        }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (g == 0 && lane < E4TOB * nr) {
+        const int j = lane / nr, r = lane - j * nr, o = o0 + j;
+        if (o < O) {
+            float v = 0.f;
+#pragma unroll
+            for (int kk = 0; kk < KS; kk++) v += pt[((slot * KS + kk) * E4TOB + j) * E4T_FAST_ROWS + r];
+            y[(size_t)r * y_row + o] = v;
+        }
+    }
+}
+static int e4t_ob_on(void) { const char *e = std::getenv("COLI_SYCL_E4T_OB"); return !(e && *e == '0'); }
+static int e4t_ob_ks(int I) { int ks = 8; while (ks > 1 && I / (16 * 16 * ks) < 2) ks >>= 1; return ks; }
+/* the launch: NG matrices (1: an ungrouped one), outputs O = NG * ol, at sub-group 16 */
+static void e4t_ob_launch(sycl::queue &q, float *y, int y_row, const float *x, int x_row, int x_grp, const E4tGrp &gp, int S,
+                          int I, int ol, int NG) {
+    const int ks = e4t_ob_ks(I), slots = (256 / 16) / ks, O = NG * ol, blocks = (O + E4TOB - 1) / E4TOB;
+    dpct::dim3 grid((unsigned)((blocks + slots - 1) / slots), 1u);
+    const size_t slm = (size_t)(256 / 16) * E4TOB * E4T_FAST_ROWS * sizeof(float);
+    #define E4OB_L(K_) COLI_SG_LAUNCH(q, 16, grid, 256, slm, e4t_fastob_k<SG, K_>(y, y_row, x, x_row, x_grp, gp, S, I, ol, NG, dpct_local))
+    if (ks == 8) E4OB_L(8); else if (ks == 4) E4OB_L(4); else if (ks == 2) E4OB_L(2); else E4OB_L(1);
+    #undef E4OB_L
+}
 extern "C" void *coli_cuda_e4m3t_upload(int device, const unsigned char *q, const unsigned char *s, int O, int I) try {
     if (fault_injected() || !q || !s || O < 1 || I < 32 || (I & 31)) return NULL;
     DeviceContext *ctx = find_ctx(device);
@@ -6172,6 +6271,12 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev,
         static int fast_env = -1;   /* COLI_SYCL_E4T_FAST: 1 (default) the decode rows' fast product (not the CPU's bits), 0 exact */
         if (fast_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_FAST"); fast_env = !(e && *e == '0'); }
         if (fast_env && S <= E4T_FAST_ROWS && ((uintptr_t)dq8 & 15) == 0 && ((uintptr_t)x_dev & 15) == 0) {
+            if (S >= 2 && e4t_ob_on()) {
+                E4tGrp gp1;
+                for (int k = 0; k < E4TG_MAX; k++) { gp1.q[k] = dq8; gp1.sc[k] = ds; }
+                e4t_ob_launch(*st, y_dev, O, x_dev, I, 0, gp1, S, I, O, 1);
+                return cuda_ok(0, "chain e4t ob launch");
+            }
             const int sgw = ctx->sg, nsg = 256 / sgw;
             static int ks_env = -1;
             if (ks_env < 0) { const char *e = std::getenv("COLI_SYCL_E4T_KS"); ks_env = e ? std::atoi(e) : 0; }
@@ -6372,6 +6477,10 @@ extern "C" int coli_cuda_tensor_gemm_grp_async(ColiCudaTensor *const *t, int ng,
     DeviceContext *ctx = find_ctx(dev);
     if (!select_ctx(ctx)) return 0;
     sycl::queue *st = (sycl::queue *)stream;
+    if (S >= 2 && e4t_ob_on()) {
+        e4t_ob_launch(*st, y_dev, y_row, x_dev, x_row, x_grp, gp, S, I, ol, ng);
+        return cuda_ok(0, "chain e4t grouped ob launch") ? 1 : 0;
+    }
     const int sgw = ctx->sg, nsg = 256 / sgw, ks = I / (16 * sgw) >= 8 ? 2 : 1, rows_wg = nsg / ks, O = ng * ol;
     dpct::dim3 grid((unsigned)((O + rows_wg - 1) / rows_wg), 1u);
     const size_t slm = (size_t)nsg * E4T_FAST_ROWS * sizeof(float);

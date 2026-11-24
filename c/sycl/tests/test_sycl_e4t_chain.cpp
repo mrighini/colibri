@@ -139,20 +139,20 @@ static void grouped(int dev, int ng, int ol, int I, int S) {
     for (CcBuf *b : {xb, ga, gb, xg, yg}) T->free(b);
     for (auto *tt : t) coli_cuda_tensor_free(tt);
 }
-static void timed(int dev) {   /* one row, the trunk's shapes, many launches in a frame */
+static void timed(int dev, int S = 1) {   /* S rows, the trunk's shapes, many launches in a frame */
     const int sh[][2] = { {1024, 5120}, {32768, 1024}, {576, 5120}, {1024, 4096}, {5120, 8192}, {2048, 5120}, {5120, 2048} };
     for (auto &p : sh) {
         const int O = p[0], I = p[1], N = 200;
         std::vector<uint8_t> q, s; make(q, s, O, I);
         ColiCudaTensor *t = nullptr;
         require(coli_cuda_tensor_upload_e4t(&t, q.data(), s.data(), O, I, dev), "upload_e4t (timed)");
-        std::vector<float> x(I, 0.25f);
-        CcBuf *xb = up(x), *yb = T->buf((size_t)O * 4, CC_DEV);
+        std::vector<float> x((size_t)S * I, 0.25f);
+        CcBuf *xb = up(x), *yb = T->buf((size_t)S * O * 4, CC_DEV);
         double best = 1e9, sub = 0;
         for (int r = 0; r < 4; r++) {
             auto t0 = std::chrono::steady_clock::now();
             bool ok = T->begin();
-            for (int i = 0; i < N && ok; i++) ok = T->matmul(t, xb, 0, yb, 0, 1);
+            for (int i = 0; i < N && ok; i++) ok = T->matmul(t, xb, 0, yb, 0, S);
             auto t1 = std::chrono::steady_clock::now();
             ok = T->submit(1) && ok;
             require(ok, "timed launches");
@@ -160,7 +160,7 @@ static void timed(int dev) {   /* one row, the trunk's shapes, many launches in 
             if (dt < best) { best = dt; sub = std::chrono::duration<double>(t1 - t0).count() / N; }
         }
         /* host: the launches' own time on the host (enqueue); a product's total at or near it means the host bounds it */
-        std::printf("E4T-TIME O=%d I=%d S=1: %.1f us a product (host enqueue %.1f us), %.0f GB/s of weights\n", O, I,
+        std::printf("E4T-TIME O=%d I=%d S=%d: %.1f us a product (host enqueue %.1f us), %.0f GB/s of weights\n", O, I, S,
                     best * 1e6, sub * 1e6, (double)O * I / best / 1e9);
         std::fflush(stdout);
         T->free(xb); T->free(yb);
@@ -201,10 +201,12 @@ int main(int argc, char **argv) {
     T = coli_cuda_chain_ops();
     require(T && T->size == sizeof(ColiCudaChainOps) && T->init(dev[0]) && T->ready(), "the chain on the device");
     const int sh[][3] = { {64, 32, 1}, {1024, 5120, 1}, {1024, 5120, 4}, {577, 5120, 3}, {32768, 1024, 1}, {576, 5120, 8},
-                          {1024, 4096, 9}, {5120, 8192, 2}, {2048, 5120, 32}, {5120, 2048, 7}, {33, 96, 17} };
+                          {1024, 4096, 9}, {5120, 8192, 2}, {2048, 5120, 32}, {5120, 2048, 7}, {33, 96, 17},
+                          {1024, 4096, 4}, {32768, 1280, 4}, {2304, 5120, 3}, {1027, 2048, 2}, {64, 32, 4} };
     for (auto &p : sh) shape(dev[0], p[0], p[1], p[2]);
     grouped(dev[0], 8, 1024, 4096, 1); grouped(dev[0], 8, 1024, 4096, 4); grouped(dev[0], 3, 64, 96, 2);
     timed(dev[0]);
+    timed(dev[0], 4);
     timed_ref(dev[0]);
     std::printf(fails ? "E4T SUITE FAIL\n" : "E4T SUITE PASS\n");
     return fails ? 1 : 0;
