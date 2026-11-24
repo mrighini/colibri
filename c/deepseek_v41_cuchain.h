@@ -81,6 +81,7 @@ typedef struct {
     unsigned char *cm_dirty;
     float *cm_contrib, *cm_ref, *cm_sc;
     unsigned long long cm_steps, cm_layers, cm_dev_slots, cm_host_slots, cm_reads, cm_checked, cm_route_diff;
+    unsigned long long cm_d2_slots;   /* COLI_VK_DEV2: the misses the second card took (both forms) */
     double cm_dev_ms, cm_host_ms, cm_p2_ms, cm_err_max, cm_err_sum, cm_wdiff;
     double cm_tab_ms, cm_cpu_ms, cm_cnt_ms, cm_wait_ms;   /* cm_wait_ms: the host waiting for the frame's routes */   /* within the above: the tables' refresh, the misses' CPU experts, vkt_dev_count */
     /* V41_CHAIN_ROWS=1 (v41u_forward_rows): a decode step's rows of every active conversation in one
@@ -236,6 +237,9 @@ static void v41u_report(void) {   /* where a chain forward's time went (PLAN-sca
                         "%.2f ms, vkt_dev_count %.2f ms, the host waiting for the routes %.2f ms\n", ch->cm_tab_ms / s, ch->cm_cpu_ms / s,
                 ch->cm_cnt_ms / s, ch->cm_wait_ms / s);
     }
+    if (ch->cm_d2_slots)
+        fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: %llu missed slots on the second card (COLI_VK_DEV2), the CPU beside it\n",
+                ch->cm_d2_slots);
     if (ch->cm_checked)
         fprintf(stderr, "[CUDA] deepseek_v41 chain MoE check: %llu pairs, max rel err %.3g, mean %.3g (the CPU's routing differed "
                         "in %llu, max route weight diff %.3g)\n", ch->cm_checked, ch->cm_err_max, ch->cm_err_sum / (double)ch->cm_checked,
@@ -979,6 +983,33 @@ static int v41u_cmoe_misses(V41U *ch, Model *m, int i, const float *x, const int
     }
     return 1;
 }
+/* COLI_VK_DEV2 (a second card in the tier): the chain's tables name the first card's residents only
+ * (dev_entry), so the second card's are misses here. Those go to the second card as one batch (XT(issue),
+ * every other draw -1) while the CPU computes the rest; taken[d]: not the CPU's. 0 when nothing went. */
+static int v41u_cmoe_d2_issue(Model *m, int i, int S, int K, const float *x, const int *ids, uint8_t *want, uint8_t *taken) {
+    const int draws = S * K;
+    memset(taken, 0, (size_t)draws);
+    if (XT(devices)() < 2) return 0;
+    int idm[4 * CC_ROUTE_KMAX];
+    for (int d = 0; d < draws; d++) idm[d] = want[d] ? ids[d] : -1;
+    const int n = XT(issue)(v41_tier_layer(m, "layers", i), x, S, K, idm, taken);
+    if (n) for (int d = 0; d < draws; d++) if (taken[d]) want[d] = 0;
+    return n;
+}
+/* the second card's rows back (contrib[d * D] = w * row, want[d] set again for the rank-order sum); 0: its batch
+ * failed (the tier goes on without it), the caller computes taken on the CPU */
+static int v41u_cmoe_d2_join(int draws, int D, const float *w, uint8_t *want, const uint8_t *taken, float *contrib) {
+    const float *dv[4 * CC_ROUTE_KMAX];
+    if (!XT(join)(dv)) return 0;
+    for (int d = 0; d < draws; d++) {
+        if (!taken[d]) continue;
+        float *dst = contrib + (size_t)d * D;
+        const float wk = w[d], *src = dv[d];
+        for (int e = 0; e < D; e++) dst[e] = wk * src[e];
+        want[d] = 1;
+    }
+    return 1;
+}
 static void v41u_cmoe_host(V41U *ch, Model *m, int i, const float *x, int *ids, float *w) {
     const int D = m->c.dim, E = ch->cm_E, K = ch->cm_K;
     memcpy(ids, cc_ptr(ch->cm_ids), (size_t)K * sizeof(int));
@@ -999,8 +1030,18 @@ static void v41u_cmoe_host(V41U *ch, Model *m, int i, const float *x, int *ids, 
     if (!nmiss) return;
     const double tc0 = now_s();
     if (ch->cm_batch < 0) { const char *e = getenv("V41_CHAIN_MOE_BATCH"); ch->cm_batch = !(e && *e == '0'); }
-    if (!ch->cm_batch || !v41u_cmoe_misses(ch, m, i, x, ids, w, want))   /* V41_CHAIN_MOE_BATCH=0: one miss at a time */
+    uint8_t taken[CC_ROUTE_KMAX];
+    const int n2 = v41u_cmoe_d2_issue(m, i, 1, K, x, ids, want, taken);
+    int ncpu = 0;
+    for (int k = 0; k < K; k++) ncpu += want[k];
+    if (ncpu && (!ch->cm_batch || !v41u_cmoe_misses(ch, m, i, x, ids, w, want)))   /* V41_CHAIN_MOE_BATCH=0: one miss at a time */
         moe_vk_cpu(m, &m->cache[i], "layers", i, K, x, 1, ids, w, want, ch->cm_contrib);
+    if (n2 && !v41u_cmoe_d2_join(K, D, w, want, taken, ch->cm_contrib)) {
+        if (!ch->cm_batch || !v41u_cmoe_misses(ch, m, i, x, ids, w, taken))
+            moe_vk_cpu(m, &m->cache[i], "layers", i, K, x, 1, ids, w, taken, ch->cm_contrib);
+        for (int k = 0; k < K; k++) want[k] |= taken[k];
+    }
+    ch->cm_d2_slots += (unsigned long long)n2;
     ch->cm_cpu_ms += (now_s() - tc0) * 1e3;
     for (int k = 0; k < K; k++) {   /* rank order, as moe_vk_block's sum */
         if (!want[k]) continue;
@@ -1134,10 +1175,22 @@ static void v41u_cmoe_host_rows(V41U *ch, Model *m, int i, int S, const float *x
     memset(hy, 0, (size_t)S * D * sizeof(float));
     if (!nmiss) return;
     if (ch->cm_batch < 0) { const char *e = getenv("V41_CHAIN_MOE_BATCH"); ch->cm_batch = !(e && *e == '0'); }
-    if (!ch->cm_batch || !v41u_cmoe_misses_rows(ch, m, i, S, x, ids, w, want))
+    uint8_t taken[4 * CC_ROUTE_KMAX];
+    const int n2 = v41u_cmoe_d2_issue(m, i, S, K, x, ids, want, taken);
+    int ncpu = 0;
+    for (int d = 0; d < draws; d++) ncpu += want[d];
+    if (ncpu && (!ch->cm_batch || !v41u_cmoe_misses_rows(ch, m, i, S, x, ids, w, want)))
         for (int r = 0; r < S; r++)
             moe_vk_cpu(m, &m->cache[i], "layers", i, K, x + (size_t)r * D, 1, ids + (size_t)r * K, w + (size_t)r * K, want + (size_t)r * K,
                        ch->rw_contrib + (size_t)r * K * D);
+    if (n2 && !v41u_cmoe_d2_join(draws, D, w, want, taken, ch->rw_contrib)) {
+        if (!ch->cm_batch || !v41u_cmoe_misses_rows(ch, m, i, S, x, ids, w, taken))
+            for (int r = 0; r < S; r++)
+                moe_vk_cpu(m, &m->cache[i], "layers", i, K, x + (size_t)r * D, 1, ids + (size_t)r * K, w + (size_t)r * K,
+                           taken + (size_t)r * K, ch->rw_contrib + (size_t)r * K * D);
+        for (int d = 0; d < draws; d++) want[d] |= taken[d];
+    }
+    ch->cm_d2_slots += (unsigned long long)n2;
     for (int r = 0; r < S; r++)
         for (int k = 0; k < K; k++) {   /* rank order, as moe_vk_block's sum */
             const int d = r * K + k;
