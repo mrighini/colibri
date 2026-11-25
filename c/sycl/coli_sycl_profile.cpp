@@ -579,11 +579,27 @@ void coli_sycl_fprof_frame(double host_ms, double submit_ms, double wait_ms) {
     }
     static long dump_n = -1;   /* COLI_SYCL_FRAME_PROF_DUMP=<n>: the n-th frame of its bucket (default 8) */
     if (dump_n < 0) { const char *e = getenv("COLI_SYCL_FRAME_PROF_DUMP"); dump_n = e && atol(e) > 0 ? atol(e) : 8; }
-    static long dump_c = -1;   /* COLI_SYCL_FRAME_PROF_DUMP_CMDS=<c>: only a frame of c commands */
-    if (dump_c < 0) { const char *e = getenv("COLI_SYCL_FRAME_PROF_DUMP_CMDS"); dump_c = e && atol(e) > 0 ? atol(e) : 0; }
-    if (g_fp->level >= 2 && !g_fp->dumped && b.frames == (unsigned long long)dump_n &&
-        (!dump_c || evs.size() == (size_t)dump_c)) {   /* one frame command by command */
-        g_fp->dumped = 1;
+    /* COLI_SYCL_FRAME_PROF_DUMP_CMDS=<c>[,<c>..]: only a frame of c commands; a list (up to 4): the n-th frame of each
+     * of those counts (a one-row and a batched decode layer's frames in one run). Not set: the first count to get there. */
+    static long dump_cs[4]; static int dump_nc = -1;
+    if (dump_nc < 0) {
+        dump_nc = 0;
+        const char *e = getenv("COLI_SYCL_FRAME_PROF_DUMP_CMDS");
+        while (e && *e && dump_nc < 4) {
+            char *end; const long v = strtol(e, &end, 10);
+            if (end == e) break;
+            if (v > 0) dump_cs[dump_nc++] = v;
+            e = *end == ',' ? end + 1 : end;
+            if (*end != ',') break;
+        }
+    }
+    int want = -1;
+    if (g_fp->level >= 2 && b.frames == (unsigned long long)dump_n) {
+        if (!dump_nc) { if (!g_fp->dumped) want = 0; }
+        else for (int k = 0; k < dump_nc; k++) if (evs.size() == (size_t)dump_cs[k] && !(g_fp->dumped & (1 << k))) want = k;
+    }
+    if (want >= 0) {   /* one frame command by command */
+        g_fp->dumped |= 1 << want;
         std::fprintf(stderr, "[SYCL] frame profile: frame %llu (%zu commands) command by command: index, kind, start (us from the "
                              "frame's first), duration (us), idle before it (us)\n", g_fp->frames, evs.size());
         unsigned long long pe = 0;
