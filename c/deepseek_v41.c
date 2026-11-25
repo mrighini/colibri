@@ -7118,7 +7118,10 @@ static size_t v41_cu_dense_span(const Model *m, int lo, int hi, int head) {
     /* the head: a GGUF's goes up through cud_mm (mvb's V41_CU). The native checkpoint's never does: it is the CPU's, or
      * V41_HEAD_GPU's BF16 copy, up before the tier sizes itself -- counting its f32 rows here (2.47 GiB of V4.1-Flash)
      * left that much of the card empty */
-    size_t b = head && m->head.gx ? v41_cu_wb(&m->head) : 0;
+    /* V41_DENSE_HEAD=1: count it as before (an A/B against runs made with the old budget: 117 experts fewer) */
+    static int old_head = -1;
+    if (old_head < 0) { const char *e = getenv("V41_DENSE_HEAD"); old_head = e && atoi(e) > 0; }
+    size_t b = head && (m->head.gx || old_head) ? v41_cu_wb(&m->head) : 0;
     const int og = m->c.o_groups, ol = m->c.o_lora;
     for (int i = lo; i < hi; i++) {
         const Layer *l = &m->L[i];
@@ -7360,7 +7363,18 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
     if (n > 0) {
         double t0 = now_s();
         static const char *const part[V41_EXPERT_TENSORS] = {"w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale"};
-        #pragma omp parallel for schedule(dynamic, 4)
+        /* V41_WARM_READERS=<n>: the warm start's reader threads. Unset: one an OpenMP thread, each reading an expert
+         * from the disk and uploading it -- the whole team on the disk and the bus at once, the start's burst. A few
+         * readers fill the card as full, later. */
+        const char *wre = getenv("V41_WARM_READERS");
+        int wr = wre && atoi(wre) > 0 ? atoi(wre) : 0;
+#ifdef _OPENMP
+        if (wr < 1 || wr > omp_get_max_threads()) wr = omp_get_max_threads();
+#else
+        (void)wr;
+#endif
+        if (wre && *wre) fprintf(stderr, "%s tier deepseek_v41: warm start with %d readers (V41_WARM_READERS)\n", XT_TAG, wr);
+        #pragma omp parallel for schedule(dynamic, 4) num_threads(wr)
         for (int i = 0; i < n; i++) {
             if (m->gx) {   /* a GGUF's: the file's rows */
                 uint8_t *rows = NULL;
