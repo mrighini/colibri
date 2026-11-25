@@ -7765,6 +7765,8 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    v41_amx_warm();   /* V41_AMX_WARM: the first AMX use as a ramp, after the tier's fill and before anything is served */
+
     if (getenv("SERVE") && atoi(getenv("SERVE"))) {
         /* unbuffered, as qwen36/qwen38: serve_mux asks select() whether a command waits
          * (coli_serve_stdin_ready), and select cannot see commands stdio already read

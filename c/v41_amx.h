@@ -192,6 +192,71 @@ static int v41_amx_gemm(float *y, int ystride, const float *x, int xstride, int 
     return 1;
 }
 
+/* V41_AMX_WARM (default on where V41_AMX is): the process's first AMX use as a ramp, before the engine is ready and
+ * with nothing else in flight. v41_amx_on is lazy, so without this the first prompt pass is at once the request to the
+ * kernel for the tile state, every thread's first tile instruction (the kernel grows each thread's state there) and
+ * every core's step to its AMX power level, in the second of the card's first uploads: the instant the host's CPU
+ * errors of 2026-11-24/25 fell on (the logs of three of the four end at the V41_AMX line). Here the same tile task runs
+ * on private scratch on 1, 2, 4, .. V41_AMX_WARM_STEP (8) threads, then STEP more a step up to all of them,
+ * V41_AMX_WARM_MS (150) each with V41_AMX_WARM_PAUSE_MS (100) between; a flushed line a step, so a log shows how far
+ * it came. No result is used. V41_AMX_WARM=0: off (the first prompt pass is the first use, as before). */
+static void v41_amx_warm(void) {
+    const char *e = getenv("V41_AMX_WARM");
+    if (e && *e == '0') return;
+    const int mode = v41_amx_on();
+    if (!mode) return;
+    const char *ms_e = getenv("V41_AMX_WARM_MS"), *pz_e = getenv("V41_AMX_WARM_PAUSE_MS"), *st_e = getenv("V41_AMX_WARM_STEP");
+    int ms = ms_e && atoi(ms_e) > 0 ? atoi(ms_e) : 150, pz = pz_e && *pz_e ? atoi(pz_e) : 100, step = st_e && atoi(st_e) > 0 ? atoi(st_e) : 8;
+    if (ms > 5000) ms = 5000;
+    if (pz < 0) pz = 0;
+    if (pz > 5000) pz = 5000;
+    enum { WI = 1024, WS = 32 };   /* a pass: 32 outputs x 1024 inputs x 32 rows */
+    const int nth = omp_get_max_threads();
+    const size_t xn = (size_t)WS * WI;
+    uint16_t *xh = aligned_alloc(64, xn * 2), *xl = mode == 2 ? aligned_alloc(64, xn * 2) : NULL;
+    if (!xh || (mode == 2 && !xl)) { free(xh); free(xl); return; }
+    for (size_t i = 0; i < xn; i++) {
+        xh[i] = v41_f2bf((float)((int)(i % 13) - 6) * 0.125f);
+        if (xl) xl[i] = v41_f2bf((float)((int)(i % 7) - 3) * 0x1p-12f);
+    }
+    const double t0 = now_s();
+    fprintf(stderr, "[v41] AMX warm-up (V41_AMX_WARM): the tile products on 1 to %d threads, %d ms a step, %d ms between, "
+            "before the engine is ready\n", nth, ms, pz);
+    fflush(stderr);
+    for (int k = 1;;) {
+        double flop = 0;
+        int used = 0;
+        const double ts = now_s();
+        #pragma omp parallel num_threads(k) reduction(+:flop) reduction(+:used)
+        {
+            uint16_t *ws = aligned_alloc(64, (size_t)WI * 64);
+            float *y = aligned_alloc(64, (size_t)WS * 32 * sizeof(float));
+            if (ws && y) {
+                for (int i = 0; i < WI * 32; i++) ws[i] = v41_f2bf((float)((i % 11) - 5) * 0.25f);
+                v41_amx_cfg();
+                do {
+                    v41_amx_task(y, 32, xh, xl, WS, WI, 32, ws, 0, 0, WS);
+                    flop += 2.0 * WS * WI * 32 * (mode == 2 ? 2 : 1);
+                } while ((now_s() - ts) * 1e3 < ms);
+                v41_amx_release();
+                used = 1;
+            }
+            free(ws); free(y);
+        }
+        const double dt = now_s() - ts;
+        fprintf(stderr, "[v41] AMX warm-up: %d of %d threads, %.0f ms, %.1f GFLOP/s\n", used, nth, dt * 1e3,
+                dt > 0 ? flop / dt * 1e-9 : 0.0);
+        fflush(stderr);
+        if (k >= nth) break;
+        k = k < step ? k * 2 : k + step;
+        if (k > nth) k = nth;
+        if (pz) usleep((useconds_t)pz * 1000);
+    }
+    fprintf(stderr, "[v41] AMX warm-up done in %.2f s\n", now_s() - t0);
+    fflush(stderr);
+    free(xh); free(xl);
+}
+
 /* vectorized decoders' pieces (AVX-512F/BW): 16 floats that bf16 holds exactly -> their top halves */
 __attribute__((target("avx512f,avx512bw"))) static inline void v41_amx_st16(uint16_t *d, __m512 v) {
     _mm256_storeu_si256((__m256i *)d, _mm512_cvtepi32_epi16(_mm512_srli_epi32(_mm512_castps_si512(v), 16)));
@@ -256,4 +321,5 @@ static void v41_amx_dec_bf16(const void *ctx, int o0, int O, int I, uint16_t *ds
 }
 #else
 #define V41_AMX_HAVE 0
+static inline void v41_amx_warm(void) {}
 #endif
