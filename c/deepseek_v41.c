@@ -7119,14 +7119,22 @@ static size_t v41_cu_dense_span(const Model *m, int lo, int hi, int head) {
      * V41_HEAD_GPU's BF16 copy, up before the tier sizes itself -- counting its f32 rows here (2.47 GiB of V4.1-Flash)
      * left that much of the card empty */
     size_t b = head && m->head.gx ? v41_cu_wb(&m->head) : 0;
+    const int og = m->c.o_groups, ol = m->c.o_lora;
     for (int i = lo; i < hi; i++) {
         const Layer *l = &m->L[i];
-        b += v41_cu_w8(&l->wq_a) + v41_cu_w8(&l->wq_b) + v41_cu_w8(&l->wkv) + v41_cu_w8(&l->wo_a) +
+        /* wo_a as the chain uploads it: its output groups, a matrix each (v41u_woa). A fmt 9 matrix carries a table and
+         * its own rows of tiles, so the groups take more than the one matrix (7 KiB a layer of V4.1-Flash): with the head
+         * out of the count that was the budget's last matrices refused, the routed experts back on the host */
+        size_t woa = v41_cu_w8(&l->wo_a);
+        if (woa && !l->wo_a.gx && og > 1 && ol > 0 && l->wo_a.O == og * ol) woa = (size_t)og * cud_bytes(9, ol, l->wo_a.I, 0);
+        b += v41_cu_w8(&l->wq_a) + v41_cu_w8(&l->wq_b) + v41_cu_w8(&l->wkv) + woa +
              v41_cu_w8(&l->wo_b) + v41_cu_w8(&l->idx_wq_b) + v41_cu_w8(&l->sh_w1) + v41_cu_w8(&l->sh_w3) +
              v41_cu_w8(&l->sh_w2) + v41_cu_w8(&l->eng_wkv) + v41_cu_wb(&l->comp_wkv) + v41_cu_wb(&l->comp_wgate) +
              v41_cu_wb(&l->idx_wk) + v41_cu_wb(&l->idx_wproj) + v41_cu_wb(&l->gate_w);
     }
-    return b;
+    /* and a margin: a matrix the count misses by a little must not turn the chain off on a card with gigabytes free
+     * (less than an expert of the tier's) */
+    return b ? b + ((size_t)8 << 20) : 0;
 }
 static size_t v41_cu_dense_bytes(const Model *m) { return v41_cu_dense_span(m, 0, m->c.n_layers, 1); }
 static size_t g_v41_cud2;   /* V41_CHAIN_SPLIT: the room the second device's layers' matrices take there */
