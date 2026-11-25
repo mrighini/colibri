@@ -75,6 +75,8 @@ struct CcSync {
     sycl::event up_ev[CC_UP_MARKS];       /* host_up: the copies' marks, a ring on the copy queue */
     sycl::event up_after;                 /* the frame's point a host_up waits for */
     sycl::event stg_ev[CC_STAGE_N];       /* cc_write: the copy that last read each staging slot */
+    sycl::event mark;                     /* cc_mark: the point of the open frame the host asks about (cc_reached) */
+    int mark_set = 0;
 };
 struct CcCtx {
     int device, up, lost, in_frame;
@@ -224,6 +226,11 @@ __attribute__((noinline)) static float cc_rstd(float ss, float n, float eps) {
     const float ms = n > 0.f ? ss / n : ss;
     return sycl::rsqrt(ms + eps);
 }
+/* NV: the elements a work-item holds in registers (D <= 256 NV). 8 is the kernel as it was (up to 2048 a row, longer
+ * rows through the loops); 20 takes a row of up to 5120 the same way (DeepSeek V4.1's two FFN/attention input norms a
+ * layer, D 5120: 25 us a launch through the loops against 6 us for the short rows, DS48's frame profile) -- the values,
+ * the order of the sum and the products are the loops', so the bits are. COLI_SYCL_NORM_NV=8: as before. */
+template <int NV>
 static void cc_norm_k(const float *__restrict__ x, const float *__restrict__ w,
                       float *__restrict__ y, CcNorm p) {
     auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -242,17 +249,17 @@ static void cc_norm_k(const float *__restrict__ x, const float *__restrict__ w,
     /* up to 2048 a row: x and the weights in registers, loaded together before the sum (the
      * weights used to be read after it, a second trip to memory on the step's path); the same
      * values in the same order, so the same bits */
-    const bool fit = p.D <= 8 * 256;
-    float xv[8], wv8[8];
+    const bool fit = p.D <= NV * 256;
+    float xv[NV], wv8[NV];
     if (fit) {
         #pragma unroll
-        for (int k = 0; k < 8; k++) {
+        for (int k = 0; k < NV; k++) {
             const int i = tid + 256 * k;
             xv[k] = i < p.D ? x[xb + i] : 0.f;
             wv8[k] = wt && i < p.D ? w[wb + i] : 0.f;
         }
         #pragma unroll
-        for (int k = 0; k < 8; k++)
+        for (int k = 0; k < NV; k++)
             if (tid + 256 * k < p.D) { float v = pre ? xv[k] * wv8[k] : xv[k]; acc += v * v; }
     } else
         for (int i = tid; i < p.D; i += 256) { float v = pre ? x[xb + i] * w[wb + i] : x[xb + i]; acc += v * v; }
@@ -265,7 +272,7 @@ static void cc_norm_k(const float *__restrict__ x, const float *__restrict__ w,
     float r = cc_rstd(red[0], (p.flags & 4) ? 0.f : (float)p.D, p.eps);   /* the .cu's 1.f / sqrtf, see cc_rstd */
     if (fit) {
         #pragma unroll
-        for (int k = 0; k < 8; k++) {
+        for (int k = 0; k < NV; k++) {
             const int i = tid + 256 * k;
             if (i >= p.D) continue;
             float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + wv8[k] : wv8[k]);
@@ -2371,12 +2378,17 @@ static int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf
     if (coli_sycl_fprof_flag) coli_sycl_fprof_name("matmul_glu");
     return 1;
 }
+static int cc_norm_nv20(void) {   /* read at each launch: the test runs both kernels in one process */
+    const char *e = getenv("COLI_SYCL_NORM_NV");
+    return !(e && atoi(e) == 8);
+}
 static int cc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
     CcCtx *c = live();
     if (!c || !x || !y || !p || p->nseg < 1 || p->D < 1 || p->per_row < 1) return 0;
     if (!(p->flags & CC_NORM_NOW) && !w) return 0;
     const float *xp = fp(x), *wp = fp(w); float *yp = fpw(y); const CcNorm pp = *p;
-    CC_K(c, dim3(grid1((size_t)p->nseg, 1)), 256, cc_norm_k(xp, wp, yp, pp));
+    if (p->D > 8 * 256 && p->D <= 20 * 256 && cc_norm_nv20()) CC_K(c, dim3(grid1((size_t)p->nseg, 1)), 256, cc_norm_k<20>(xp, wp, yp, pp));
+    else CC_K(c, dim3(grid1((size_t)p->nseg, 1)), 256, cc_norm_k<8>(xp, wp, yp, pp));
     return launched(c, "norm");
 }
 static int cc_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
@@ -3175,6 +3187,31 @@ static int cc_wait_host(CcBuf *flag, size_t word, unsigned v) {
     const auto state = coli_sycl_host_state(c->device);
     (void)cc_try(c, "wait host", [&] { coli_sycl_fprof_ev(c->stream->submit([=](sycl::handler &h) { h.host_task([=] { state->wait(f, v); }); })); });
     return launched(c, "wait host");
+}
+/* mark / reached (DS52): the hybrid step's "the routes are down" without a host task. cc_signal's host task holds every
+ * later command of the in-order queue until the runtime has seen the routes' kernel end, run the task and released them:
+ * the card sat idle 20-100 us a layer between the router and the resident experts (DS48's frame profile), and the host
+ * learned of the routes only through that hop. A mark is a barrier event at this point of the frame -- complete once
+ * every earlier command is, exactly what the host task waited for -- and holds nothing: the frame's later commands
+ * follow at once, and the host asks the event's status (reached: 1 complete, 0 not yet, -1 lost or no mark). No device
+ * access to host memory beyond the kernels' own stores, no atomics, no kernel that waits: the contract above stands.
+ * The rows the kernels before the mark wrote to DOWN memory are there when it is complete (their events completed). */
+static int cc_mark(void) {
+    CcCtx *c = live();
+    if (!c) return 0;
+    if (!cc_try(c, "mark", [&] { c->sy->mark = c->stream->ext_oneapi_submit_barrier(); })) return 0;
+    if (coli_sycl_fprof_flag) { coli_sycl_fprof_ev(c->sy->mark); coli_sycl_fprof_name("mark"); }
+    c->sy->mark_set = 1;
+    return 1;
+}
+static int cc_reached(void) {
+    CcCtx *c = live();
+    if (!c || !c->sy->mark_set) return -1;
+    int done = 0;
+    if (!cc_try(c, "mark status", [&] {
+            done = c->sy->mark.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete; }))
+        return -1;
+    return done;
 }
 static int cc_moe_stage_op(CcBuf *b, size_t slot_bytes, int slots) {
     CcCtx *c = live();
@@ -3990,5 +4027,7 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_attn_h_mx, cc_copy_regions_h_mx,
     cc_matmul_grp,
     cc_ds_attn_rows,
+    cc_moe_tail,
+    cc_mark, cc_reached,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

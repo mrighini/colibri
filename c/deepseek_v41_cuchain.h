@@ -82,6 +82,7 @@ typedef struct {
     float *cm_contrib, *cm_ref, *cm_sc;
     unsigned long long cm_steps, cm_layers, cm_dev_slots, cm_host_slots, cm_reads, cm_checked, cm_route_diff;
     unsigned long long cm_d2_slots;   /* COLI_VK_DEV2: the misses the second card took (both forms) */
+    unsigned long long cm_tails;      /* V41_CHAIN_TAIL: layer steps whose last frame was one launch (cc_moe_tail) */
     double cm_dev_ms, cm_host_ms, cm_p2_ms, cm_err_max, cm_err_sum, cm_wdiff;
     double cm_tab_ms, cm_cpu_ms, cm_cnt_ms, cm_wait_ms;   /* cm_wait_ms: the host waiting for the frame's routes */   /* within the above: the tables' refresh, the misses' CPU experts, vkt_dev_count */
     /* V41_CHAIN_ROWS=1 (v41u_forward_rows): a decode step's rows of every active conversation in one
@@ -89,6 +90,7 @@ typedef struct {
     unsigned long long rw_steps, rw_rows, rw_fallbacks, rw_layers, rw_dev_slots, rw_host_slots;
     unsigned long long rw_checked_steps, rw_checked_rows;
     double rw_dev_ms, rw_host_ms, rw_p2_ms, rw_book_ms, rw_head_ms, rw_fwd_ms, rw_err_max, rw_err_sum;
+    double rw_wait_ms;   /* within rw_dev_ms: the host waiting for the frame's routes */
     float *rw_mbuf, *rw_contrib;   /* the rows' host misses: [pair][gate I | up I] then [pair][D]; [row * K + k][D] */
 } V41U;
 static V41U *g_v41u;
@@ -217,6 +219,29 @@ static int v41u_min_rows(void) {
 static int v41u_slots_ok(void) { return g_v41_mux_slots <= 1 || v41u_min_rows() == 1; }
 /* the native checkpoint the chain takes: its W8 are e4m3 with tiles (not a GGUF's blocks) */
 static int v41u_native(const Model *m) { return !m->gguf && m->c.n_layers > 0 && !m->L[0].wq_a.gx && m->L[0].wq_a.s; }
+/* DS52 (the layer frame's idle card, PROFILE DS48: one gap a layer, the card waiting for the host's misses, and the
+ * frame after it a command at a time). Three switches, each the same arithmetic in another order or launch:
+ *   V41_CHAIN_SHARED_LATE (default 1)  the router and its word BEFORE the shared expert: the host's misses start a
+ *       shared expert earlier (3 products and the SwiGLU, 0.09 ms a layer on one row, 0.25 on four), the card runs it
+ *       and the residents meanwhile. 0: the shared expert first, as before.
+ *   V41_CHAIN_TAIL (default 1)  the layer's last frame -- the residents' sum, the FFN add, the streams' write back --
+ *       in one launch (cc_moe_tail) where the backend has it; each command of that frame waited for the host's submit
+ *       with the card idle. 0: cc_moe parts 2, ew ADD, mhc POST.
+ *   V41_CHAIN_DIRECT (default 1)  a decode step's one row keeps its streams, mixes and shared branch in the layer's
+ *       buffers from frame to frame: the nine copies a layer to and from the segment's stash (lw_xs, lw_hp, lw_ds:
+ *       what a prompt's chunks need, one row does not) are not made. 0: as before. */
+static int v41u_env01(const char *name, int def) { const char *e = getenv(name); return e && *e ? *e != '0' : def; }
+static int v41u_shared_late(void) { static int v = -1; if (v < 0) v = v41u_env01("V41_CHAIN_SHARED_LATE", 1); return v; }
+static int v41u_tail_on(void) { static int v = -1; if (v < 0) v = v41u_env01("V41_CHAIN_TAIL", 1); return v; }
+static int v41u_direct_on(void) { static int v = -1; if (v < 0) v = v41u_env01("V41_CHAIN_DIRECT", 1); return v; }
+/*   V41_CHAIN_MARK (default 0, DS52's opt-in)  "the routes are down" as a mark the host polls (cc_mark / cc_reached)
+ *       in place of cc_signal's host task, which held the frame's later commands until the runtime had run it. */
+static int v41u_mark_on(void) { static int v = -1; if (v < 0) v = v41u_env01("V41_CHAIN_MARK", 0) && cc_mark_ready(); return v; }
+/* the open frame's routes are down (their rows and h2d in DOWN memory): 1; 0 not yet; -1 a lost device */
+static int v41u_routes_down(const V41U *ch) {
+    if (v41u_mark_on()) return cc_reached();
+    return *(volatile unsigned *)cc_ptr(ch->cm_flag) >= ch->cm_seq;
+}
 static void v41u_report(void) {   /* where a chain forward's time went (PLAN-scale S3) */
     { const char *fp = getenv("COLI_SYCL_FRAME_PROF"); if (fp && *fp && strcmp(fp, "0")) cc_shutdown(); }   /* its per-command books, printed once */
     const V41U *ch = g_v41u;
@@ -240,6 +265,13 @@ static void v41u_report(void) {   /* where a chain forward's time went (PLAN-sca
     if (ch->cm_d2_slots)
         fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: %llu missed slots on the second card (COLI_VK_DEV2), the CPU beside it\n",
                 ch->cm_d2_slots);
+    if (ch->cm_layers || ch->rw_steps)   /* DS52's switches as this run had them (deepseek_v41_cuchain.h, v41u_shared_late) */
+        fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: the routes %s the shared expert (V41_CHAIN_SHARED_LATE), the last frame in one "
+                        "launch for %llu layer steps (V41_CHAIN_TAIL %d), one row's streams %s (V41_CHAIN_DIRECT)\n",
+                v41u_shared_late() ? "before" : "after", ch->cm_tails, v41u_tail_on(), v41u_direct_on() ? "in place" : "through the stash");
+    if (ch->cm_layers || ch->rw_steps)
+        fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: the routes' word %s (V41_CHAIN_MARK); batched steps: the host waited %.2f ms a "
+                        "step for the routes\n", v41u_mark_on() ? "a mark the host polls" : "a host task", ch->rw_steps ? ch->rw_wait_ms / (double)ch->rw_steps : 0.0);
     if (ch->cm_checked)
         fprintf(stderr, "[CUDA] deepseek_v41 chain MoE check: %llu pairs, max rel err %.3g, mean %.3g (the CPU's routing differed "
                         "in %llu, max route weight diff %.3g)\n", ch->cm_checked, ch->cm_err_max, ch->cm_err_sum / (double)ch->cm_checked,
@@ -890,7 +922,7 @@ static CcMoe v41u_cmoe_args_s(const V41U *ch, const Model *m, int i, int parts, 
 static CcMoe v41u_cmoe_args(const V41U *ch, const Model *m, int i, int parts) { return v41u_cmoe_args_s(ch, m, i, parts, 1); }
 /* layer i's router and resident experts, appended to the open attention+shared frame (nrm: the
  * normalized FFN input the host step reads as h2d) */
-static int v41u_cmoe_dev_s(V41U *ch, Model *m, int i, int S) {   /* nrm's S rows (V41_CHAIN_ROWS: every conversation's) */
+static int v41u_cmoe_route_s(V41U *ch, Model *m, int i, int S) {   /* nrm's S rows (V41_CHAIN_ROWS: every conversation's) */
     const Cfg *c = &m->c;
     const int E = ch->cm_E, K = ch->cm_K;
     CcRoute r;
@@ -901,13 +933,25 @@ static int v41u_cmoe_dev_s(V41U *ch, Model *m, int i, int S) {   /* nrm's S rows
     r.n_group = 0; r.topk_group = 0;
     r.norm = c->norm_topk_prob && K > 1 ? 1 : 0;   /* moe_gate: by the sum + 1e-20 only with norm_topk_prob */
     r.temp = c->gate_temp; r.scale = c->route_scale; r.norm_eps = 1e-20f;
-    CcMoe p = v41u_cmoe_args_s(ch, m, i, 1, S);
-    /* the routes down, then the word: the host's misses run while cc_moe parts 1 computes the resident experts */
+    /* the routes down, then the word: the host's misses run while the frame's later ops compute */
     return cc_matmul(ch->cm_gate[i], ch->nrm, 0, ch->cm_lg, 0, S) && cc_route(ch->cm_lg, ch->cm_bias, ch->cm_ids, ch->cm_w, &r) &&
-           cc_signal(ch->cm_flag, 0, ++ch->cm_seq) &&
-           cc_moe(ch->cm_tab, ch->nrm, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_y, ch->cm_hy, &p);
+           (v41u_mark_on() ? cc_mark() : cc_signal(ch->cm_flag, 0, ++ch->cm_seq));
 }
+static int v41u_cmoe_res_s(V41U *ch, Model *m, int i, int S) {   /* the resident experts (cc_moe parts 1) */
+    CcMoe p = v41u_cmoe_args_s(ch, m, i, 1, S);
+    return cc_moe(ch->cm_tab, ch->nrm, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_y, ch->cm_hy, &p);
+}
+static int v41u_cmoe_dev_s(V41U *ch, Model *m, int i, int S) { return v41u_cmoe_route_s(ch, m, i, S) && v41u_cmoe_res_s(ch, m, i, S); }
 static int v41u_cmoe_dev(V41U *ch, Model *m, int i) { return v41u_cmoe_dev_s(ch, m, i, 1); }
+/* the last frame's three ops in one launch: 1 done (the streams swapped, as v41u_post leaves them), else not taken */
+static int v41u_tail(V41U *ch, Model *m, const CcMoe *p2, CcBuf *hp, int n) {
+    Cfg *c = &m->c; const int H = c->hc_mult, D = c->dim, HD = H * D, hr = 2 * H + H * H;
+    CcMhc po = {n, H, D, c->hc_iters, 0, HD, 0, D, 0, hr, 0, HD, 0, 0, c->norm_eps, c->hc_eps, 0.f};
+    if (cc_moe_tail(ch->cm_tab, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_hy, ch->cm_y, ch->ds, ch->br, ch->xs, hp, ch->xn, p2, &po) <= 0) return 0;
+    CcBuf *t = ch->xs; ch->xs = ch->xn; ch->xn = t;
+    ch->cm_tails++;
+    return 1;
+}
 /* The host's part of layer i after the device's frame: the routing it made (ids, w back to the
  * host), the misses -- slots whose expert the device's table does not hold -- on the CPU
  * (moe_vk_cpu: w * expert(x) per slot, through the expert cache, each passed to the tier as
@@ -1306,8 +1350,11 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     }
 #endif
     (void)cmoe;
+    /* V41_CHAIN_DIRECT: a decode step's one row (one chunk of one segment) keeps its streams in the layer's buffers */
+    const int direct = n == 1 && v41u_direct_on();
     for (int s0 = 0; ok && !stopped && s0 < n; s0 += per) {   /* a segment's rows through every layer */
         const int se = s0 + per < n ? s0 + per : n;
+        int loaded = 0;   /* direct: the row's streams and mixes are in xs and hpf (from the first layer's frame on) */
         f.s0 = s0;
         for (int c0 = s0; ok && c0 < se; c0 += rows) {   /* its streams, a chunk at a time */
             const int nr = se - c0 < rows ? se - c0 : rows;
@@ -1337,33 +1384,50 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
                 const int nr = se - c0 < rows ? se - c0 : rows, pb = start + c0, lc = c0 - s0;
                 f.pb = pb; f.nr = nr; f.lo = c0 * LR;
                 v41u_chunk_tables(ch, m, start, pb, nr, f.csB, cs_, wl);   /* the RoPE rows (the list's window half is up) */
-                ok = cc_begin() && cc_write(ch->cs, 0, cs_, (size_t)(f.csB + (nr + ch->rmax - 1) * rd) * sizeof(float)) &&
-                     cc_copy(ch->xs, 0, ch->lw_xs, (size_t)lc * HD, (size_t)nr * HD) && cc_copy(ch->hpf, 0, ch->lw_hp, (size_t)lc * hr, (size_t)nr * hr);
+                ok = cc_begin() && cc_write(ch->cs, 0, cs_, (size_t)(f.csB + (nr + ch->rmax - 1) * rd) * sizeof(float));
+                if (ok && (!direct || !loaded)) {   /* the chunk's streams and mixes from the stash (direct: the row's, once) */
+                    ok = cc_copy(ch->xs, 0, ch->lw_xs, (size_t)lc * HD, (size_t)nr * HD) && cc_copy(ch->hpf, 0, ch->lw_hp, (size_t)lc * hr, (size_t)nr * hr);
+                    loaded = 1;
+                }
                 if (ok && l->engram_index >= 0) ok = v41u_engram(ch, m, i, nr, pb, er);
                 ok = ok && v41u_pre(ch, m, ch->fna[i], ch->o_hca[i], ch->hpa, ch->hpf, ch->o_an[i], nr) &&
                      v41u_attention(ch, m, i, &f) && v41u_post(ch, m, ch->hpa, nr) &&
                      v41u_pre(ch, m, ch->fnf[i], ch->o_hcf[i], ch->hpf, ch->hpa, ch->o_fn[i], nr) &&
-                     cc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D) && v41u_shared(ch, m, l, nr) &&
-                     cc_copy(ch->lw_xs, (size_t)lc * HD, ch->xs, 0, (size_t)nr * HD) && cc_copy(ch->lw_hp, (size_t)lc * hr, ch->hpf, 0, (size_t)nr * hr) &&
-                     cc_copy(ch->lw_ds, (size_t)lc * D, ch->ds, 0, (size_t)nr * D);
+                     cc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)nr * D);
+                /* the shared expert, then the chunk's streams, mixes and shared branch to the stash (direct: they stay where they are) */
+#define V41U_SHARED_STASH() (v41u_shared(ch, m, l, nr) && \
+                     (direct || (cc_copy(ch->lw_xs, (size_t)lc * HD, ch->xs, 0, (size_t)nr * HD) && \
+                                 cc_copy(ch->lw_hp, (size_t)lc * hr, ch->hpf, 0, (size_t)nr * hr) && \
+                                 cc_copy(ch->lw_ds, (size_t)lc * D, ch->ds, 0, (size_t)nr * D))))
+                int shared_done = 0;
 #if V41U_CMOE
                 /* the router and the resident experts in the same frame; refused (not a lost device): the host step from here on */
-                if (ok && cmoe && !v41u_cmoe_dev(ch, m, i)) {
-                    if (cc_lost()) ok = 0;
-                    else { v41u_cmoe_off(ch, "the device's router or experts refused (cc_matmul/cc_route/cc_moe parts 1)"); cmoe = 0; }
+                if (ok && cmoe) {
+                    int r;
+                    if (v41u_shared_late()) {   /* the routes and their word first: the shared expert and the residents run beside the host's misses */
+                        r = v41u_cmoe_route_s(ch, m, i, 1);
+                        if (r) { shared_done = 1; ok = V41U_SHARED_STASH(); r = ok && v41u_cmoe_res_s(ch, m, i, 1); }
+                    } else { shared_done = 1; ok = V41U_SHARED_STASH(); r = ok && v41u_cmoe_dev(ch, m, i); }
+                    if (ok && !r) {
+                        if (cc_lost()) ok = 0;
+                        else { v41u_cmoe_off(ch, "the device's router or experts refused (cc_matmul/cc_route/cc_moe parts 1)"); cmoe = 0; }
+                    }
                 }
 #endif
+                if (ok && !shared_done) ok = V41U_SHARED_STASH();
+#undef V41U_SHARED_STASH
 #if V41U_CMOE
                 if (cmoe) {   /* the frame left running: its word says the routes (and h2d, copied before them) are down */
                     ok = ok && cc_submit(0);
                     if (ok) {
                         const double tw = now_s();
-                        volatile unsigned *fw = (volatile unsigned *)cc_ptr(ch->cm_flag);
-                        for (unsigned long spin = 0; *fw < ch->cm_seq; spin++)
+                        int rd = 0;
+                        for (unsigned long spin = 0; (rd = v41u_routes_down(ch)) == 0; spin++)
                             if ((spin & 0xFFFFu) == 0 && (cc_lost() || now_s() - tw > 60.0)) {
                                 fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: the device did not reach layer %d's routes in 60 s\n", i);
                                 ok = 0; break;
                             }
+                        if (rd < 0) ok = 0;
                         ch->cm_wait_ms += (now_s() - tw) * 1e3;
                     }
                 } else
@@ -1393,13 +1457,22 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
                 const int nr = se - c0 < rows ? se - c0 : rows, lc = c0 - s0;
                 CcBuf *rin = ch->routed;   /* the routed row the add reads: the host's, or the device's y */
                 CcEw add = {CC_EW_ADD, nr * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+                int tailed = 0, restored = 0;
                 ok = 1;
+/* the chunk's streams, mixes and shared branch back from the stash (direct: they never left) */
+#define V41U_RESTORE() (direct || (cc_copy(ch->xs, 0, ch->lw_xs, (size_t)lc * HD, (size_t)nr * HD) && \
+                     cc_copy(ch->hpf, 0, ch->lw_hp, (size_t)lc * hr, (size_t)nr * hr) && cc_copy(ch->ds, 0, ch->lw_ds, (size_t)lc * D, (size_t)nr * D)))
 #if V41U_CMOE
                 if (cmoe) {   /* y = hy + the resident slots' w * down in rank order (cc_moe parts 2), then the add from y */
                     CcMoe p2 = v41u_cmoe_args(ch, m, i, 2);
                     cm_checked = ch->cm_check > 0;
                     ok = cc_begin();
-                    if (ok && cc_moe(ch->cm_tab, ch->nrm, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_y, ch->cm_hy, &p2) &&
+                    if (ok && !cm_checked && v41u_tail_on()) {   /* that, the add and the write back in one launch (a checked step: the three ops) */
+                        ok = V41U_RESTORE(); restored = 1;
+                        if (ok && v41u_tail(ch, m, &p2, ch->hpf, nr)) { tailed = 1; rin = ch->cm_y; }
+                    }
+                    if (tailed) ;
+                    else if (ok && cc_moe(ch->cm_tab, ch->nrm, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_y, ch->cm_hy, &p2) &&
                         (!cm_checked || cc_copy(ch->cm_yd, 0, ch->cm_y, 0, (size_t)D))) rin = ch->cm_y;
                     else if (ok) {   /* refused: this layer's routed row from moe_run_at after all, the host step from here on */
                         ok = !cc_lost() && cc_submit(1);
@@ -1415,10 +1488,10 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
                     memcpy(cc_ptr(ch->routed), ch->lw_out + (size_t)lc * D, (size_t)nr * D * sizeof(float));
                     ok = cc_begin();
                 }
-                ok = ok && cc_copy(ch->xs, 0, ch->lw_xs, (size_t)lc * HD, (size_t)nr * HD) &&
-                     cc_copy(ch->hpf, 0, ch->lw_hp, (size_t)lc * hr, (size_t)nr * hr) && cc_copy(ch->ds, 0, ch->lw_ds, (size_t)lc * D, (size_t)nr * D) &&
-                     cc_ops()->ew(ch->br, rin, ch->ds, NULL, NULL, &add) && v41u_post(ch, m, ch->hpf, nr) &&
-                     cc_copy(ch->lw_xs, (size_t)lc * HD, ch->xs, 0, (size_t)nr * HD) && cc_submit(1);
+                if (ok && !restored) ok = V41U_RESTORE();
+                if (!tailed) ok = ok && cc_ops()->ew(ch->br, rin, ch->ds, NULL, NULL, &add) && v41u_post(ch, m, ch->hpf, nr);
+                ok = ok && (direct || cc_copy(ch->lw_xs, (size_t)lc * HD, ch->xs, 0, (size_t)nr * HD)) && cc_submit(1);
+#undef V41U_RESTORE
             }
             ch->ffn_ms += (now_s() - tf) * 1e3;
 #if V41U_CMOE
@@ -1439,8 +1512,8 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         for (int c0 = s0; ok && !stopped && c0 < se; c0 += rows) {
             const int nr = se - c0 < rows ? se - c0 : rows, last = c0 + nr == n;
             if (!all && !last) continue;
-            ok = cc_begin() && cc_copy(ch->xd, 0, ch->lw_xs, (size_t)(c0 - s0) * HD, (size_t)nr * HD) &&
-                 cc_copy(ch->hpd, 0, ch->lw_hp, (size_t)(c0 - s0) * hr, (size_t)nr * hr) &&
+            ok = cc_begin() && cc_copy(ch->xd, 0, direct ? ch->xs : ch->lw_xs, direct ? 0 : (size_t)(c0 - s0) * HD, (size_t)nr * HD) &&
+                 cc_copy(ch->hpd, 0, direct ? ch->hpf : ch->lw_hp, direct ? 0 : (size_t)(c0 - s0) * hr, (size_t)nr * hr) &&
                  (!last || v41u_state_pull(ch, m, start, E, pc, pw)) && cc_submit(1);
             if (!ok) break;
             const float *xd = (const float *)cc_ptr(ch->xd), *hpd = (const float *)cc_ptr(ch->hpd);
@@ -1696,22 +1769,35 @@ static int v41u_forward_rows(Model *m, const int *slots, const int *pos, int S, 
         ok = ok && v41u_pre(ch, m, ch->fna[i], ch->o_hca[i], ch->hpa, ch->hpf, ch->o_an[i], S) &&
              v41u_attention_rows(ch, m, i, S, slots, pos, keyl) && v41u_post(ch, m, ch->hpa, S) &&
              v41u_pre(ch, m, ch->fnf[i], ch->o_hcf[i], ch->hpf, ch->hpa, ch->o_fn[i], S) &&
-             cc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)S * D) && v41u_shared(ch, m, l, S);
+             cc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)S * D);
+        int shared_done = 0;
 #if V41U_CMOE
-        if (ok && cmoe && !v41u_cmoe_dev_s(ch, m, i, S)) {   /* refused (not a lost device): the host's routed experts from here on */
-            if (cc_lost()) ok = 0;
-            else { v41u_cmoe_off(ch, "the device's router or experts refused (cc_matmul/cc_route/cc_moe parts 1, S rows)"); cmoe = 0; }
+        if (ok && cmoe) {
+            int r;
+            if (v41u_shared_late()) {   /* the routes and their word first: the shared expert and the residents run beside the host's misses */
+                r = v41u_cmoe_route_s(ch, m, i, S);
+                if (r) { shared_done = 1; ok = v41u_shared(ch, m, l, S); r = ok && v41u_cmoe_res_s(ch, m, i, S); }
+            } else { shared_done = 1; ok = v41u_shared(ch, m, l, S); r = ok && v41u_cmoe_dev_s(ch, m, i, S); }
+            if (ok && !r) {   /* refused (not a lost device): the host's routed experts from here on */
+                if (cc_lost()) ok = 0;
+                else { v41u_cmoe_off(ch, "the device's router or experts refused (cc_matmul/cc_route/cc_moe parts 1, S rows)"); cmoe = 0; }
+            }
         }
+#endif
+        if (ok && !shared_done) ok = v41u_shared(ch, m, l, S);
+#if V41U_CMOE
         if (ok && cmoe) {   /* the frame left running: its word says the routes (and h2d, copied before them) are down */
             ok = cc_submit(0);
             if (ok) {
                 const double tw = now_s();
-                volatile unsigned *fw = (volatile unsigned *)cc_ptr(ch->cm_flag);
-                for (unsigned long spin = 0; *fw < ch->cm_seq; spin++)
+                int rd = 0;
+                for (unsigned long spin = 0; (rd = v41u_routes_down(ch)) == 0; spin++)
                     if ((spin & 0xFFFFu) == 0 && (cc_lost() || now_s() - tw > 60.0)) {
                         fprintf(stderr, "[CUDA] deepseek_v41 chain rows: the device did not reach layer %d's routes in 60 s\n", i);
                         ok = 0; break;
                     }
+                if (rd < 0) ok = 0;
+                ch->rw_wait_ms += (now_s() - tw) * 1e3;
             }
         } else
 #endif
@@ -1730,12 +1816,13 @@ static int v41u_forward_rows(Model *m, const int *slots, const int *pos, int S, 
         const double tp = now_s();
         CcBuf *rin = ch->routed;   /* the routed rows the add reads: the host's, or the device's y */
         CcEw add = {CC_EW_ADD, S * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-        int open = 0;
+        int open = 0, tailed = 0;
 #if V41U_CMOE
         if (cmoe) {   /* y = hy + the resident slots' w * down in rank order (cc_moe parts 2, S rows), then the add from y */
             CcMoe p2 = v41u_cmoe_args_s(ch, m, i, 2, S);
             ok = open = cc_begin();
-            if (ok && cc_moe(ch->cm_tab, ch->nrm, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_y, ch->cm_hy, &p2)) rin = ch->cm_y;
+            if (ok && v41u_tail_on() && v41u_tail(ch, m, &p2, ch->hpf, S)) { tailed = 1; rin = ch->cm_y; }   /* that, the add and the write back in one launch */
+            else if (ok && cc_moe(ch->cm_tab, ch->nrm, ch->cm_ids, ch->cm_w, ch->cm_hid, ch->cm_y, ch->cm_hy, &p2)) rin = ch->cm_y;
             else if (ok) {   /* refused: this layer's routed rows from moe_run_at after all, the host step from here on */
                 ok = !cc_lost() && cc_submit(1);
                 open = 0;
@@ -1751,7 +1838,7 @@ static int v41u_forward_rows(Model *m, const int *slots, const int *pos, int S, 
             memcpy(cc_ptr(ch->routed), ch->lw_out, (size_t)S * D * sizeof(float));
             ok = open = cc_begin();
         }
-        ok = ok && cc_ops()->ew(ch->br, rin, ch->ds, NULL, NULL, &add) && v41u_post(ch, m, ch->hpf, S);
+        if (!tailed) ok = ok && cc_ops()->ew(ch->br, rin, ch->ds, NULL, NULL, &add) && v41u_post(ch, m, ch->hpf, S);
         if (open) ok = v41u_close(ok);
         p2_ms += (now_s() - tp) * 1e3;
 #if V41U_CMOE

@@ -400,6 +400,216 @@ static void test_engram(int S, int H, int D) {
     for (CcBuf *b : {kb, xb, pb}) T->free(b);
 }
 
+/* ---- DS52: the layer frame's merged and faster small kernels, bit for bit against the kernels they stand for ---- */
+#include <chrono>
+static double now_us() { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+/* cc_norm's rows of 2049..5120 through the registers' path (cc_norm_k<20>) against the loops' (COLI_SYCL_NORM_NV=8) */
+static void test_norm_nv(int rows, int D, int flags) {
+    std::vector<float> x = fvec((size_t)rows * D, 2.f), w = fvec((size_t)D, 1.f);
+    CcBuf *xb = upf(x), *wb = upf(w), *ya = T->buf((size_t)rows * D * 4, CC_DEV), *yb = T->buf((size_t)rows * D * 4, CC_DEV);
+    CcNorm p = {rows, D, 1, 0, D, D, 0, D, D, 0, 0, flags, 1e-6f, 1.f};
+    setenv("COLI_SYCL_NORM_NV", "8", 1);
+    int ok = T->begin() && T->norm(xb, wb, ya, &p) && T->submit(1);
+    unsetenv("COLI_SYCL_NORM_NV");
+    ok = ok && T->begin() && T->norm(xb, wb, yb, &p) && T->submit(1);
+    auto a = down<float>(ya, (size_t)rows * D), b = down<float>(yb, (size_t)rows * D);
+    size_t diff = 0, nz = 0;
+    for (size_t i = 0; i < a.size(); i++) { diff += memcmp(&a[i], &b[i], 4) != 0; nz += a[i] != 0.f; }
+    char m[200]; snprintf(m, sizeof m, "norm rows %d D %d flags %d: the registers' path vs the loops', %zu of %zu values differ (%zu non-zero)",
+                          rows, D, flags, diff, a.size(), nz);
+    ck(ok && diff == 0 && nz > a.size() / 2, m);
+    for (CcBuf *q : {xb, wb, ya, yb}) T->free(q);
+}
+static int have_moe_tail() { return T->size >= offsetof(ColiCudaChainOps, moe_tail) + sizeof T->moe_tail && T->moe_tail; }
+/* a chain-MoE layer's last frame: cc_moe parts 2, ew ADD, mhc POST against moe_tail's one launch (y, br and the streams) */
+struct TailCase {
+    int S, K, D, I, H, E, hrow;
+    CcBuf *tab, *ids, *w, *hid, *hy, *ds, *xs, *hp, *y[2], *br[2], *xn[2];
+    CcMoe p; CcMhc po; CcEw add;
+};
+static TailCase tail_make(int S, int K, int D, int I, int H, int hoff_on) {
+    TailCase t; memset(&t, 0, sizeof t);
+    t.S = S; t.K = K; t.D = D; t.I = I; t.H = H; t.E = 24; t.hrow = 2 * H + H * H;
+    const int toff = 5;
+    std::vector<CcExpert> tab((size_t)toff + t.E);
+    memset(tab.data(), 0, tab.size() * sizeof(CcExpert));
+    for (int e = 0; e < t.E; e++) if (e % 3 != 1) tab[toff + e].g = (const void *)(uintptr_t)64;   /* held: parts 2 reads g as a flag only */
+    std::vector<int> ids((size_t)S * K);
+    for (int s = 0; s < S; s++) for (int k = 0; k < K; k++) ids[s * K + k] = (s * 7 + k * 5) % 11 == 3 ? -1 : (int)(rnd() % t.E);
+    const size_t hf = cc_moe_hid_floats(S, K, D, I, t.E);
+    std::vector<float> w = fvec((size_t)S * K, 1.f), hid = fvec(hf, 3.f), hy = fvec((size_t)S * D, 2.f), ds = fvec((size_t)S * D, 2.f),
+                       xs = fvec((size_t)S * H * D, 2.f), hp = fvec((size_t)S * t.hrow, 1.f);
+    t.tab = up(tab.data(), tab.size() * sizeof(CcExpert)); t.ids = up(ids.data(), ids.size() * 4);
+    t.w = upf(w); t.hid = upf(hid); t.hy = upf(hy); t.ds = upf(ds); t.xs = upf(xs); t.hp = upf(hp);
+    for (int v = 0; v < 2; v++) {
+        t.y[v] = T->buf((size_t)S * D * 4, CC_DEV); t.br[v] = T->buf((size_t)S * D * 4, CC_DEV); t.xn[v] = T->buf((size_t)S * H * D * 4, CC_DEV);
+    }
+    CcMoe p; memset(&p, 0, sizeof p);
+    p.S = S; p.K = K; p.D = D; p.I = I; p.fmt = 7; p.gs = 32; p.act = 1; p.parts = 2; p.t_off = toff; p.x_row = D; p.i_row = K; p.w_row = K;
+    p.y_row = D; p.h_off = hoff_on ? 0 : -1; p.E = t.E; p.act_lim = 10.f;
+    t.p = p;
+    CcMhc po = {S, H, D, 20, 0, H * D, 0, D, 0, t.hrow, 0, H * D, 0, 0, 1e-6f, 1e-6f, 0.f};
+    t.po = po;
+    CcEw add = {CC_EW_ADD, S * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+    t.add = add;
+    return t;
+}
+static int tail_three(TailCase &t, int v) {
+    return T->moe(t.tab, NULL, t.ids, t.w, t.hid, t.y[v], t.hy, &t.p) && T->ew(t.br[v], t.y[v], t.ds, NULL, NULL, &t.add) &&
+           T->mhc(CC_MHC_POST, t.xs, t.br[v], t.hp, NULL, t.xn[v], &t.po);
+}
+static int tail_one(TailCase &t, int v) {
+    return T->moe_tail(t.tab, t.ids, t.w, t.hid, t.hy, t.y[v], t.ds, t.br[v], t.xs, t.hp, t.xn[v], &t.p, &t.po) == 1;
+}
+static void tail_free(TailCase &t) {
+    for (CcBuf *q : {t.tab, t.ids, t.w, t.hid, t.hy, t.ds, t.xs, t.hp, t.y[0], t.y[1], t.br[0], t.br[1], t.xn[0], t.xn[1]}) T->free(q);
+}
+static size_t bitdiff(CcBuf *a, CcBuf *b, size_t n, size_t *nz) {
+    auto x = down<float>(a, n), y = down<float>(b, n);
+    size_t d = 0;
+    for (size_t i = 0; i < n; i++) { d += memcmp(&x[i], &y[i], 4) != 0; if (nz) *nz += x[i] != 0.f; }
+    return d;
+}
+/* the split's sum of squares with its loads sixteen at a time (ccd_mhc_split_sg<H, 1>) against the loop (COLI_SYCL_MHC_BATCH=0) */
+static void test_mhc_batch(int S, int H, int D, int iters) {
+    const int HD = H * D, nm = (2 + H) * H, hrow = 2 * H + H * H;
+    std::vector<float> x = fvec((size_t)S * HD, 1.f), mix = fvec((size_t)S * nm, 2.f), prm(3 + nm);
+    for (int i = 0; i < 3; i++) prm[i] = 0.5f + (rnd() % 100) / 100.f;
+    for (int i = 0; i < nm; i++) prm[3 + i] = frnd() * 0.5f;
+    CcBuf *xb = upf(x), *mb = upf(mix), *pb = upf(prm), *ha = T->buf((size_t)S * hrow * 4, CC_DEV), *hb = T->buf((size_t)S * hrow * 4, CC_DEV);
+    CcMhc sp = {S, H, D, iters, 0, HD, 0, nm, 0, hrow, 0, D, 0, 0, 1e-5f, 1e-6f, 0.f};
+    setenv("COLI_SYCL_MHC_BATCH", "0", 1);
+    int ok = T->begin() && T->mhc(CC_MHC_SPLIT, xb, mb, ha, pb, NULL, &sp) && T->submit(1);
+    unsetenv("COLI_SYCL_MHC_BATCH");
+    ok = ok && T->begin() && T->mhc(CC_MHC_SPLIT, xb, mb, hb, pb, NULL, &sp) && T->submit(1);
+    size_t nz = 0;
+    const size_t d = bitdiff(ha, hb, (size_t)S * hrow, &nz);
+    char m[200]; snprintf(m, sizeof m, "mhc split S %d H %d D %d iters %d: loads sixteen at a time vs the loop, %zu of %zu values differ", S, H, D, iters, d, (size_t)S * hrow);
+    ck(ok && d == 0 && nz > (size_t)S * hrow / 2, m);
+    for (CcBuf *q : {xb, mb, pb, ha, hb}) T->free(q);
+}
+static void test_moe_tail(int S, int K, int D, int I, int H, int hoff_on) {
+    char m[240];
+    if (!have_moe_tail()) { snprintf(m, sizeof m, "moe tail S %d: the backend has no moe_tail", S); ck(0, m); return; }
+    TailCase t = tail_make(S, K, D, I, H, hoff_on);
+    int ok = T->begin() && tail_three(t, 0) && T->submit(1);
+    ok = ok && T->begin() && tail_one(t, 1) && T->submit(1);
+    size_t nz = 0;
+    const size_t dy = bitdiff(t.y[0], t.y[1], (size_t)S * D, &nz), db = bitdiff(t.br[0], t.br[1], (size_t)S * D, &nz),
+                 dx = bitdiff(t.xn[0], t.xn[1], (size_t)S * H * D, &nz);
+    snprintf(m, sizeof m, "moe tail S %d K %d D %d H %d host rows %d: one launch vs moe sum, add, mhc post: y %zu, br %zu, streams %zu values "
+                          "differ (%zu non-zero of %zu)", S, K, D, H, hoff_on, dy, db, dx, nz, (size_t)S * D * (2 + H));
+    ck(ok && !dy && !db && !dx && nz > (size_t)S * D * (2 + H) / 2, m);
+    setenv("COLI_SYCL_MOE_TAIL", "0", 1);   /* the switch: not taken, nothing launched */
+    const int r = T->begin() ? T->moe_tail(t.tab, t.ids, t.w, t.hid, t.hy, t.y[1], t.ds, t.br[1], t.xs, t.hp, t.xn[1], &t.p, &t.po) : 0;
+    unsetenv("COLI_SYCL_MOE_TAIL");
+    ok = T->submit(1);
+    snprintf(m, sizeof m, "moe tail S %d: COLI_SYCL_MOE_TAIL=0 is not taken (%d)", S, r);
+    ck(ok && r == -1, m);
+    tail_free(t);
+}
+/* mark / reached: a frame left running, its mark after the first ops; the host polls: the rows those ops wrote to DOWN
+ * memory are there when the mark is reached, and the frame's later ops were not held (the frame ends after it) */
+static void test_mark(int later) {
+    char m[240];
+    if (T->size < offsetof(ColiCudaChainOps, reached) + sizeof T->reached || !T->mark || !T->reached) { ck(0, "mark: the backend has no mark / reached"); return; }
+    const int D = 5120, H = 4, HD = H * D, hrow = 2 * H + H * H;
+    std::vector<float> x = fvec((size_t)HD, 1.f), hp = fvec(hrow, 1.f), br = fvec(D, 1.f);
+    CcBuf *xb = upf(x), *hb = upf(hp), *bb = upf(br), *dn = T->buf((size_t)HD * 4, CC_DOWN), *yb = T->buf((size_t)HD * 4, CC_DEV);
+    CcMhc po = {1, H, D, 20, 0, HD, 0, D, 0, hrow, 0, HD, 0, 0, 1e-6f, 1e-6f, 0.f};
+    int bad = 0, never = 0; double t_mark = 0, t_end = 0; long polls = 0;
+    const int reps = 50;
+    for (int rep = 0; rep < reps && !bad && !never; rep++) {
+        float *d = (float *)T->ptr(dn);
+        memset(d, 0, (size_t)HD * 4);
+        std::vector<float> xr = fvec((size_t)HD, 1.f);
+        int ok = T->begin() && T->write(xb, 0, xr.data(), (size_t)HD * 4) && T->copy(dn, 0, xb, 0, (size_t)HD) && T->mark();
+        for (int i = 0; ok && i < later; i++) ok = T->mhc(CC_MHC_POST, xb, bb, hb, NULL, yb, &po);
+        ok = ok && T->submit(0);
+        const double t0 = now_us();
+        int r = 0;
+        while (ok && (r = T->reached()) == 0) { polls++; if (now_us() - t0 > 5e6) { never = 1; break; } }
+        const double t1 = now_us();
+        if (!ok || r != 1 || memcmp(d, xr.data(), (size_t)HD * 4)) bad = 1;   /* at the mark: the copy's rows are down */
+        if (!T->finish()) bad = 1;
+        t_mark += t1 - t0; t_end += now_us() - t0;
+    }
+    snprintf(m, sizeof m, "mark with %d ops after it: reached %.1f us after the submit (%ld polls a frame), the frame done after %.1f us; "
+                          "the rows before the mark down at the mark", later, t_mark / reps, polls / reps, t_end / reps);
+    ck(!bad && !never, m);
+    for (CcBuf *q : {xb, hb, bb, dn, yb}) T->free(q);
+}
+/* Times, the card's (a line each, no verdict): `queued` = n launches in one frame, waited once (the device's time a
+ * launch with the next one already submitted); `live` = a frame a repetition, waited each time (what a frame costs
+ * when the card is idle as it is submitted: the layer's last frame after the host's misses) */
+template <class F> static void time_queued(const char *what, int n, F f) {
+    int ok = T->begin();
+    for (int i = 0; ok && i < 16; i++) ok = f();
+    ok = ok && T->submit(1) && T->begin();
+    const double t0 = now_us();
+    for (int i = 0; ok && i < n; i++) ok = f();
+    ok = ok && T->submit(1);
+    printf("  DS52-TIME %-58s queued %7.1f us%s\n", what, (now_us() - t0) / n, ok ? "" : " (FAILED)");
+}
+template <class F> static void time_live(const char *what, int n, F f) {
+    int ok = 1;
+    for (int i = 0; ok && i < 16; i++) ok = T->begin() && f() && T->submit(1);
+    const double t0 = now_us();
+    for (int i = 0; ok && i < n; i++) ok = T->begin() && f() && T->submit(1);
+    printf("  DS52-TIME %-58s live   %7.1f us%s\n", what, (now_us() - t0) / n, ok ? "" : " (FAILED)");
+}
+static void ds52_times() {
+    const int D = 5120, H = 4, HD = H * D, nm = (2 + H) * H, hrow = 2 * H + H * H, N = 400;
+    for (int S : {1, 4}) {
+        char m[120];
+        std::vector<float> x = fvec((size_t)S * HD, 1.f), w = fvec((size_t)D, 1.f), mix = fvec((size_t)S * nm, 2.f), prm = fvec(3 + nm, 0.5f);
+        CcBuf *xb = upf(x), *wb = upf(w), *mb = upf(mix), *pb = upf(prm), *yb = T->buf((size_t)S * HD * 4, CC_DEV),
+              *hb = T->buf((size_t)S * hrow * 4, CC_DEV), *cb = T->buf((size_t)S * D * 4, CC_DEV);
+        CcNorm np = {S, D, 1, 0, D, D, 0, D, D, 0, 0, 0, 1e-6f, 1.f};
+        CcNorm ns = {S * 10, 512, 10, 0, D, 512, 0, D, 512, 0, 0, 0, 1e-6f, 1.f};   /* ten rows of 512 a row: a short norm */
+        CcMhc sp = {S, H, D, 20, 0, HD, 0, nm, 0, hrow, 0, D, 0, 0, 1e-6f, 1e-6f, 0.f};
+        CcMhc po = {S, H, D, 20, 0, HD, 0, D, 0, hrow, 0, HD, 0, 0, 1e-6f, 1e-6f, 0.f};
+        setenv("COLI_SYCL_NORM_NV", "8", 1);
+        snprintf(m, sizeof m, "norm D 5120 rows %d, the loops (COLI_SYCL_NORM_NV=8)", S);
+        time_queued(m, N, [&] { return T->norm(xb, wb, yb, &np); });
+        unsetenv("COLI_SYCL_NORM_NV");
+        snprintf(m, sizeof m, "norm D 5120 rows %d, the registers", S);
+        time_queued(m, N, [&] { return T->norm(xb, wb, yb, &np); });
+        snprintf(m, sizeof m, "norm D 512 x 10 a row, rows %d", S);
+        time_queued(m, N, [&] { return T->norm(xb, wb, yb, &ns); });
+        snprintf(m, sizeof m, "mhc split H 4 D 5120 iters 20 rows %d", S);
+        time_queued(m, N, [&] { return T->mhc(CC_MHC_SPLIT, xb, mb, hb, pb, NULL, &sp); });
+        setenv("COLI_SYCL_MHC_BATCH", "0", 1);
+        snprintf(m, sizeof m, "mhc split H 4 D 5120 iters 20 rows %d, the loop (BATCH=0)", S);
+        time_queued(m, N, [&] { return T->mhc(CC_MHC_SPLIT, xb, mb, hb, pb, NULL, &sp); });
+        unsetenv("COLI_SYCL_MHC_BATCH");
+        setenv("COLI_SYCL_MHC_GENERIC", "1", 1);
+        snprintf(m, sizeof m, "mhc split H 4 D 5120 iters 20 rows %d, generic", S);
+        time_queued(m, N, [&] { return T->mhc(CC_MHC_SPLIT, xb, mb, hb, pb, NULL, &sp); });
+        unsetenv("COLI_SYCL_MHC_GENERIC");
+        CcMhc sp1 = sp; sp1.iters = 1;
+        snprintf(m, sizeof m, "mhc split H 4 D 5120 iters 1 rows %d", S);
+        time_queued(m, N, [&] { return T->mhc(CC_MHC_SPLIT, xb, mb, hb, pb, NULL, &sp1); });
+        snprintf(m, sizeof m, "mhc collapse rows %d", S);
+        time_queued(m, N, [&] { return T->mhc(CC_MHC_COLLAPSE, xb, NULL, hb, NULL, cb, &sp); });
+        snprintf(m, sizeof m, "mhc post rows %d", S);
+        time_queued(m, N, [&] { return T->mhc(CC_MHC_POST, xb, cb, hb, NULL, yb, &po); });
+        snprintf(m, sizeof m, "copy %d floats", S * HD);
+        time_queued(m, N, [&] { return T->copy(yb, 0, xb, 0, (size_t)S * HD); });
+        if (have_moe_tail()) {
+            TailCase t = tail_make(S, 6, D, 2304, H, 1);
+            snprintf(m, sizeof m, "last frame rows %d: moe sum, add, mhc post", S);
+            time_queued(m, N, [&] { return tail_three(t, 0); });
+            time_live(m, N, [&] { return tail_three(t, 0); });
+            snprintf(m, sizeof m, "last frame rows %d: moe_tail", S);
+            time_queued(m, N, [&] { return tail_one(t, 1); });
+            time_live(m, N, [&] { return tail_one(t, 1); });
+            tail_free(t);
+        }
+        for (CcBuf *q : {xb, wb, mb, pb, yb, hb, cb}) T->free(q);
+    }
+}
+
 int main(int argc, char **argv) {
     int devices[COLI_CUDA_MAX_DEVICES];
     if (sycl_test_devices(argc, argv, devices, COLI_CUDA_MAX_DEVICES) < 0) return 0;   /* --list */
@@ -426,6 +636,18 @@ int main(int argc, char **argv) {
     /* last, so the cases above draw the same random numbers as before: the constant-H split at H 8 and the generic H 3 */
     printf("mhc (more)\n"); test_mhc(8, 40, 20); test_mhc(3, 17, 5);
     printf("attention rows\n"); test_attn_rows(4, 64, 512, 128, 700, 640); test_attn_rows(3, 7, 96, 8, 300, 200); test_attn_rows(2, 64, 512, 128, 2000, 1500);
+    /* DS52, after everything the suite had (the same random numbers for those) */
+    printf("norm, the registers' path (DS52)\n");
+    for (int fl : {0, CC_NORM_ADD1, CC_NORM_NOW, CC_NORM_L2, CC_NORM_PRESCALE}) test_norm_nv(3, 5120, fl);
+    test_norm_nv(4, 2049, 0); test_norm_nv(2, 4100, 0); test_norm_nv(1, 5119, CC_NORM_ADD1); test_norm_nv(5, 3000, CC_NORM_PRESCALE);
+    printf("mhc split, loads sixteen at a time (DS52)\n");
+    test_mhc_batch(1, 4, 5120, 20); test_mhc_batch(4, 4, 5120, 20); test_mhc_batch(3, 4, 5120 / 8, 20); test_mhc_batch(2, 2, 33, 3); test_mhc_batch(3, 4, 1000, 7);
+    printf("the last frame in one launch (DS52)\n");
+    test_moe_tail(1, 6, 5120, 2304, 4, 1); test_moe_tail(4, 6, 5120, 2304, 4, 1); test_moe_tail(3, 6, 5120, 2304, 4, 1);
+    test_moe_tail(2, 9, 320, 96, 2, 1); test_moe_tail(4, 6, 5120, 2304, 4, 0); test_moe_tail(8, 3, 1056, 64, 8, 1);
+    printf("a mark the host polls (DS52)\n");
+    test_mark(0); test_mark(40); test_mark(400);
+    if (!getenv("DS52_NO_TIMES")) { printf("times (DS52)\n"); ds52_times(); }
     T->shutdown();
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails != 0;

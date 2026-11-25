@@ -222,7 +222,11 @@ static void ccd_mhc_split_t(const float *x, const float *mx, float *hp, const fl
  * 0.f, index ascending) and each lane divides its own element -- the same operations on the same values, so the same
  * bits, with the ~2*iters*H*H dependent IEEE divisions (-fp-model=precise) 16 at a time instead of one work-item's
  * (DS36: 91 us a call on 4 rows). The pre and post weights go one a lane too. COLI_SYCL_MHC_GENERIC=1: the generic. */
-template <int H>
+/* B 1 (DS52): the streams' sum of squares with its loads sixteen at a time -- a work-item's HD / 256 elements (80 at
+ * DeepSeek V4.1's 4 x 5120) were a load, then an add, eighty times in a row, each load waited for; now sixteen
+ * independent loads, then their sixteen adds in the same order from the same start, so the same sum to the bit.
+ * COLI_SYCL_MHC_BATCH=0: B 0, the loop as it was. */
+template <int H, int B = 0>
 static void ccd_mhc_split_sg(const float *x, const float *mx, float *hp, const float *prm, CcMhc p) {
     auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
@@ -233,7 +237,16 @@ static void ccd_mhc_split_sg(const float *x, const float *mx, float *hp, const f
     const int s = it.get_group(2), tid = it.get_local_id(2), HD = H * p.D;
     const int xb = p.x_off + s * p.x_row;
     float a = 0.f;
-    for (int i = tid; i < HD; i += 256) { float v = x[xb + i]; a += v * v; }
+    if (B) {
+        for (int i0 = tid; i0 < HD; i0 += 16 * 256) {
+            float xv[16];
+#pragma unroll
+            for (int k = 0; k < 16; k++) { const int i = i0 + 256 * k; xv[k] = i < HD ? x[xb + i] : 0.f; }
+#pragma unroll
+            for (int k = 0; k < 16; k++) if (i0 + 256 * k < HD) { float v = xv[k]; a += v * v; }
+        }
+    } else
+        for (int i = tid; i < HD; i += 256) { float v = x[xb + i]; a += v * v; }
     red[tid] = a;
     CCD_SYNC(it);
     for (int off = 128; off > 0; off >>= 1) {
@@ -280,6 +293,10 @@ static int ccd_mhc_generic(void) {   /* read at each launch: the test runs both 
     const char *e = getenv("COLI_SYCL_MHC_GENERIC");
     return e && atoi(e) > 0;
 }
+static int ccd_mhc_batch(void) {   /* read at each launch, as ccd_mhc_generic */
+    const char *e = getenv("COLI_SYCL_MHC_BATCH");
+    return !(e && *e == '0');
+}
 static void ccd_mhc_ew_k(int mode, const float *x, const float *mx, const float *hp, float *y, CcMhc p) {
     auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long i = (long long)it.get_group(2) * it.get_local_range(2) + it.get_local_id(2);
@@ -317,7 +334,10 @@ static int cc_mhc(int mode, CcBuf *x, CcBuf *m, CcBuf *hp, CcBuf *prm, CcBuf *y,
     if (mode == CC_MHC_SPLIT) {
         if (!m || !hp || !prm || p->S < 1 || p->H < 1 || p->H > 8 || (2 + p->H) * p->H > 96) return 0;
         float *hw = fpw(hp);
-        if (!ccd_mhc_generic() && p->H == 4) CC_KSG(c, dim3((unsigned)p->S), 256, 0, ccd_mhc_split_sg<4>(xp, mp, hw, pp_, pp));   /* a fixed sub-group width (16 or 32) */
+        const int bt = ccd_mhc_batch();
+        if (!ccd_mhc_generic() && p->H == 4 && bt) CC_KSG(c, dim3((unsigned)p->S), 256, 0, ccd_mhc_split_sg<4, 1>(xp, mp, hw, pp_, pp));
+        else if (!ccd_mhc_generic() && p->H == 4) CC_KSG(c, dim3((unsigned)p->S), 256, 0, ccd_mhc_split_sg<4>(xp, mp, hw, pp_, pp));   /* a fixed sub-group width (16 or 32) */
+        else if (!ccd_mhc_generic() && p->H == 2 && bt) CC_KSG(c, dim3((unsigned)p->S), 256, 0, ccd_mhc_split_sg<2, 1>(xp, mp, hw, pp_, pp));
         else if (!ccd_mhc_generic() && p->H == 2) CC_KSG(c, dim3((unsigned)p->S), 256, 0, ccd_mhc_split_sg<2>(xp, mp, hw, pp_, pp));
         else if (!ccd_mhc_generic() && p->H == 8) CC_K(c, dim3((unsigned)p->S), 256, ccd_mhc_split_t<8>(xp, mp, hw, pp_, pp));
         else CC_K(c, dim3((unsigned)p->S), 256, ccd_mhc_split_k(xp, mp, hw, pp_, pp));
@@ -331,6 +351,84 @@ static int cc_mhc(int mode, CcBuf *x, CcBuf *m, CcBuf *hp, CcBuf *prm, CcBuf *y,
     const float *hr = fp(hp); float *yp = fpw(y); const int md = mode;
     CC_K(c, dim3(grid1(n, 256)), 256, ccd_mhc_ew_k(md, xp, mp, hr, yp, pp));
     return launched(c, "mhc");
+}
+
+/* ---- a chain-MoE layer's last frame in one launch (cc_moe_tail) ------------------------------
+ * The three kernels the frame ran one after the other, a work-item a (row, output) as the first of them:
+ *   moe_sum_k (backend_cuda.dp.cpp, cc_moe parts 2)   y = the host's row, then each held slot's w * down, in rank order
+ *   cc_ew_k op 0 (ADD)                                br = y + ds
+ *   ccd_mhc_ew_k CC_MHC_POST                          xn[j] = sum_k comb[k][j] * xs[k] + post[j] * br, for the H streams
+ * each statement theirs, in their order, on the values they read back from memory (a float stored and loaded is the
+ * same float), so y, br and xn have their bits (the ops test compares the three buffers byte for byte). Why: the frame
+ * is submitted when the host's misses are done and the card is idle, so each of its commands waited for the host's
+ * submit before it ran -- 6 to 18 us of idle card before each (DS24's frame dump), ~0.11 ms a layer for 25 us of work. */
+static void ccd_moe_tail_k(const CcExpert *tab, const int *ids, const float *w, const float *hid, const float *hy, float *y,
+                           const float *ds, float *br, const float *xs, const float *hp, float *xn, CcMoe p, CcMhc q) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int s = it.get_group(1), d = it.get_group(2) * 256 + it.get_local_id(2);
+    if (d >= p.D) return;
+    /* moe_sum_k, line for line */
+    size_t dn = (size_t)(p.lay_S > 0 ? p.lay_S : p.S) * p.K * p.I;
+    const int hs = p.lay_s0 + s;
+    float v = p.h_off >= 0 ? hy[p.h_off + (size_t)s * p.D + d] : 0.f;
+    for (int k0 = 0; k0 < p.K; k0 += 8) {
+        int e[8];
+        bool on[8];
+        float wk[8], hk[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) e[j] = k0 + j < p.K ? ids[p.i_off + s * p.i_row + k0 + j] : -1;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) on[j] = e[j] >= 0 && tab[p.t_off + e[j]].g;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            wk[j] = on[j] ? w[p.w_off + s * p.w_row + k0 + j] : 0.f;
+            hk[j] = on[j] ? hid[dn + (size_t)(hs * p.K + k0 + j) * p.D + d] : 0.f;
+        }
+        #pragma unroll
+        for (int j = 0; j < 8; j++) if (on[j]) v += wk[j] * hk[j];
+    }
+    y[p.y_off + (size_t)s * p.y_row + d] = v;
+    /* cc_ew_k op 0 on S * D floats from offset 0: br = y + ds */
+    const float b = v + ds[(size_t)s * p.D + d];
+    br[(size_t)s * p.D + d] = b;
+    /* ccd_mhc_ew_k CC_MHC_POST, its work-items (s, j, d) for j = 0..H-1 */
+    const int H = q.H, D = q.D;
+    const int xb = q.x_off + s * q.x_row, hb = q.hp_off + s * q.hp_row;
+    for (int j = 0; j < H; j++) {
+        float t = 0.f;
+        for (int k = 0; k < H; k++) t += hp[hb + 2 * H + k * H + j] * xs[xb + k * D + d];
+        t += hp[hb + H + j] * b;
+        xn[q.y_off + s * q.y_row + j * D + d] = t;
+    }
+}
+static int ccd_moe_tail_on(void) {   /* read at each launch: the test runs both in one process */
+    const char *e = getenv("COLI_SYCL_MOE_TAIL");
+    return !(e && *e == '0');
+}
+/* 1 done, -1 not taken (the caller's cc_moe parts 2, ew ADD and mhc POST), 0 a failure. Taken where cc_moe's parts 2 is
+ * moe_sum_k on its own: the tier's formats (fmt < 100: a GGUF's blocks have their own launch), a decode step's rows
+ * (no slots sorted by expert: S and lay_S up to CC_MOE_FRAME_ROWS), the buffers of the shapes the three ops are given */
+static int cc_moe_tail(CcBuf *tab, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *hy, CcBuf *y, CcBuf *ds, CcBuf *br, CcBuf *xs,
+                       CcBuf *hp, CcBuf *xn, const CcMoe *p, const CcMhc *po) {
+    CcCtx *c = live();
+    if (!c) return 0;
+    if (!ccd_moe_tail_on() || !tab || !ids || !w || !hid || !y || !ds || !br || !xs || !hp || !xn || !p || !po) return -1;
+    const int LS = p->lay_S > 0 ? p->lay_S : p->S;
+    if (p->parts != 2 || p->fmt >= 100 || p->S < 1 || p->K < 1 || p->K > CC_ROUTE_KMAX || LS > CC_MOE_FRAME_ROWS || p->lay_S < 0 ||
+        p->lay_s0 < 0 || p->lay_s0 > LS - p->S || (p->h_off >= 0 && !hy) || p->D < 1 || p->I < 1) return -1;
+    if (po->S != p->S || po->D != p->D || po->H < 1 || po->H > 8 || xs == xn || br == y || br == xn || y == xn) return -1;
+    if (cc_moe_hid_floats(LS, p->K, p->D, p->I, p->E) * 4 > hid->bytes) return -1;
+    if (((size_t)p->y_off + (size_t)(p->S - 1) * p->y_row + p->D) * 4 > y->bytes || (size_t)p->S * p->D * 4 > ds->bytes ||
+        (size_t)p->S * p->D * 4 > br->bytes ||
+        ((size_t)po->x_off + (size_t)(p->S - 1) * po->x_row + (size_t)po->H * po->D) * 4 > xs->bytes ||
+        ((size_t)po->y_off + (size_t)(p->S - 1) * po->y_row + (size_t)po->H * po->D) * 4 > xn->bytes ||
+        ((size_t)po->hp_off + (size_t)(p->S - 1) * po->hp_row + 2 * (size_t)po->H + (size_t)po->H * po->H) * 4 > hp->bytes) return -1;
+    const CcExpert *tp = (const CcExpert *)tab->d; const int *ip = (const int *)ids->d;
+    const float *wp = fp(w), *hd_ = fp(hid), *hyp = fp(hy), *dsp = fp(ds), *xp = fp(xs), *hpp = fp(hp);
+    float *yp = fpw(y), *bp = fpw(br), *xnp = fpw(xn);
+    const CcMoe pp = *p; const CcMhc qq = *po;
+    CC_K(c, dim3((unsigned)((p->D + 255) / 256), (unsigned)p->S), 256, ccd_moe_tail_k(tp, ip, wp, hd_, hyp, yp, dsp, bp, xp, hpp, xnp, pp, qq));
+    return launched(c, "moe sum + add + mhc post");
 }
 
 /* ---- sparse attention ------------------------------------------------------------------- */

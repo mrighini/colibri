@@ -513,6 +513,17 @@ typedef struct ColiCudaChainOps {
      * is row 0's, row r's query, list and output rows r q_row / l_row / o_row on, its window and compressed rows at
      * wo[r] / co[r] (in place of w_off / c_off). 1 done, -1 not taken (n separate ds_attn calls), 0 a failure */
     int  (*ds_attn_rows)(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p, const int *wo, const int *co, int n);
+    /* moe_tail: a chain-MoE layer's last frame in one launch (DeepSeek V4.1's decode rows): moe parts 2 with p (y = hy +
+     * each held slot's w * down, in rank order), ew ADD (br = y + ds, S * D floats from offset 0) and mhc POST with po
+     * (xn = comb(xs) + post * br), the three kernels' statements in their order, so y, br and xn have their bits.
+     * 1 done, -1 not taken (the caller's three ops), 0 a failure */
+    int  (*moe_tail)(CcBuf *tab, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *hy, CcBuf *y, CcBuf *ds, CcBuf *br, CcBuf *xs,
+                     CcBuf *hp, CcBuf *xn, const CcMoe *p, const CcMhc *po);
+    /* mark: a point of the open frame, complete once every op before it is (what signal's host task waited for), that
+     * holds no later op back; reached: 1 the last mark is complete (the rows the ops before it wrote to DOWN memory
+     * are there), 0 not yet, -1 no mark or a lost device. The host polls reached where it polled signal's word. */
+    int  (*mark)(void);
+    int  (*reached)(void);
 } ColiCudaChainOps;
 #define CC_MX_N 16   /* conversations a dnconv_mx / dnrec_mx launch takes (KV_SLOTS' limit) */
 #define CC_MX_ATTN_N 8   /* conversations an attn_h_mx call takes: a decode step's rows in the backend's attention */
@@ -628,6 +639,18 @@ static inline int cc_dsv4_ready(void) {
 static inline int cc_mhc(int mode, CcBuf *x, CcBuf *m, CcBuf *hp, CcBuf *prm, CcBuf *y, const CcMhc *p) {
     return cc_dsv4_ready() ? cc_ops()->mhc(mode, x, m, hp, prm, y, p) : 0;
 }
+static inline int cc_moe_tail(CcBuf *tab, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *hy, CcBuf *y, CcBuf *ds, CcBuf *br, CcBuf *xs,
+                              CcBuf *hp, CcBuf *xn, const CcMoe *p, const CcMhc *po) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, moe_tail) + sizeof t->moe_tail && t->moe_tail
+           ? t->moe_tail(tab, ids, w, hid, hy, y, ds, br, xs, hp, xn, p, po) : -1;
+}
+static inline int cc_mark_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, reached) + sizeof t->reached && t->mark && t->reached;
+}
+static inline int cc_mark(void) { return cc_mark_ready() ? cc_ops()->mark() : 0; }
+static inline int cc_reached(void) { return cc_mark_ready() ? cc_ops()->reached() : -1; }
 static inline int cc_ds_attn(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p) {
     return cc_dsv4_ready() ? cc_ops()->ds_attn(q, win, cmp, list, prm, out, p) : 0;
 }
