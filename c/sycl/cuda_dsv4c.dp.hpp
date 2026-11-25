@@ -329,6 +329,7 @@ static void ccd_mhc_ew_k(int mode, const float *x, const float *mx, const float 
 }
 static int cc_mhc(int mode, CcBuf *x, CcBuf *m, CcBuf *hp, CcBuf *prm, CcBuf *y, const CcMhc *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_mhc", x, m, hp, prm, y);
     if (!c || !p || !x) return 0;
     const float *xp = fp(x), *mp = fp(m), *pp_ = fp(prm); const CcMhc pp = *p;
     if (mode == CC_MHC_SPLIT) {
@@ -411,6 +412,8 @@ static int ccd_moe_tail_on(void) {   /* read at each launch: the test runs both 
 static int cc_moe_tail(CcBuf *tab, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *hy, CcBuf *y, CcBuf *ds, CcBuf *br, CcBuf *xs,
                        CcBuf *hp, CcBuf *xn, const CcMoe *p, const CcMhc *po) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_moe_tail", tab, ids, w, hid, hy, y, ds, br, xs, hp, xn);
+    if (p) cc_own_table(c, "cc_moe_tail", tab, p->t_off, p->E);
     if (!c) return 0;
     if (!ccd_moe_tail_on() || !tab || !ids || !w || !hid || !y || !ds || !br || !xs || !hp || !xn || !p || !po) return -1;
     const int LS = p->lay_S > 0 ? p->lay_S : p->S;
@@ -857,6 +860,7 @@ static int ccd_attn_rows(CcCtx *c, const float *qp, const float *wp, const float
 static int cc_ds_attn_rows(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p,
                            const int *wo, const int *co, int n) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_ds_attn_rows", q, win, cmp, list, prm, out);
     if (!c || !p || !q || !win || !list || !prm || !out || !wo || !co || p->H < 1 || p->hd < 1 || p->hd > 1024 || p->cnt < 1 ||
         p->cnt > 3072) return 0;
     if (!ccd_attn_v2()) return -1;
@@ -864,6 +868,7 @@ static int cc_ds_attn_rows(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf 
 }
 static int cc_ds_attn(CcBuf *q, CcBuf *win, CcBuf *cmp, CcBuf *list, CcBuf *prm, CcBuf *out, const CcDsAttn *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_ds_attn", q, win, cmp, list, prm, out);
     if (!c || !p || !q || !win || !list || !prm || !out || p->S < 1 || p->H < 1 || p->hd < 1 || p->hd > 1024 ||
         p->cnt < 1 || p->cnt > 3072) return 0;
     const float *qp = fp(q), *wp = fp(win), *cm = fp(cmp ? cmp : win), *pp_ = fp(prm);
@@ -947,6 +952,7 @@ static void ccd_rope_k(float *x, const float *cs, CcDsRope p) {
 }
 static int cc_ds_rope(CcBuf *x, CcBuf *cs, const CcDsRope *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_ds_rope", x, cs);
     if (!c || !p || !x || !cs || p->nseg < 0 || p->per_row < 1 || p->rd < 2 || (p->rd & 1)) return 0;
     if (p->nseg == 0) return 1;
     float *xp = fpw(x); const float *csp = fp(cs); const CcDsRope pp = *p;
@@ -999,6 +1005,7 @@ static void ccd_compress_k(const float *kv, const float *sc, float *ring, const 
 }
 static int cc_ds_compress(CcBuf *kv, CcBuf *sc, CcBuf *ring, CcBuf *prm, CcBuf *out, const CcDsComp *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_ds_compress", kv, sc, ring, prm, out);
     if (!c || !p || p->S < 0 || p->ratio < 1 || p->P < 1 || p->D < 1 || p->D > p->P || (p->overlap && p->P < 2 * p->D)) return 0;
     if (p->S == 0) return 1;
     if (!kv || !sc || !ring || !out || (p->ape_off >= 0 && !prm)) return 0;
@@ -1044,6 +1051,7 @@ static void ccd_score_k(const float *iq, const float *hw, const float *keys, con
 }
 static int cc_ds_score(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *mask, CcBuf *sc, const CcDsScore *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_ds_score", iq, hw, keys, mask, sc);
     if (!c || !p || p->S < 1 || p->IH < 1 || p->IH > 256 || p->ID < 1 || p->ratio < 1 || p->width < 0 ||
         p->sc_row < p->width || (p->mask_row > 0 && !mask) || !iq || !hw || !keys || !sc) return 0;
     if (p->mask_row > 0 && (size_t)p->mask_off + (size_t)(p->S - 1) * p->mask_row + (size_t)p->width > mask->bytes) return 0;   /* bytes */
@@ -1108,6 +1116,7 @@ static void ccd_cand_k(const float *scs, unsigned char *mask, CcDsCand p) {
 }
 static int cc_ds_cand(CcBuf *sc, CcBuf *mask, const CcDsCand *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_ds_cand", sc, mask);
     if (!c || !p || !sc || !mask || p->S < 1 || p->block < 1 || p->ratio < 1 || p->width < 0 ||
         (p->width + p->block - 1) / p->block > 4096 || p->mask_row < p->width || p->mask_off < 0 ||
         (size_t)p->mask_off + (size_t)(p->S - 1) * p->mask_row + (size_t)p->width > mask->bytes) return 0;
@@ -1171,6 +1180,7 @@ static void ccd_topk_k(const float *scs, int *list, CcDsTopk p, uint8_t *slm) {
 }
 static int cc_ds_topk(CcBuf *sc, CcBuf *list, const CcDsTopk *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_ds_topk", sc, list);
     if (!c || !p || !sc || !list || p->S < 1 || p->width < 0 || p->topk < 1 || p->sc_row < p->width || (p->order && p->topk > 4096)) return 0;
     const size_t smem = p->order ? (size_t)p->topk * sizeof(float) : 0;
     const float *sp = fp(sc); int *lp = reinterpret_cast<int *>(fpw(list)); const CcDsTopk pp = *p;
@@ -1210,6 +1220,7 @@ static void ccd_engram_k(const float *kv, const float *prm, float *x, CcDsEngram
 }
 static int cc_ds_engram(CcBuf *kv, CcBuf *prm, CcBuf *x, const CcDsEngram *p) {
     CcCtx *c = live();
+    CC_OWN(c, "cc_ds_engram", kv, prm, x);
     if (!c || !p || !kv || !prm || !x || p->S < 1 || p->H < 1 || p->D < 1) return 0;
     const float *kp = fp(kv), *pp_ = fp(prm); float *xp = fpw(x); const CcDsEngram pp = *p;
     CC_K(c, dim3((unsigned)p->H, (unsigned)p->S), 256, ccd_engram_k(kp, pp_, xp, pp));

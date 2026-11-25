@@ -207,6 +207,12 @@ extern "C" void coli_sycl_print_profiles(void) {
     }
 }
 
+int coli_sycl_test_devices(void) {
+    static int n = -1;
+    if (n < 0) { const char *tc = getenv("COLI_SYCL_TEST_CPU"); n = tc && atoi(tc) > 0 ? atoi(tc) : 0; }
+    return n;
+}
+
 int coli_sycl_available_device_count(void) {
     list_and_exit_if_asked();
     return (int)gpu_list().size();
