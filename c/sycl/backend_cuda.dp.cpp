@@ -3204,14 +3204,14 @@ static int bf16t_v1(void) { const char *e = getenv("COLI_SYCL_BF16T_V1"); return
  *    pass per four rows. With both, 1 to 4 rows cost the same 2.0-2.1 ms on a Max 1100 (bf16t2: 2.4 / 2.6 / 3.0 / 3.5).
  * Each output still has its eight accumulators in one work-item: columns j, j+8, ... in order, fma from +0, then
  * ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)). test_sycl_bf16t holds it to the reference and to bf16t2_kernel byte for byte.
- * A matrix gets the layout at upload: COLI_SYCL_BF16T_LB=32 any matrix, =0 none (bf16t2_kernel, the rows as they are).
- * Unset: none while BF16T_ILV_DEFAULT is 0. The kernel's shape was memcmp-equal to bf16t2_kernel on the card in
- * sycl/tests/bench_sycl_bf16_head (DS51), but this file's version of it has not run there yet (test_sycl_bf16t,
- * launch-ds51b.sh: the host was lost first); once that passes, 1: the matrices of BF16T_ILV_MIN bytes and more (the
- * head; the small ones are cache-resident and stay as they were). COLI_SYCL_BF16T_V1=1 at upload keeps the rows too. */
+ * A matrix gets the layout at upload: COLI_SYCL_BF16T_LB=32 any matrix, =0 none (bf16t2_kernel, the rows as they are);
+ * unset (BF16T_ILV_DEFAULT 1), the ones of BF16T_ILV_MIN bytes and more: the head; the small ones are cache-resident
+ * and stay as they were. COLI_SYCL_BF16T_V1=1 at upload keeps the rows too. On the card (DS51b, test_sycl_bf16t,
+ * a call = input upload, kernel, logits download, median of 40): the head at 1 / 2 / 3 / 4 rows 2.07 / 2.10 / 2.21 /
+ * 2.27 ms against bf16t2_kernel's 2.48 / 2.71 / 3.05 / 3.32, both the reference's bytes at 1..5 rows. */
 #define BF16T_LB 32
 #define BF16T_ILV_MIN ((size_t)64 << 20)
-#define BF16T_ILV_DEFAULT 0
+#define BF16T_ILV_DEFAULT 1
 template <int SG, int LB, int NR>
 static void bf16t3_kernel(float *y, int ystride, const float *x, int xstride, const uint32_t *w, int I, int O) {
     static_assert(LB == SG || LB == 2 * SG, "a block is one sub-group or two");

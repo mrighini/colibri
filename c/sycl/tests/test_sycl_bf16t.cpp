@@ -6,11 +6,13 @@
  *       here, for every shape)
  *   v2  bf16t2_kernel: the rows as they are (COLI_SYCL_BF16T_LB=0)
  *   v1  bf16t_kernel (COLI_SYCL_BF16T_V1=1)
- * Shapes: DeepSeek V4.1's lm head (129280 x 5120), its router and compressor shapes, and odd ones (O not a multiple of
- * 256 or 32, I a multiple of 8 only), 1..9 rows (more than four: several passes), each also with strides wider than
- * the rows. Then the head: v3 against v2's output byte for byte at 1..5 rows, the same with nothing set (whichever
- * kernel the backend's default is), and the head timed at 1..4 rows for v2 and v3, 1 and 4 for v1 (BF16T-TIME: a call
- * = upload, kernel, download; GB/s of weights). BF16T_SMALL=1 leaves the 1.3 GB shape out. "BF16T SUITE PASS" at the end. */
+ * Shapes: DeepSeek V4.1's router and compressor shapes and odd ones (O not a multiple of 256 or 32, I a multiple of 8
+ * only), 1..9 rows (more than four: several passes), each also with strides wider than the rows, in all three modes.
+ * Then the lm head (129280 x 5120, 1.32 GB), uploaded ONCE a program (the card's host-to-card path is not to be
+ * exercised in loops) in the mode BF16T_HEAD names: unset = nothing set (the backend's default: v3 from 64 MiB),
+ * v2, v3, v1, none. It is held to the reference at 5 rows (two passes), each of 1..4 rows to the same rows (every row
+ * count's kernel), the 5 rows' bytes hashed (BF16T-HASH: the same line in every mode), and timed at 1..4 rows
+ * (BF16T-TIME: a call = input upload, kernel, logits download; GB/s of weights). "BF16T SUITE PASS" at the end. */
 #include "../../backend_cuda.h"
 #include "sycl_test_args.h"
 #include <algorithm>
@@ -20,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 static int fails;
@@ -96,70 +99,69 @@ static Stat time_mv(void *h, float *y, const float *x, int O, int I, int S, int 
     std::sort(t.begin(), t.end());
     return { t[0], t[n / 2] };
 }
-/* the head: the default layout against v2 byte for byte, then the timings */
-static void head(int dev) {
+static uint64_t fnv(const void *p, size_t n) {
+    const uint8_t *b = (const uint8_t *)p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+/* the head, one upload: the reference at 5 rows, 1..4 rows against it, the hash, the timings */
+static void head(int dev, const char *which) {
+    const int mode = !std::strcmp(which, "v2") ? V2 : !std::strcmp(which, "v3") ? V3 : !std::strcmp(which, "v1") ? V1 : DEFAULT;
     const int O = 129280, I = 5120, SM = 5;
     std::vector<uint16_t> w((size_t)O * I);
     for (auto &b : w) b = wrand();
-    std::vector<float> x((size_t)SM * I), y2((size_t)SM * O, NAN), y((size_t)SM * O);
+    std::vector<float> x((size_t)SM * I), ref((size_t)SM * O), y((size_t)SM * O, NAN);
     for (auto &v : x) v = ((int)(rnd() % 20001) - 10000) / 7919.0f;
-    Stat st2[5], st3[5], st1[5];
-    mode_set(V2);
-    auto t0 = std::chrono::steady_clock::now();
-    void *h = coli_cuda_bf16t_upload(dev, w.data(), O, I);
-    const double up2 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    require(h != nullptr, "upload (v2, the head)");
-    require(coli_cuda_bf16t_mv(h, y2.data(), O, x.data(), I, SM), "v2, the head");
-    for (int S = 1; S <= 4; S++) st2[S] = time_mv(h, y.data(), x.data(), O, I, S, 40);
-    coli_cuda_bf16t_free(h);
-    double up3 = 0;
-    for (int mode : {V3, DEFAULT}) {   /* DEFAULT: nothing set, whichever kernel that is */
-        mode_set(mode);
-        t0 = std::chrono::steady_clock::now();
-        h = coli_cuda_bf16t_upload(dev, w.data(), O, I);
-        if (mode == V3) up3 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        require(h != nullptr, "upload (the head)");
-        for (int S = 1; S <= SM; S++) {
-            std::fill(y.begin(), y.end(), NAN);
-            require(coli_cuda_bf16t_mv(h, y.data(), O, x.data(), I, S), "the head");
-            size_t d = 0;
-            for (size_t i = 0; i < (size_t)S * O; i++) d += std::memcmp(&y[i], &y2[i], 4) != 0;
-            std::printf("  %s the head, %s against v2, S %d: %zu of %zu values differ\n", d ? "FAIL" : "ok  ", mode_name[mode], S, d, (size_t)S * O);
-            if (d) fails++;
-        }
-        if (mode == V3) for (int S = 1; S <= 4; S++) st3[S] = time_mv(h, y.data(), x.data(), O, I, S, 40);
-        coli_cuda_bf16t_free(h);
+    {   /* the reference on a few threads: each (row, output) is its own chain */
+        const int nt = 16;
+        std::vector<std::thread> th;
+        for (int k = 0; k < nt; k++)
+            th.emplace_back([&, k] {
+                const int o0 = (int)((long long)O * k / nt), o1 = (int)((long long)O * (k + 1) / nt);
+                for (int r = 0; r < SM; r++) reference(ref.data() + (size_t)r * O + o0, w.data() + (size_t)o0 * I, x.data() + (size_t)r * I, 1, I, o1 - o0);
+            });
+        for (auto &t : th) t.join();
     }
-    mode_set(V1);
-    h = coli_cuda_bf16t_upload(dev, w.data(), O, I);
-    require(h != nullptr, "upload (v1, the head)");
-    for (int S : {1, 4}) st1[S] = time_mv(h, y.data(), x.data(), O, I, S, 10);
+    mode_set(mode);
+    const auto t0 = std::chrono::steady_clock::now();
+    void *h = coli_cuda_bf16t_upload(dev, w.data(), O, I);   /* the program's one upload of the head */
+    const double up = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    require(h != nullptr, "upload (the head)");
+    require(coli_cuda_bf16t_mv(h, y.data(), O, x.data(), I, SM), "the head, 5 rows");
+    size_t d5 = 0;
+    for (size_t i = 0; i < (size_t)SM * O; i++) d5 += std::memcmp(&y[i], &ref[i], 4) != 0;
+    std::printf("  %s the head %s S %d against the reference: %zu of %zu values differ\n", d5 ? "FAIL" : "ok  ", mode_name[mode], SM, d5, (size_t)SM * O);
+    if (d5) fails++;
+    std::printf("BF16T-HASH the head's %d rows (fnv1a-64 of the bytes): device %016llx reference %016llx\n", SM,
+                (unsigned long long)fnv(y.data(), (size_t)SM * O * 4), (unsigned long long)fnv(ref.data(), (size_t)SM * O * 4));
+    for (int S = 1; S <= 4; S++) {
+        std::fill(y.begin(), y.end(), NAN);
+        require(coli_cuda_bf16t_mv(h, y.data(), O, x.data(), I, S), "the head, 1..4 rows");
+        size_t d = 0;
+        for (size_t i = 0; i < (size_t)S * O; i++) d += std::memcmp(&y[i], &ref[i], 4) != 0;
+        std::printf("  %s the head %s S %d against the reference: %zu of %zu values differ\n", d ? "FAIL" : "ok  ", mode_name[mode], S, d, (size_t)S * O);
+        if (d) fails++;
+    }
+    Stat st[5];
+    for (int S = 1; S <= 4; S++) st[S] = time_mv(h, y.data(), x.data(), O, I, S, 40);
     coli_cuda_bf16t_free(h);
     mode_set(DEFAULT);
     const double gb = (double)O * I * 2 / 1e9;
-    std::printf("BF16T-TIME the head's upload: v2 %.2f s, v3 (the blocks built on the host) %.2f s\n", up2, up3);
-    for (int S = 1; S <= 4; S++) {
-        std::printf("BF16T-TIME v2 O %d I %d S %d: min %.3f median %.3f ms a call (upload, kernel, download), %.0f GB/s of weights (median)\n",
-                    O, I, S, st2[S].min_ms, st2[S].med_ms, gb / (st2[S].med_ms * 1e-3));
-        std::printf("BF16T-TIME v3 O %d I %d S %d: min %.3f median %.3f ms a call (upload, kernel, download), %.0f GB/s of weights (median), %.2fx v2\n",
-                    O, I, S, st3[S].min_ms, st3[S].med_ms, gb / (st3[S].med_ms * 1e-3), st2[S].med_ms / st3[S].med_ms);
-    }
-    for (int S : {1, 4})
-        std::printf("BF16T-TIME v1 O %d I %d S %d: min %.3f median %.3f ms a call (upload, kernel, download), %.0f GB/s of weights (median)\n",
-                    O, I, S, st1[S].min_ms, st1[S].med_ms, gb / (st1[S].med_ms * 1e-3));
+    std::printf("BF16T-TIME %s the head's upload: %.2f s\n", mode_name[mode], up);
+    for (int S = 1; S <= 4; S++)
+        std::printf("BF16T-TIME %s O %d I %d S %d: min %.3f median %.3f ms a call (input upload, kernel, logits download), %.0f GB/s of weights (median)\n",
+                    mode_name[mode], O, I, S, st[S].min_ms, st[S].med_ms, gb / (st[S].med_ms * 1e-3));
 }
 int main(int argc, char **argv) {
     int dev[1]; int n = sycl_test_devices(argc, argv, dev, 1); if (n < 0) return 0;
     require(coli_cuda_init(dev, n), "init");
-    const bool small = std::getenv("BF16T_SMALL") != nullptr;   /* no 1.3 GB shape: a device without the memory, a CPU device */
-    const int sh[][3] = { {64, 8, 1}, {384, 5120, 1}, {384, 5120, 4}, {129280, 5120, 1}, {129280, 5120, 4}, {513, 5120, 3},
-                          {1000, 1032, 9}, {257, 4096, 5}, {200, 64, 8}, {33, 520, 2}, {31, 64, 6}, {96, 5120, 7} };
+    const char *hd = std::getenv("BF16T_HEAD");   /* unset: nothing set; v2 | v3 | v1; none: no 1.3 GB shape */
+    const int sh[][3] = { {64, 8, 1}, {384, 5120, 1}, {384, 5120, 4}, {513, 5120, 3}, {1000, 1032, 9}, {257, 4096, 5},
+                          {200, 64, 8}, {33, 520, 2}, {31, 64, 6}, {96, 5120, 7}, {2048, 5120, 5} };
     for (int mode : {V3, V2, V1})
-        for (auto &p : sh) {
-            if (small && p[0] > 100000) continue;
-            shape(dev[0], p[0], p[1], p[2], mode);
-        }
-    if (!small) head(dev[0]);
+        for (auto &p : sh) shape(dev[0], p[0], p[1], p[2], mode);
+    if (!hd || std::strcmp(hd, "none")) head(dev[0], hd && *hd ? hd : "default");
     std::printf(fails ? "BF16T SUITE FAIL\n" : "BF16T SUITE PASS\n");
     return fails ? 1 : 0;
 }
