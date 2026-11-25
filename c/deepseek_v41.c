@@ -2131,6 +2131,77 @@ static void scratch_put(uint8_t *p, int64_t n) {
     if (p) compat_aligned_free(p);
 }
 
+/* What a slot's window holds of one read's tensor: the config's bytes, or a GGUF layer's
+ * (its experts share a size; -1 when this tensor's differs). A read of more is refused. */
+static int64_t expert_read_cap(const Model *m, const ExpertRead *r) {
+    int64_t cap = r->gx_layer >= 0 ? m->gx_len[3 * r->gx_layer + r->part / 2] : expert_part_bytes(&m->c, r->part);
+    if (r->gx_layer >= 0 && r->t->nbytes != cap) cap = -1;   /* a GGUF layer's experts share a size */
+    return cap;
+}
+/* One of an expert's reads into its slot's window; the bytes read. Called by several threads
+ * at once (expert_fetch's team, the RAM fill's readers): it touches the slot's window and the
+ * scratch pool (its own lock), and for a request's read (`turn`) the mirrors' counters, which
+ * a turn's line is made of and the serving thread reads between turns. */
+static uint64_t expert_read_one(Model *m, const ExpertRead *r, int turn) {
+    int64_t pad = r->t->off % ST_DIRECT_ALIGN;
+    if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {
+        /* A GGUF matrix the slot holds in another form: read into a pooled scratch
+         * buffer, then interleaved by 16 rows or laid out as FP4 and scales. */
+        int64_t raw_n = 0;
+        uint8_t *raw = scratch_get(r->t->nbytes + 2 * ST_DIRECT_ALIGN, &raw_n);
+        st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes, raw + pad,
+                          r->t->nbytes, 1, expert_direct(), "pread expert");
+        const int k = r->part / 2, held = m->gx_h[3 * r->gx_layer + k];
+        int64_t shape[2];
+        v41_gx_shape(&m->c, k, shape);
+        if (held < 0) coli_mxfp4_unblock(r->slot->base[r->part + 1], r->slot->base[r->part], raw + pad,
+                                         shape[0] * shape[1] / 32);
+        else gq_r16_pack(held, r->slot->base[r->part], raw + pad, (int)shape[0], (int)shape[1]);
+        scratch_put(raw, raw_n);
+    } else
+    /* The payload pointer carries the slack st_read_range_rep needs to read
+     * from the enclosing block boundary, so an O_DIRECT transfer lands the
+     * data exactly where the slot wants it and nothing is copied afterwards. */
+    st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes,
+                      r->slot->base[r->part] + pad, r->t->nbytes, 1, expert_direct(),
+                      "pread expert");
+    /* Which drive actually answered. A partial mirror leaves shards on the
+     * primary, so the replica the route picked is not always the one that read. */
+    if (turn) {
+        int rep = r->rep;
+        if (st_fd_rep(&m->S, r->t->fd, rep) < 0) rep = 0;
+        __atomic_fetch_add(&g_mir_bytes[rep], (uint64_t)r->t->nbytes, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
+    }
+    return (uint64_t)r->t->nbytes;
+}
+/* The slot's payload pointer of a read that has landed (and of a GGUF matrix's scales). */
+static void expert_publish_one(const Model *m, const ExpertRead *r) {
+    if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {   /* the copy's own */
+        *slot_part(r->slot, r->part) = r->slot->base[r->part];
+        *slot_part(r->slot, r->part + 1) = m->gx_h[3 * r->gx_layer + r->part / 2] < 0 ? r->slot->base[r->part + 1] : NULL;
+    } else {
+        *slot_part(r->slot, r->part) = r->slot->base[r->part] + (r->t->off % ST_DIRECT_ALIGN);
+        if (r->gx_layer >= 0) *slot_part(r->slot, r->part + 1) = NULL;
+    }
+}
+
+/* The RAM fill (v41_pl_start, further down): what expert_fetch and the slot lookups share
+ * with it. `run` is the serving thread's (a fill is under way); `demand` counts the requests'
+ * own fetches in flight, which the fill's readers let pass; `have` is one byte an expert of
+ * the backbone, set once it is in its layer's slots; `poke` tells the serving thread that
+ * the readers have something for it. */
+static struct {
+    int run, demand, poke;
+    uint64_t demand_ms;   /* when a request's fetch last ended (now_s, ms) */
+    uint8_t *have;
+    int E;
+} g_pl;
+/* The readers stay off the drive this long after a request's fetch: a cold request reads a
+ * layer's experts, computes for a millisecond or two and reads the next layer's, and a reader
+ * starting in between would have its reads in the drive's queue ahead of them. */
+#define V41_PL_QUIET_MS 20
+
 /* Read `n` reserved experts at once. The slot ids are stamped only after every
  * read has landed, so a slot never advertises an expert it does not yet hold. */
 static void expert_fetch(Model *m, const char *kind, int layer,
@@ -2146,9 +2217,7 @@ static void expert_fetch(Model *m, const char *kind, int layer,
      * more than that must not be read into it -- same refusal st_read_raw_cap
      * applied when the read went by name. */
     for (int i = 0; i < total; i++) {
-        int64_t cap = list[i].gx_layer >= 0 ? m->gx_len[3 * list[i].gx_layer + list[i].part / 2]
-                                            : expert_part_bytes(&m->c, list[i].part);
-        if (list[i].gx_layer >= 0 && list[i].t->nbytes != cap) cap = -1;   /* a GGUF layer's experts share a size */
+        const int64_t cap = expert_read_cap(m, &list[i]);
         if (list[i].t->nbytes < 0 || list[i].t->nbytes > cap) {
             fprintf(stderr, "%s: expert tensor declares %lld bytes, the slot holds %lld — "
                             "refusing (untrusted container)\n", list[i].t->name,
@@ -2156,6 +2225,8 @@ static void expert_fetch(Model *m, const char *kind, int layer,
             exit(1);
         }
     }
+    const int filling = g_pl.run;   /* the RAM fill's readers wait while a request reads */
+    if (filling) __atomic_fetch_add(&g_pl.demand, 1, __ATOMIC_RELAXED);
     double started = now_s();
     const int depth = expert_read_depth();
     const int threads = depth < total ? depth : total;
@@ -2177,51 +2248,17 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     for (;;) {
         const int i = __atomic_fetch_add(&next_read, 1, __ATOMIC_RELAXED);
         if (i >= total) break;
-        const ExpertRead *r = &list[i];
-        int64_t pad = r->t->off % ST_DIRECT_ALIGN;
-        if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {
-            /* A GGUF matrix the slot holds in another form: read into a pooled scratch
-             * buffer, then interleaved by 16 rows or laid out as FP4 and scales. */
-            int64_t raw_n = 0;
-            uint8_t *raw = scratch_get(r->t->nbytes + 2 * ST_DIRECT_ALIGN, &raw_n);
-            st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes, raw + pad,
-                              r->t->nbytes, 1, expert_direct(), "pread expert");
-            const int k = r->part / 2, held = m->gx_h[3 * r->gx_layer + k];
-            int64_t shape[2];
-            v41_gx_shape(&m->c, k, shape);
-            if (held < 0) coli_mxfp4_unblock(r->slot->base[r->part + 1], r->slot->base[r->part], raw + pad,
-                                             shape[0] * shape[1] / 32);
-            else gq_r16_pack(held, r->slot->base[r->part], raw + pad, (int)shape[0], (int)shape[1]);
-            scratch_put(raw, raw_n);
-        } else
-        /* The payload pointer carries the slack st_read_range_rep needs to read
-         * from the enclosing block boundary, so an O_DIRECT transfer lands the
-         * data exactly where the slot wants it and nothing is copied afterwards. */
-        st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes,
-                          r->slot->base[r->part] + pad, r->t->nbytes, 1, expert_direct(),
-                          "pread expert");
-        /* Which drive actually answered. A partial mirror leaves shards on the
-         * primary, so the replica the route picked is not always the one that read. */
-        int rep = r->rep;
-        if (st_fd_rep(&m->S, r->t->fd, rep) < 0) rep = 0;
-        __atomic_fetch_add(&g_mir_bytes[rep], (uint64_t)r->t->nbytes, __ATOMIC_RELAXED);
-        __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
-        bytes += (uint64_t)r->t->nbytes;
+        bytes += expert_read_one(m, &list[i], 1);
     }
+    }
+    if (filling) {
+        __atomic_store_n(&g_pl.demand_ms, (uint64_t)(now_s() * 1000.0), __ATOMIC_RELAXED);
+        __atomic_fetch_sub(&g_pl.demand, 1, __ATOMIC_RELAXED);
     }
     /* Publish the payload pointers only now. A slot that advertises an expert has
      * to address that expert, and until the read landed the window base was the
      * only pointer that meant anything. */
-    for (int i = 0; i < total; i++) {
-        const ExpertRead *r = &list[i];
-        if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {   /* the copy's own */
-            *slot_part(r->slot, r->part) = r->slot->base[r->part];
-            *slot_part(r->slot, r->part + 1) = m->gx_h[3 * r->gx_layer + r->part / 2] < 0 ? r->slot->base[r->part + 1] : NULL;
-        } else {
-            *slot_part(r->slot, r->part) = r->slot->base[r->part] + (r->t->off % ST_DIRECT_ALIGN);
-            if (r->gx_layer >= 0) *slot_part(r->slot, r->part + 1) = NULL;
-        }
-    }
+    for (int i = 0; i < total; i++) expert_publish_one(m, &list[i]);
     m->expert_bytes += bytes;
     m->t_disk += now_s() - started;
     const int gi = v41_gx_index(m, kind, layer);
@@ -2229,8 +2266,219 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         slot[i]->eid = eid[i];
         for (int k = 0; k < 3; k++) slot[i]->gt[k] = gi >= 0 ? m->gx_h[3 * gi + k] : -1;
     }
+    if (g_pl.have && !strcmp(kind, "layers"))   /* the fill's readers skip these */
+        for (int i = 0; i < n; i++)
+            if (eid[i] >= 0 && eid[i] < g_pl.E) __atomic_store_n(&g_pl.have[(size_t)layer * g_pl.E + eid[i]], 1, __ATOMIC_RELAXED);
     free(list);
 }
+
+/* ------------------------------------------------------------ the RAM fill ----
+ *
+ * A start leaves the expert cache empty, and an expert is read from the disk the first time
+ * a request routes to it: on a 510 GB checkpoint the first answers wait for the drive (DS48:
+ * 1.2-4.7 tok/s and 24-31 s to a short prompt's first token, against 14-16 tok/s and 0.6 s
+ * once the experts are in RAM). Where the cache holds every expert and the machine has the
+ * RAM for them (v41_pl_start checks both, and does nothing otherwise), a few reader threads
+ * read the experts no request has asked for yet, in the background, from the moment the
+ * engine is ready.
+ *
+ * The cache has one owner, the serving thread, and it stays so: no lock was added to it. A
+ * reader never touches a layer's slots. It reads an expert into a spare slot of its own (six
+ * windows, as a cache slot's), and queues it; the serving thread places it, where it already
+ * is in the cache's code (the top of a slot lookup, one atomic load when there is nothing)
+ * and while it waits for a command. Placing is an exchange of window pointers with the
+ * layer's next unused slot: nothing is copied, no slot in use moves, and the spare leaves
+ * with that slot's untouched windows for the next read. An expert a request read meanwhile
+ * is dropped there. With room for every expert no slot is ever evicted, so a placed expert
+ * stays. A request that wants an expert the readers have not reached reads it as before;
+ * the readers wait while it does and for V41_PL_QUIET_MS after (g_pl.demand, demand_ms), so
+ * the drive answers the request first.
+ *
+ * V41_RAM_FILL=0: off. V41_RAM_FILL_READERS: the reader threads (4, at most 16).
+ * V41_RAM_FILL_PACE_US: a reader's pause before each expert (0), to slow the fill down.
+ * V41_RAM_FILL_WAIT=1: the engine says READY only once the fill is complete. */
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+#define V41_PL_READERS_MAX 16
+typedef struct {
+    int layer, eid, nread;
+    uint64_t bytes;
+    Slot s;
+    ExpertRead rd[V41_EXPERT_TENSORS];
+} PlSpare;
+static struct {
+    Model *m;
+    int L, readers, pace_us, stop;               /* stop: atomic */
+    int *order, n_order, next;                   /* layer * E + eid in the fill's order; next: atomic */
+    PlSpare *sp; int n_sp;
+    int *freeq, nfree, *readyq, nready, live;    /* under mx */
+    pthread_mutex_t mx; pthread_cond_t cv;
+    pthread_t th[V41_PL_READERS_MAX]; int n_th;
+    double t0;
+    uint64_t bytes;
+    int installed, dup, dropped;
+} g_plw = { .mx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+
+static void *v41_pl_reader(void *arg) {
+    (void)arg;
+    Model *m = g_plw.m;
+#if defined(__linux__) && defined(CPU_SETSIZE)
+    if (getenv("OMP_PROC_BIND")) {   /* a thread is born with its creator's CPUs, and OMP_PROC_BIND bound that one to a place */
+        cpu_set_t all; CPU_ZERO(&all);
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n > CPU_SETSIZE) n = CPU_SETSIZE;
+        for (long i = 0; i < n; i++) CPU_SET((int)i, &all);
+        (void)sched_setaffinity(0, sizeof all, &all);
+    }
+#endif
+    for (;;) {
+        if (__atomic_load_n(&g_plw.stop, __ATOMIC_ACQUIRE)) break;
+        const int i = __atomic_fetch_add(&g_plw.next, 1, __ATOMIC_RELAXED);
+        if (i >= g_plw.n_order) break;
+        const int flat = g_plw.order[i], layer = flat / g_pl.E, eid = flat % g_pl.E;
+        if (g_plw.pace_us > 0) usleep((useconds_t)g_plw.pace_us);
+        if (__atomic_load_n(&g_pl.have[flat], __ATOMIC_RELAXED)) continue;   /* a request read it meanwhile */
+        pthread_mutex_lock(&g_plw.mx);
+        while (!g_plw.nfree && !__atomic_load_n(&g_plw.stop, __ATOMIC_ACQUIRE)) pthread_cond_wait(&g_plw.cv, &g_plw.mx);
+        const int si = g_plw.nfree ? g_plw.freeq[--g_plw.nfree] : -1;
+        pthread_mutex_unlock(&g_plw.mx);
+        if (si < 0) break;
+        PlSpare *sp = &g_plw.sp[si];
+        sp->layer = layer; sp->eid = eid; sp->bytes = 0;
+        sp->nread = expert_read_list(m, "layers", layer, eid, &sp->s, expert_route(layer, eid), sp->rd);
+        int ok = !__atomic_load_n(&g_pl.have[flat], __ATOMIC_RELAXED);   /* read by a request while this waited for a spare */
+        for (int k = 0; k < sp->nread && ok; k++)   /* a tensor its window cannot hold: left to the request that wants it, which refuses it */
+            if (sp->rd[k].t->nbytes < 0 || sp->rd[k].t->nbytes > expert_read_cap(m, &sp->rd[k])) ok = 0;
+        for (int k = 0; k < sp->nread && ok; k++) {
+            while (!__atomic_load_n(&g_plw.stop, __ATOMIC_ACQUIRE)) {   /* a request is reading, or just was: the drive is its */
+                if (__atomic_load_n(&g_pl.demand, __ATOMIC_RELAXED) > 0) { usleep(500); continue; }
+                const uint64_t last = __atomic_load_n(&g_pl.demand_ms, __ATOMIC_RELAXED), now = (uint64_t)(now_s() * 1000.0);
+                if (last && now >= last && now - last < V41_PL_QUIET_MS) { usleep(1000); continue; }
+                break;
+            }
+            if (__atomic_load_n(&g_plw.stop, __ATOMIC_ACQUIRE)) { ok = 0; break; }
+            sp->bytes += expert_read_one(m, &sp->rd[k], 0);
+        }
+        if (ok) {
+            for (int k = 0; k < sp->nread; k++) expert_publish_one(m, &sp->rd[k]);
+            const int gi = v41_gx_index(m, "layers", layer);
+            for (int k = 0; k < 3; k++) sp->s.gt[k] = gi >= 0 ? m->gx_h[3 * gi + k] : -1;
+        }
+        pthread_mutex_lock(&g_plw.mx);
+        if (ok) { g_plw.readyq[g_plw.nready++] = si; __atomic_store_n(&g_pl.poke, 1, __ATOMIC_RELEASE); }
+        else g_plw.freeq[g_plw.nfree++] = si;
+        pthread_mutex_unlock(&g_plw.mx);
+    }
+    pthread_mutex_lock(&g_plw.mx);
+    if (--g_plw.live == 0) __atomic_store_n(&g_pl.poke, 1, __ATOMIC_RELEASE);   /* the serving thread closes the fill */
+    pthread_mutex_unlock(&g_plw.mx);
+    return NULL;
+}
+
+/* The readers have left and everything they read is placed: the fill's line, and its memory back. */
+static void v41_pl_finish(Model *m) {
+    for (int i = 0; i < g_plw.n_th; i++) pthread_join(g_plw.th[i], NULL);
+    g_plw.n_th = 0;
+    const double dt = now_s() - g_plw.t0;
+    int in_ram = 0;
+    for (int i = 0; i < g_plw.L; i++) in_ram += m->cache[i].n;
+    if (!__atomic_load_n(&g_plw.stop, __ATOMIC_ACQUIRE))
+        fprintf(stderr, "[v41] RAM fill: done, %d experts (%.1f GiB) in %.1f s, %.2f GiB/s with %d readers; "
+                        "%d of the model's %d experts in RAM (%d read by a request meanwhile%s)\n",
+                g_plw.installed, g_plw.bytes / 1073741824.0, dt, dt > 0 ? g_plw.bytes / 1073741824.0 / dt : 0.0,
+                g_plw.readers, in_ram, g_plw.L * g_pl.E, g_plw.dup, g_plw.dropped ? "; some found no slot" : "");
+    for (int i = 0; i < g_plw.n_sp; i++)
+        for (int part = 0; part < V41_EXPERT_TENSORS; part++) compat_aligned_free(g_plw.sp[i].s.base[part]);
+    free(g_plw.sp); free(g_plw.freeq); free(g_plw.readyq); free(g_plw.order);
+    g_plw.sp = NULL; g_plw.freeq = g_plw.readyq = g_plw.order = NULL; g_plw.n_sp = 0;
+    uint8_t *have = g_pl.have;
+    g_pl.have = NULL; g_pl.run = 0;
+    free(have);
+}
+
+/* The serving thread places what the readers queued (see the note above). */
+static void v41_pl_install_now(Model *m) {
+    for (;;) {
+        int idx[32], n = 0;
+        pthread_mutex_lock(&g_plw.mx);
+        while (g_plw.nready && n < 32) idx[n++] = g_plw.readyq[--g_plw.nready];
+        const int live = g_plw.live;
+        if (!g_plw.nready) __atomic_store_n(&g_pl.poke, 0, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&g_plw.mx);
+        for (int j = 0; j < n; j++) {
+            PlSpare *sp = &g_plw.sp[idx[j]];
+            LCache *cache = &m->cache[sp->layer];
+            int held = 0;
+            for (int i = 0; i < cache->n && !held; i++) held = cache->slot[i].eid == sp->eid;
+            if (held) { g_plw.dup++; continue; }
+            if (cache->n >= cache->cap || !cache->slot[cache->n].base[0]) { g_plw.dropped++; continue; }
+            Slot *c = &cache->slot[cache->n];
+            for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
+                uint8_t *fresh = c->base[part];
+                c->base[part] = sp->s.base[part];
+                *slot_part(c, part) = *slot_part(&sp->s, part);
+                sp->s.base[part] = fresh;
+                *slot_part(&sp->s, part) = fresh;
+            }
+            for (int k = 0; k < 3; k++) c->gt[k] = sp->s.gt[k];
+            c->vk_rows = NULL;
+            c->used = 0;                 /* never routed to: the first a full cache would give up */
+            c->eid = sp->eid;
+            cache->n++;
+            __atomic_store_n(&g_pl.have[(size_t)sp->layer * g_pl.E + sp->eid], 1, __ATOMIC_RELAXED);
+            g_plw.installed++; g_plw.bytes += sp->bytes;   /* not the turn's bytes (m->expert_bytes): no request read these */
+        }
+        if (n) {
+            pthread_mutex_lock(&g_plw.mx);
+            for (int j = 0; j < n; j++) g_plw.freeq[g_plw.nfree++] = idx[j];
+            pthread_cond_broadcast(&g_plw.cv);
+            pthread_mutex_unlock(&g_plw.mx);
+            continue;
+        }
+        if (!live) v41_pl_finish(m);
+        return;
+    }
+}
+static inline void v41_pl_install(Model *m) {
+    if (__atomic_load_n(&g_pl.poke, __ATOMIC_ACQUIRE)) v41_pl_install_now(m);
+}
+/* A serve loop with nothing to decode: the fill goes on being placed until a command is there. */
+static void v41_pl_idle(Model *m) {
+    while (g_pl.run) {
+        v41_pl_install(m);
+        if (!g_pl.run) return;
+        fd_set readable;
+        struct timeval soon = {0, 20000};
+        FD_ZERO(&readable);
+        FD_SET(STDIN_FILENO, &readable);
+        const int got = select(STDIN_FILENO + 1, &readable, NULL, NULL, &soon);
+        if (got > 0 || (got < 0 && errno != EINTR)) return;   /* a command or the input's end: the caller's read sees it */
+    }
+}
+/* V41_RAM_FILL_WAIT=1: the whole fill before READY. */
+static void v41_pl_wait(Model *m) {
+    while (g_pl.run) {
+        v41_pl_install_now(m);
+        if (g_pl.run) usleep(20000);
+    }
+}
+/* The process ends (or the serve loop did): the readers leave before anything they read from is closed. */
+static void v41_pl_stop(void) {
+    if (!g_plw.n_th) return;
+    __atomic_store_n(&g_plw.stop, 1, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&g_plw.mx);
+    pthread_cond_broadcast(&g_plw.cv);
+    pthread_mutex_unlock(&g_plw.mx);
+    for (int i = 0; i < g_plw.n_th; i++)
+        if (!pthread_equal(pthread_self(), g_plw.th[i])) pthread_join(g_plw.th[i], NULL);
+    g_plw.n_th = 0;
+}
+static void v41_pl_start(Model *m);
+#else
+static inline void v41_pl_install(Model *m) { (void)m; }
+static inline void v41_pl_idle(Model *m) { (void)m; }
+static inline void v41_pl_stop(void) {}
+static inline void v41_pl_start(Model *m) { (void)m; }
+#endif
 
 /* One byte per expert: routed in this turn or not, for the dashboard's HITS line. */
 static pthread_mutex_t g_ehit_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -2282,6 +2530,7 @@ static int v41_victim(const Model *m, const LCache *cache, const char *kind, int
     return oldest;
 }
 static Slot *expert_slot_at(Model *m, LCache *cache, const char *kind, int layer, int eid) {
+    v41_pl_install(m);   /* the RAM fill's experts into their slots, before this lookup */
     if (!strcmp(kind, "layers")) ehit_mark(m, layer, eid);
     for (int i = 0; i < cache->n; i++)
         if (cache->slot[i].eid == eid) {
@@ -2316,6 +2565,7 @@ static void expert_slots_at(Model *m, LCache *cache, const char *kind, int layer
     int miss_eid[64];
     Slot *miss_slot[64];
     int misses = 0;
+    v41_pl_install(m);   /* the RAM fill's experts into their slots, before these lookups */
     for (int k = 0; k < topk; k++) {
         int eid = chosen[k];
         if (!strcmp(kind, "layers")) ehit_mark(m, layer, eid);
@@ -6386,6 +6636,7 @@ static void serve_mux(Model *m, Tok *tokenizer, const char *snap) {
     fprintf(stderr, "[v41] serving %d conversations at once (KV_SLOTS)\n", n);
     for (;;) {
         int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
+        if (!active && !input_eof) v41_pl_idle(m);   /* the RAM fill is placed while no command waits */
         /* idle: wait for a command; decoding: take one only when one is there */
         if (!input_eof && (!active || coli_serve_stdin_ready())) {
             ColiServeCommand command;
@@ -6457,6 +6708,7 @@ static void serve_mux(Model *m, Tok *tokenizer, const char *snap) {
 }
 
 static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
+    v41_pl_start(m);   /* the RAM fill, where the cache and the machine's RAM hold every expert (before READY) */
     if (g_v41_mux_slots > 1) { serve_mux(m, tokenizer, snap); coli_ps_report(&g_v41_ps); return; }
     Cfg *c = &m->c;
     coli_serve_stdio_init();
@@ -6476,6 +6728,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
 
     for (;;) {
         ColiServeCommand command;
+        v41_pl_idle(m);   /* the RAM fill is placed while no command waits */
         ColiServeReadResult result = coli_serve_read_command(stdin, &v41_wire, &command);
         if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) break;
         if (result == COLI_SERVE_READ_NOMEM) {
@@ -7106,6 +7359,187 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
 }
 #endif
 
+/* The RAM fill's start (the note above v41_pl_reader), from serve_loop before READY: the two
+ * checks, the order, the spare slots, the readers.
+ *
+ * The checks. The cache must hold every expert of every backbone layer (the cap), or a fill
+ * would only evict what it read. And the machine must have the RAM now: the experts not yet
+ * in the slots, at the slots' size, against what the system says is available
+ * (compat_meminfo_gb: MemAvailable, or a container's room when that is less) less this
+ * process's mapped weights (MemAvailable counts their pages as memory it could take back,
+ * and they are in use) and a margin (5 % of the machine, 4 GB at least, and the state the
+ * conversations still allocate). A RAM budget (RAM_GB, the gateway's --ram) is kept too:
+ * what the process holds now and the fill must fit in it. Either check failing leaves the
+ * engine as it was, with one line saying which.
+ *
+ * The order: the experts the card does not hold first (the card serves its own), in each
+ * group the history's hottest first where the tier has one (route_trace.h), then an expert
+ * of each layer in turn. */
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+typedef struct { int flat, turn; uint32_t heat; uint8_t dev; } PlOrd;
+static int v41_pl_cmp(const void *a, const void *b) {
+    const PlOrd *x = a, *y = b;
+    if (x->dev != y->dev) return (int)x->dev - (int)y->dev;
+    if (x->heat != y->heat) return x->heat > y->heat ? -1 : 1;
+    return x->turn - y->turn;
+}
+/* This process's resident set and the file-backed part of it, GB; 0 where /proc does not say. */
+static void v41_pl_rss(double *rss_gb_now, double *file_gb) {
+    *rss_gb_now = *file_gb = 0;
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char ln[256]; double kb;
+    while (fgets(ln, sizeof ln, f)) {
+        if (sscanf(ln, "VmRSS: %lf", &kb) == 1) *rss_gb_now = kb * 1024.0 / 1e9;
+        else if (sscanf(ln, "RssFile: %lf", &kb) == 1) *file_gb = kb * 1024.0 / 1e9;
+    }
+    fclose(f);
+}
+static void v41_pl_start(Model *m) {
+    const Cfg *c = &m->c;
+    const char *sw = getenv("V41_RAM_FILL");
+    if (g_pl.run || (sw && *sw == '0') || g_v41_dry || !m->cache || c->n_routed < 1 || c->n_layers < 1) return;
+#ifdef V41_CLUSTER
+    if (g_cluster_n) return;   /* the workers hold the experts, no slot here is read */
+#endif
+    const int L = c->n_layers, E = c->n_routed;
+    int cap_min = E, in_ram = 0;
+    for (int i = 0; i < L; i++) {
+        if (!m->cache[i].slot) return;
+        if (m->cache[i].cap < cap_min) cap_min = m->cache[i].cap;
+        in_ram += m->cache[i].n;
+    }
+    const char *as = "they are read from the disk as requests want them, as before";
+    if (cap_min < E) {
+        fprintf(stderr, "[v41] RAM fill: off, the expert cache holds %d of a layer's %d experts (its cap): %s\n", cap_min, E, as);
+        return;
+    }
+    const int missing = L * E - in_ram;
+    if (missing < 1) return;
+    size_t slot_bytes = 0;
+    for (int part = 0; part < V41_EXPERT_TENSORS; part++) slot_bytes += (size_t)slot_part_bytes(m, part) + ST_DIRECT_ALIGN;
+    const double need = (double)missing * (double)slot_bytes / 1e9;
+    double total = 0, avail = 0, rss = 0, mapped = 0;
+    compat_meminfo_gb(&total, &avail);
+    v41_pl_rss(&rss, &mapped);
+    if (rss <= 0) rss = rss_gb();
+    double margin = total * 0.05;
+    if (margin < 4) margin = 4;
+    {   /* the conversations past the first: windows and compressed KV the RAM does not count yet */
+        double later = 0;
+        for (int i = 0; i < L; i++) {
+            later += (double)c->window * c->head_dim * sizeof(float);
+            if (c->kv_source[i]) {
+                const int ratio = c->compress_ratio[i];
+                later += (double)(c->max_positions / (ratio > 0 ? ratio : 1)) * (double)(c->head_dim + c->index_head_dim) * sizeof(float);
+            }
+        }
+        margin += later * (g_v41_mux_slots > 1 ? g_v41_mux_slots - 1 : 0) / 1e9;
+    }
+    const double room = avail - mapped;
+    if (avail <= 0 || need + margin > room) {
+        fprintf(stderr, "[v41] RAM fill: off, the %d experts not in RAM are %.1f GB and %.1f GB are free for them "
+                        "(%.1f GB available, less %.1f GB of this process's mapped weights, a %.1f GB margin kept): %s\n",
+                missing, need, room > margin ? room - margin : 0.0, avail, mapped, margin, as);
+        return;
+    }
+    const char *rg = getenv("RAM_GB");
+    const double budget = rg && *rg ? atof(rg) : 0;
+    if (budget > 0 && rss + need > budget) {
+        fprintf(stderr, "[v41] RAM fill: off, the %d experts not in RAM are %.1f GB and the process holds %.1f GB: over "
+                        "the RAM budget of %.0f GB (--ram): %s\n", missing, need, rss, budget, as);
+        return;
+    }
+    int readers = 4;
+    const char *re = getenv("V41_RAM_FILL_READERS");
+    if (re && *re) readers = atoi(re);
+    if (readers < 1) readers = 1;
+    if (readers > V41_PL_READERS_MAX) readers = V41_PL_READERS_MAX;
+    const char *pe = getenv("V41_RAM_FILL_PACE_US");
+    g_plw.pace_us = pe && *pe ? atoi(pe) : 0;
+    if (g_plw.pace_us < 0) g_plw.pace_us = 0;
+    if (g_plw.pace_us > 1000000) g_plw.pace_us = 1000000;
+    /* the order */
+    PlOrd *ord = malloc((size_t)missing * sizeof *ord);
+    uint8_t *have = calloc((size_t)L * E, 1);
+    const int n_sp = 2 * readers + 2;
+    PlSpare *sp = calloc((size_t)n_sp, sizeof *sp);
+    int *order = malloc((size_t)missing * sizeof(int)), *freeq = malloc((size_t)n_sp * sizeof(int)), *readyq = malloc((size_t)n_sp * sizeof(int));
+    int ok = ord && have && sp && order && freeq && readyq;
+    for (int i = 0; ok && i < n_sp; i++) {
+        sp[i].s.eid = -1; sp[i].s.gt[0] = sp[i].s.gt[1] = sp[i].s.gt[2] = -1;
+        for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
+            void *window = NULL;
+            if (posix_memalign(&window, ST_DIRECT_ALIGN, (size_t)slot_part_bytes(m, part) + ST_DIRECT_ALIGN) != 0) { ok = 0; break; }
+            sp[i].s.base[part] = window;
+            *slot_part(&sp[i].s, part) = window;
+        }
+    }
+    if (!ok) {
+        for (int i = 0; sp && i < n_sp; i++)
+            for (int part = 0; part < V41_EXPERT_TENSORS; part++) compat_aligned_free(sp[i].s.base[part]);
+        free(ord); free(have); free(sp); free(order); free(freeq); free(readyq);
+        fprintf(stderr, "[v41] RAM fill: off, no memory for its readers: %s\n", as);
+        return;
+    }
+    for (int i = 0; i < L; i++)
+        for (int k = 0; k < m->cache[i].n; k++)
+            if (m->cache[i].slot[k].eid >= 0 && m->cache[i].slot[k].eid < E) have[(size_t)i * E + m->cache[i].slot[k].eid] = 1;
+    int n = 0, on_dev = 0, hot = 0;
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    uint32_t **heat = XT(ready)() ? rt_counts_all() : NULL;
+#endif
+    for (int i = 0; i < L; i++)
+        for (int e = 0; e < E && n < missing; e++) {
+            if (have[(size_t)i * E + e]) continue;
+            PlOrd *o = &ord[n++];
+            o->flat = i * E + e; o->turn = e * L + i; o->heat = 0; o->dev = 0;
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+            o->dev = XT(resident)(i, e) ? 1 : 0;
+            if (heat && heat[i]) o->heat = heat[i][e];
+#endif
+            on_dev += o->dev; hot += o->heat > 0;
+        }
+    qsort(ord, (size_t)n, sizeof *ord, v41_pl_cmp);
+    for (int i = 0; i < n; i++) order[i] = ord[i].flat;
+    free(ord);
+    for (int i = 0; i < n_sp; i++) freeq[i] = i;
+    g_plw.m = m; g_plw.L = L; g_plw.readers = readers; g_plw.stop = 0;
+    g_plw.order = order; g_plw.n_order = n; g_plw.next = 0;
+    g_plw.sp = sp; g_plw.n_sp = n_sp; g_plw.freeq = freeq; g_plw.nfree = n_sp; g_plw.readyq = readyq; g_plw.nready = 0;
+    g_plw.bytes = 0; g_plw.installed = g_plw.dup = g_plw.dropped = 0;
+    g_pl.E = E; g_pl.have = have; g_pl.demand = 0; g_pl.poke = 0; g_pl.demand_ms = 0;
+    g_plw.t0 = now_s();
+    g_plw.live = 0; g_plw.n_th = 0;
+    (void)expert_direct();   /* decided here, once, before the readers ask */
+    pthread_mutex_lock(&g_plw.mx);
+    for (int i = 0; i < readers; i++)
+        if (!pthread_create(&g_plw.th[g_plw.n_th], NULL, v41_pl_reader, NULL)) { g_plw.n_th++; g_plw.live++; }
+    pthread_mutex_unlock(&g_plw.mx);
+    if (!g_plw.n_th) {
+        for (int i = 0; i < n_sp; i++)
+            for (int part = 0; part < V41_EXPERT_TENSORS; part++) compat_aligned_free(sp[i].s.base[part]);
+        free(have); free(sp); free(order); free(freeq); free(readyq);
+        g_pl.have = NULL; g_plw.sp = NULL; g_plw.order = g_plw.freeq = g_plw.readyq = NULL; g_plw.n_sp = 0;
+        fprintf(stderr, "[v41] RAM fill: off, its reader threads did not start: %s\n", as);
+        return;
+    }
+    g_plw.readers = g_plw.n_th;
+    g_pl.run = 1;
+    static int at_exit;
+    if (!at_exit) { at_exit = 1; atexit(v41_pl_stop); }
+    const char *wt = getenv("V41_RAM_FILL_WAIT");
+    const int wait = wt && *wt && *wt != '0';
+    char hist[64] = "";
+    if (hot) snprintf(hist, sizeof hist, ", the history's %d hottest first", hot);
+    fprintf(stderr, "[v41] RAM fill: %d experts (%.1f GB) into RAM %s, %d readers (V41_RAM_FILL_READERS), the %d the card "
+                    "holds last%s; %.1f GB free for them with a %.1f GB margin kept (V41_RAM_FILL=0: off)\n",
+            n, need, wait ? "before READY (V41_RAM_FILL_WAIT)" : "in the background, a request's own reads first",
+            g_plw.readers, on_dev, hist, room - margin, margin);
+    if (wait) v41_pl_wait(m);
+}
+#endif
+
 /* GGUF_CHECK's verdict, once model_load has looked up everything it reads: 0 = every tensor
  * the engine loads is in the file with its type and bytes and the file has nothing else, 3 =
  * the file holds tensors the engine does not read (listed), 1 = a mismatch (the loader said
@@ -7297,6 +7731,7 @@ int main(int argc, char **argv) {
         const char *seed = getenv("SEED");
         srand(seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)time(NULL));
         serve_loop(&m, &tokenizer, snap);
+        v41_pl_stop();   /* the RAM fill's readers, were they still reading */
         vk_report();
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
         XT(report)("run", m.hits, m.miss);
