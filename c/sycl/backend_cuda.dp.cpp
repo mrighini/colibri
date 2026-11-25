@@ -3113,7 +3113,7 @@ catch (sycl::exception const &exc) {
  * ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)). Here lane j of 8 is accumulator lane j: columns j, j+8, ... in order,
  * the same fmas from +0, the same sub-group shifts (4, 2, 1) as e4m3t. bf16 -> float is a shift (exact, NaNs
  * kept). I a multiple of 8 (the CPU's tail loop never runs). */
-struct ColiBf16t { int device, O, I; uint16_t *w; };
+struct ColiBf16t { int device, O, I; uint16_t *w; int lb; };   /* lb: 0 the rows as they are, else blocks of lb outputs (bf16t3_kernel) */
 template <int SG>
 static void bf16t_kernel(float *y, int ystride, const float *x, int xstride, const uint16_t *w, int S, int I, int O) {
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -3193,20 +3193,124 @@ static void bf16t2_kernel(float *y, int ystride, const float *x, int xstride, co
     }
 }
 static int bf16t_v1(void) { const char *e = getenv("COLI_SYCL_BF16T_V1"); return e && atoi(e) > 0; }
+/* bf16t3_kernel: bf16t2_kernel's arithmetic, so mvb_cpu's bits, at what the card streams (DS51). Two changes, neither
+ * one of an operation:
+ *  - the bytes: bf16t2's work-item walks its own 10 KB row, so the 16 lanes of a sub-group ask for 16 different cache
+ *    lines a step, and the lm head (129280 x 5120, 1.32 GB, past every cache) came at ~550 GB/s where a read-only
+ *    kernel over one contiguous run a sub-group gets ~650. Here the matrix is stored in blocks of LB outputs, a block's
+ *    step t (8 columns, 16 bytes an output) as [lane][4 dwords]: a sub-group's step is one run of SG * 16 bytes
+ *    (LB = SG) or every other run (LB = 2 * SG: two sub-groups a block). The last block is padded with zero rows.
+ *  - the rows: NR is a template argument (bf16t2 tests r < nr four times a step), 1..4; coli_cuda_bf16t_mv launches a
+ *    pass per four rows. With both, 1 to 4 rows cost the same 2.0-2.1 ms on a Max 1100 (bf16t2: 2.4 / 2.6 / 3.0 / 3.5).
+ * Each output still has its eight accumulators in one work-item: columns j, j+8, ... in order, fma from +0, then
+ * ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7)). test_sycl_bf16t holds it to the reference and to bf16t2_kernel byte for byte.
+ * A matrix gets the layout at upload: COLI_SYCL_BF16T_LB=32 any matrix, =0 none (bf16t2_kernel, the rows as they are).
+ * Unset: none while BF16T_ILV_DEFAULT is 0. The kernel's shape was memcmp-equal to bf16t2_kernel on the card in
+ * sycl/tests/bench_sycl_bf16_head (DS51), but this file's version of it has not run there yet (test_sycl_bf16t,
+ * launch-ds51b.sh: the host was lost first); once that passes, 1: the matrices of BF16T_ILV_MIN bytes and more (the
+ * head; the small ones are cache-resident and stay as they were). COLI_SYCL_BF16T_V1=1 at upload keeps the rows too. */
+#define BF16T_LB 32
+#define BF16T_ILV_MIN ((size_t)64 << 20)
+#define BF16T_ILV_DEFAULT 0
+template <int SG, int LB, int NR>
+static void bf16t3_kernel(float *y, int ystride, const float *x, int xstride, const uint32_t *w, int I, int O) {
+    static_assert(LB == SG || LB == 2 * SG, "a block is one sub-group or two");
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const size_t sgi = item.get_group(2) * (item.get_local_range(2) / SG) + sg.get_group_id()[0];
+    const int lane = (int)sg.get_local_id()[0];
+    const size_t o = sgi * SG + lane;
+    if (sgi * SG >= (size_t)O) return;   /* past the last block: the whole sub-group (no sub-group operation below) */
+    const size_t blk = LB == SG ? sgi : sgi >> 1;
+    const int bl = LB == SG ? lane : (int)(sgi & 1) * SG + lane;
+    const int nit = I / 8;
+    const uint32_t *base = w + blk * (size_t)nit * (LB * 4) + (size_t)bl * 4;
+    float acc[NR][8];
+#pragma unroll
+    for (int r = 0; r < NR; r++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) acc[r][j] = 0.0f;
+#pragma unroll 4
+    for (int t = 0; t < nit; t++) {
+        const sycl::uint4 q = *(const sycl::uint4 *)(base + (size_t)t * (LB * 4));
+        const uint32_t wd[4] = { q.x(), q.y(), q.z(), q.w() };
+        float wv[8];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            wv[2 * k] = sycl::bit_cast<float>(wd[k] << 16);
+            wv[2 * k + 1] = sycl::bit_cast<float>(wd[k] & 0xffff0000u);
+        }
+#pragma unroll
+        for (int r = 0; r < NR; r++) {
+            const float *xr = x + (size_t)r * xstride + (size_t)t * 8;
+#pragma unroll
+            for (int j = 0; j < 8; j++) acc[r][j] = sycl::fma(wv[j], xr[j], acc[r][j]);
+        }
+    }
+    if (o < (size_t)O) {
+#pragma unroll
+        for (int r = 0; r < NR; r++) {
+            const float a0 = acc[r][0] + acc[r][4], a1 = acc[r][1] + acc[r][5], a2 = acc[r][2] + acc[r][6], a3 = acc[r][3] + acc[r][7];
+            const float b0 = a0 + a2, b1 = a1 + a3;
+            y[(size_t)r * ystride + o] = b0 + b1;
+        }
+    }
+}
+/* the layout a matrix of `bytes` gets at upload */
+static int bf16t_lb(size_t bytes) {
+    if (bf16t_v1()) return 0;
+    const char *e = getenv("COLI_SYCL_BF16T_LB");
+    if (e && *e) return atoi(e) == BF16T_LB ? BF16T_LB : 0;
+    return BF16T_ILV_DEFAULT && bytes >= BF16T_ILV_MIN ? BF16T_LB : 0;
+}
+/* rows [o0, o0 + n * lb) of w into n blocks at dst: a block's step t as [lane][16 bytes]; rows past O are zeros */
+static void bf16t_blocks(uint8_t *dst, const unsigned short *w, size_t o0, size_t n, int lb, int O, int I) {
+    const int nit = I / 8;
+    const size_t blk_bytes = (size_t)lb * I * 2;
+    for (size_t b = 0; b < n; b++)
+        for (int lane = 0; lane < lb; lane++) {
+            const size_t o = o0 + b * lb + lane;
+            uint8_t *d = dst + b * blk_bytes + (size_t)lane * 16;
+            if (o < (size_t)O) {
+                const uint8_t *src = (const uint8_t *)(w + o * (size_t)I);
+                for (int t = 0; t < nit; t++) std::memcpy(d + (size_t)t * lb * 16, src + (size_t)t * 16, 16);
+            } else {
+                for (int t = 0; t < nit; t++) std::memset(d + (size_t)t * lb * 16, 0, 16);
+            }
+        }
+}
 extern "C" void *coli_cuda_bf16t_upload(int device, const unsigned short *w, int O, int I) try {
     if (fault_injected() || !w || O < 1 || I < 8 || (I & 7)) return NULL;
     DeviceContext *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return NULL;
-    const size_t wb = (size_t)O * I * sizeof(uint16_t);
+    const int lb = bf16t_lb((size_t)O * I * sizeof(uint16_t));
+    const size_t blk_bytes = (size_t)(lb ? lb : 1) * I * sizeof(uint16_t), nb = lb ? ((size_t)O + lb - 1) / lb : (size_t)O;
+    const size_t wb = nb * blk_bytes;   /* lb: the last block padded to lb rows */
     ColiBf16t *t = (ColiBf16t *)std::calloc(1, sizeof *t);
     if (!t) return NULL;
-    t->device = device; t->O = O; t->I = I;
-    if (COLI_SYCL_ALLOC(t->w, (uint16_t *)sycl::malloc_device(wb, dq()), wb) != 0 ||
-        COLI_SYCL_TRY(dq().memcpy(t->w, w, wb).wait()) != 0) {
+    t->device = device; t->O = O; t->I = I; t->lb = lb;
+    int bad = COLI_SYCL_ALLOC(t->w, (uint16_t *)sycl::malloc_device(wb, dq()), wb) != 0;
+    if (!bad && !lb) bad = COLI_SYCL_TRY(dq().memcpy(t->w, w, wb).wait()) != 0;
+    if (!bad && lb) {   /* through a host buffer of ~32 MB of blocks */
+        size_t per = ((size_t)32 << 20) / blk_bytes;
+        if (per < 1) per = 1;
+        if (per > nb) per = nb;
+        uint8_t *stage = (uint8_t *)std::malloc(per * blk_bytes);
+        bad = !stage;
+        for (size_t b0 = 0; !bad && b0 < nb; b0 += per) {
+            const size_t n = nb - b0 < per ? nb - b0 : per;
+            bf16t_blocks(stage, w, b0 * lb, n, lb, O, I);
+            bad = COLI_SYCL_TRY(dq().memcpy((uint8_t *)t->w + b0 * blk_bytes, stage, n * blk_bytes).wait()) != 0;
+        }
+        std::free(stage);
+    }
+    if (bad) {
         try { dq().wait(); } catch (...) {}
         if (t->w) sycl::free(t->w, dq());
         std::free(t); return NULL;
     }
+    if (lb) std::fprintf(stderr, "[SYCL] BF16 matrix %d x %d (%.2f GiB) in blocks of %d outputs: bf16t3_kernel, the same bits (COLI_SYCL_BF16T_LB=0: the rows as they are, bf16t2_kernel)\n",
+                         O, I, (double)wb / (double)((size_t)1 << 30), lb);
     return t;
 }
 catch (sycl::exception const &exc) { sycl_caught(exc, "coli_cuda_bf16t_upload"); return NULL; }
@@ -3229,7 +3333,20 @@ extern "C" int coli_cuda_bf16t_mv(void *h, float *y, int ystride, const float *x
     else for (int r = 0; r < S; r++)
         if (!cuda_ok(COLI_SYCL_TRY(dq().memcpy(ctx->dx + (size_t)r * I, x + (size_t)r * xstride, (size_t)I * 4)), "bf16t input upload")) return 0;
     float *dy = ctx->dy; const float *dx = ctx->dx; const uint16_t *dw = t->w;
-    if (bf16t_v1()) {
+    if (t->lb) {   /* the blocks: a pass per four rows, the row count the kernel's */
+        const uint32_t *dw32 = (const uint32_t *)t->w;
+        dpct::dim3 grid((unsigned)((O + 255) / 256), 1u);
+        for (int r0 = 0; r0 < S; r0 += BF2_ROWS) {
+            const int nr = S - r0 < BF2_ROWS ? S - r0 : BF2_ROWS;
+            float *yy = dy + (size_t)r0 * O; const float *xx = dx + (size_t)r0 * I;
+            switch (nr) {
+            case 1: COLI_SG_LAUNCH(dq(), 16, grid, 256, 0, bf16t3_kernel<SG, BF16T_LB, 1>(yy, O, xx, I, dw32, I, O)); break;
+            case 2: COLI_SG_LAUNCH(dq(), 16, grid, 256, 0, bf16t3_kernel<SG, BF16T_LB, 2>(yy, O, xx, I, dw32, I, O)); break;
+            case 3: COLI_SG_LAUNCH(dq(), 16, grid, 256, 0, bf16t3_kernel<SG, BF16T_LB, 3>(yy, O, xx, I, dw32, I, O)); break;
+            default: COLI_SG_LAUNCH(dq(), 16, grid, 256, 0, bf16t3_kernel<SG, BF16T_LB, 4>(yy, O, xx, I, dw32, I, O)); break;
+            }
+        }
+    } else if (bf16t_v1()) {
         const int outs_per_wg = 256 / 8;
         dpct::dim3 grid((unsigned)((O + outs_per_wg - 1) / outs_per_wg), (unsigned)((S + E4T_ROWS - 1) / E4T_ROWS));
         COLI_SG_LAUNCH(dq(), ctx->sg, grid, 256, 0, bf16t_kernel<SG>(dy, O, dx, I, dw, S, I, O));
