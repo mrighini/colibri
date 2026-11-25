@@ -1553,6 +1553,10 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
                      v41u_state_pull(ch, m, start, E, pc, pw) && cc_submit(1);
                 const float *x0 = (const float *)cc_ptr(ch->xd), *p0 = (const float *)cc_ptr(ch->hpd);
                 v41u_use(ch, 1);
+                /* the frames from here on read and write the second device's list: f.list was the primary's, taken before
+                 * the layers (DS55: layer 20's top-k wrote the primary's buffer from a kernel on the second card, a GPU
+                 * page fault there; on the CPU test device, one memory for both, it had computed the right selection) */
+                f.list = ch->lw_list;
                 ok = ok && cc_begin() && cc_write(ch->lw_xs, 0, x0, (size_t)HD * sizeof(float)) &&
                      cc_write(ch->lw_hp, 0, p0, (size_t)hr * sizeof(float)) && cc_submit(1);
                 loaded = 0;
