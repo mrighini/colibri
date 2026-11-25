@@ -141,6 +141,19 @@ static const std::vector<sycl::device> &gpu_list(void) {
      * initialises: this is the process's first runtime call, so it is set here, never over a
      * value the environment chose (Dockerfile.sycl sets it for the image as well) */
     setenv("ZES_ENABLE_SYSMAN", "1", 0);
+    /* COLI_SYCL_TEST_CPU=n (tests on a machine without a card): the list is the runtime's CPU device n times, each
+     * entry a logical device with its own context and queues (two entries: a second card's paths), no GPU read */
+    if (const char *tc = getenv("COLI_SYCL_TEST_CPU")) {
+        const int n = atoi(tc);
+        try {
+            std::vector<sycl::device> cpus = sycl::device::get_devices(sycl::info::device_type::cpu);
+            for (int i = 0; i < n && i < 8 && !cpus.empty(); i++) list.push_back(cpus[0]);
+        } catch (const sycl::exception &e) {
+            std::fprintf(stderr, "[SYCL] device discovery (COLI_SYCL_TEST_CPU): %s\n", e.what());
+            list.clear();
+        }
+        if (n > 0) return list;
+    }
     try {
         std::vector<sycl::device> all = sycl::device::get_devices(sycl::info::device_type::gpu);
         bool have_l0 = false;
