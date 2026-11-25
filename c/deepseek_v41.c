@@ -7115,7 +7115,10 @@ static void v41_e4_preload_model(Model *m) {
 #endif
 /* layers lo..hi-1's, and the head's with them when head (V41_CHAIN_SPLIT: a device's part) */
 static size_t v41_cu_dense_span(const Model *m, int lo, int hi, int head) {
-    size_t b = head ? v41_cu_wb(&m->head) : 0;
+    /* the head: a GGUF's goes up through cud_mm (mvb's V41_CU). The native checkpoint's never does: it is the CPU's, or
+     * V41_HEAD_GPU's BF16 copy, up before the tier sizes itself -- counting its f32 rows here (2.47 GiB of V4.1-Flash)
+     * left that much of the card empty */
+    size_t b = head && m->head.gx ? v41_cu_wb(&m->head) : 0;
     for (int i = lo; i < hi; i++) {
         const Layer *l = &m->L[i];
         b += v41_cu_w8(&l->wq_a) + v41_cu_w8(&l->wq_b) + v41_cu_w8(&l->wkv) + v41_cu_w8(&l->wo_a) +
