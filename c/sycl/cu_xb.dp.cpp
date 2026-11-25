@@ -745,15 +745,20 @@ static void cu_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVk
     *g = e ? e->g : NULL; *u = e ? e->u : NULL; *d = e ? e->d : NULL;
 }
 /* An expert's entry for the dense chain's routed experts (vk_tier.c's vkt_dev_table, then cc_moe's table): the
- * CcExpert of its three tensors when all three are in the primary device's memory (pool 1) -- weights and the scales
- * as the tier stores them (fmt 7: one float 2^(s-127) a 32 inputs: cc_moe with CcMoe.gs 32) -- else a zero entry,
- * which cc_moe skips and the engine computes on the CPU (the host pool's experts, the second device's). Returns 1 (an
- * entry written) for both; the table's count then counts the zero entries of the host pool too. */
+ * CcExpert of its three tensors when all three are in one device's memory (the primary's pool 1, or the second
+ * device's pool 3: the tier asks for a second-device expert only with a home by layer, for the chain that runs that
+ * layer there) -- weights and the scales as the tier stores them (fmt 7: one float 2^(s-127) a 32 inputs: cc_moe with
+ * CcMoe.gs 32) -- else a zero entry, which cc_moe skips and the engine computes on the CPU (the host pool's experts).
+ * Returns 1 (an entry written) for both; the table's count then counts the zero entries of the host pool too. */
 static int cu_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry) {
     static_assert(sizeof(CcExpert) <= 32 * sizeof(uint32_t), "a CcExpert fits COLI_VK_XB_ENTRY words");
     if (!entry) return 0;
     std::memset(entry, 0, 32 * sizeof(uint32_t));
-    if (!e || !e->g || !e->u || !e->d || e->g->pool != 1 || e->u->pool != 1 || e->d->pool != 1) return 1;
+    /* a device's own memory: the primary's (pool 1), or the second device's (pool 3) for a chain that runs there and
+     * reads its tables there (the tier's home by layer names each layer's experts on that layer's device only) */
+    if (!e || !e->g || !e->u || !e->d) return 1;
+    const int pl = e->g->pool;
+    if ((pl != 1 && pl != 3) || e->u->pool != pl || e->d->pool != pl) return 1;
     CcExpert x;
     std::memset(&x, 0, sizeof x);
     x.g = e->g->w; x.u = e->u->w; x.d = e->d->w; x.gs = e->g->s; x.us = e->u->s; x.ds = e->d->s;
