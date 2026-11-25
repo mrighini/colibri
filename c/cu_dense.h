@@ -40,8 +40,31 @@ typedef struct {
     size_t budget, used;
     unsigned long long calls, rows;
     pthread_t thread;
+    /* a second device for an engine's chain that runs some layers there (cud_second, cud_place): the matrices
+     * uploaded while it is the place go to it, against a budget of its own; dev/budget/used are the place's now,
+     * the other device's kept in alt_* */
+    int two, place, alt_dev;
+    size_t alt_budget, alt_used;
 } CuDense;
 static CuDense g_cud;
+/* A second device with its own dense budget (bytes the engine counted for the matrices it will upload there).
+ * After cud_open/cud_open_whole took the primary's. */
+static void cud_second(int dev, size_t budget) {
+    if (!g_cud.on) return;
+    g_cud.two = 1; g_cud.place = 0; g_cud.alt_dev = dev; g_cud.alt_budget = budget; g_cud.alt_used = 0;
+}
+/* The device new uploads go to from now on: 0 the primary, 1 the second (cud_second). Returns the place before.
+ * A matrix already up stays where it is (its handle says which device). */
+static int cud_place(int place) {
+    const int was = g_cud.place;
+    place = place != 0;
+    if (!g_cud.on || !g_cud.two || place == was) return was;
+    const int d = g_cud.dev; const size_t b = g_cud.budget, u = g_cud.used;
+    g_cud.dev = g_cud.alt_dev; g_cud.budget = g_cud.alt_budget; g_cud.used = g_cud.alt_used;
+    g_cud.alt_dev = d; g_cud.alt_budget = b; g_cud.alt_used = u;
+    g_cud.place = place;
+    return was;
+}
 #define CUD_ROWS 512   /* a call's rows at most (cud_mm) */
 
 /* a GGUF's float matrix (F32, F16, BF16: no block form on the card): a chain's copy goes up as f32
@@ -271,6 +294,14 @@ static void cud_map_free(void) {
 }
 
 static void cud_report(const char *engine) {
+    if (g_cud.two) {
+        cud_place(0);
+        if (g_cud.mats || g_cud.left)
+            fprintf(stderr, "[CUDA] %s: %d dense matrices on two devices (%.2f GiB on the primary, %.2f GiB on the second), %d left to "
+                            "the CPU; %llu calls, %llu rows\n", engine, g_cud.mats, g_cud.used / 1073741824.0,
+                    g_cud.alt_used / 1073741824.0, g_cud.left, g_cud.calls, g_cud.rows);
+        return;
+    }
     if (g_cud.mats || g_cud.left)
         fprintf(stderr, "[CUDA] %s: %d dense matrices on the device (%.2f GiB), %d left to the CPU; %llu calls, %llu rows\n",
                 engine, g_cud.mats, g_cud.used / 1073741824.0, g_cud.left, g_cud.calls, g_cud.rows);

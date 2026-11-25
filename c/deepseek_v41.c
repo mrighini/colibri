@@ -7113,9 +7113,10 @@ static void v41_e4_preload_model(Model *m) {
     fprintf(stderr, "[v41] V41_TRUNK_GPU: %llu trunk matrices on the device, %.2f GiB (BF16 %llu, %.2f GiB), before the tier\n", g_e4_mats + g_b16_mats, g_e4_used / 1073741824.0, g_b16_mats, g_b16_used / 1073741824.0);
 }
 #endif
-static size_t v41_cu_dense_bytes(const Model *m) {
-    size_t b = v41_cu_wb(&m->head);
-    for (int i = 0; i < m->c.n_layers; i++) {
+/* layers lo..hi-1's, and the head's with them when head (V41_CHAIN_SPLIT: a device's part) */
+static size_t v41_cu_dense_span(const Model *m, int lo, int hi, int head) {
+    size_t b = head ? v41_cu_wb(&m->head) : 0;
+    for (int i = lo; i < hi; i++) {
         const Layer *l = &m->L[i];
         b += v41_cu_w8(&l->wq_a) + v41_cu_w8(&l->wq_b) + v41_cu_w8(&l->wkv) + v41_cu_w8(&l->wo_a) +
              v41_cu_w8(&l->wo_b) + v41_cu_w8(&l->idx_wq_b) + v41_cu_w8(&l->sh_w1) + v41_cu_w8(&l->sh_w3) +
@@ -7124,6 +7125,8 @@ static size_t v41_cu_dense_bytes(const Model *m) {
     }
     return b;
 }
+static size_t v41_cu_dense_bytes(const Model *m) { return v41_cu_dense_span(m, 0, m->c.n_layers, 1); }
+static size_t g_v41_cud2;   /* V41_CHAIN_SPLIT: the room the second device's layers' matrices take there */
 #endif
 /* what a prompt's chain allocates on the tier's device: the CUDA chain's at most (a GGUF or the
  * native FP8 on the CUDA tier, COLI_CUDA_CHAIN not 0; KV_SLOTS > 1 only with the decode steps on
@@ -7304,6 +7307,10 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
                     .ram_floor = expert * (size_t)c->n_activated * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .ram_later = v41_state_later(m) + v41_ps_plan(),
                     .dense_bytes = v41_tier_dense_bytes(m), .chain_bytes = v41_tier_chain_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
+#ifdef COLI_CUDA
+                    /* V41_CHAIN_SPLIT: the experts of the layers the chain runs on the second device live there only */
+                    .home_split = xt_cuda() ? g_v41u_split : 0, .dense_bytes2 = xt_cuda() && g_v41u_split ? g_v41_cud2 : 0,
+#endif
                     .load = vk_load, .release = vk_unhold, .load_ctx = m, .load_batch = vk_load_batch};
     rt_init("deepseek_v41", c->n_layers, c->n_routed);
     rt_drop_row(c->n_layers);   /* no MTP row: the history is the backbone's */
@@ -7321,6 +7328,18 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
 #endif
     const int tier_on = XT(init)(&vc, rt_counts_all());
     free(lgu); free(ldn);   /* read during XT(init) only */
+#ifdef COLI_CUDA
+    if (xt_cuda() && g_v41u_split && (!tier_on || XT(home)() != g_v41u_split)) {
+        /* the tier did not take the second device (no room, not opened): one device as before, the whole trunk's
+         * budget back on the primary (what the tier left of the card may not hold it: the chain then declines) */
+        fprintf(stderr, "[CUDA] deepseek_v41 chain: V41_CHAIN_SPLIT=%d not in force (the tier holds no experts on a second device); "
+                        "one device as before\n", g_v41u_split);
+        g_v41u_split = 0;
+        cud_place(0);
+        g_cud.two = 0;
+        if (g_cud.on) g_cud.budget = v41_cu_dense_bytes(m);
+    }
+#endif
     if (!tier_on) { rt_destroy(); g_vk_usage[0] = 0; return; }
     atexit(XT(shutdown));
     int all = c->n_layers * c->n_routed;
@@ -7701,7 +7720,15 @@ int main(int argc, char **argv) {
             else {
                 g_v41_cu = 1;
                 xt_use_cuda(1);
-                g_v41_cud = cud_open("deepseek_v41", coli_cuda_device_at(0), v41_cu_dense_bytes(&m));
+                /* V41_CHAIN_SPLIT: the layers from g_v41u_split on, their matrices and their experts, on the second device */
+                g_v41u_split = v41u_split_decide(&m, opened);
+                g_v41_cud = cud_open("deepseek_v41", coli_cuda_device_at(0),
+                                     v41_cu_dense_span(&m, 0, g_v41u_split ? g_v41u_split : c->n_layers, 1));
+                if (g_v41u_split && !g_cud.on) g_v41u_split = 0;
+                if (g_v41u_split) {
+                    g_v41_cud2 = v41_cu_dense_span(&m, g_v41u_split, c->n_layers, 0);
+                    cud_second(coli_cuda_device_at(1), g_v41_cud2);
+                }
                 v41_e4_start(coli_cuda_device_at(0));   /* V41_TRUNK_GPU: before the tier, which then sizes itself on what is left */
 #ifdef COLI_SYCL
                 v41_e4_preload_model(&m);

@@ -42,10 +42,30 @@ typedef struct {
     int s0;         /* the segment's first row: lw_xs, lw_hp, lw_ds, lw_mask and lw_in hold its rows from it */
 } V41UFwd;
 
+/* The buffers a device holds that are not a layer's own: the parameters, a step's scratch, the routed experts' rows
+ * and tables. One set a device (V41_CHAIN_SPLIT: two devices); V41U's members of these names are the current
+ * device's (v41u_use trades the two sets). A layer's own buffers and matrices are on its device. */
+#define V41U_BANK \
+    CcBuf *prm; \
+    CcBuf *xs, *xn, *mix, *hpa, *hpf, *col, *nrm, *qa, *qr, *q, *kv, *heads, *grp, *br, *craw, *cscr; \
+    CcBuf *iq, *ihw, *isc, *cs, *erows, *ekv, *gs, *us, *hs, *ds, *h2d, *xd, *hpd, *pull, *routed; \
+    CcBuf *lw_xs, *lw_hp, *lw_ds, *lw_list, *lw_mask; \
+    CcBuf *cm_bias, *cm_tab;      /* every layer's gate bias (E floats) and table (E CcExpert), at i * E */ \
+    CcBuf *cm_lg, *cm_ids, *cm_w, *cm_hid, *cm_y, *cm_hy, *cm_yd; \
+    CcBuf *cm_flag;
+typedef struct { V41U_BANK } V41UBank;
 typedef struct {
     int ok, W, Wd, K, rmax, rows;
     size_t wcap;
-    CcBuf *prm;
+    union { V41UBank bank; struct { V41U_BANK }; };   /* the current device's */
+    V41UBank bank2;                                   /* the other device's (V41_CHAIN_SPLIT) */
+    /* V41_CHAIN_SPLIT: layers split.. run on the second device (devs[1]), the ones before on the primary (devs[0]);
+     * nd 2 then, dcur the device whose bank and chain context are current. ikm[k], kvm: a second-device kv_source
+     * layer's index keys mirrored on the primary for its index sources that read them in a decode step (the keys
+     * published last), and the rows each slot's mirror holds ([SL * n_layers]) */
+    int split, nd, dcur, devs[2];
+    CcBuf **ikm; int *kvm;
+    unsigned long long sp_steps; double sp_ms;        /* the hand-offs between the devices and their time */
     size_t *o_an, *o_fn, *o_qn, *o_kn, *o_sink, *o_hca, *o_hcf, *o_cn, *o_ikn, *o_eq, *o_ek;
     ColiCudaTensor **fna, **fnf;
     CcBuf **win, **ckv, **ikey, **ring;
@@ -54,9 +74,6 @@ typedef struct {
     int SL, hd, ihd;
     int *kv_valid;   /* [SL * n_layers]: slot s, layer i at s * n_layers + i */
     int *ccap, *win_valid;   /* win_valid: [SL] */
-    CcBuf *xs, *xn, *mix, *hpa, *hpf, *col, *nrm, *qa, *qr, *q, *kv, *heads, *grp, *br, *craw, *cscr;
-    CcBuf *iq, *ihw, *isc, *cs, *erows, *ekv, *gs, *us, *hs, *ds, *h2d, *xd, *hpd, *pull, *routed;
-    CcBuf *lw_xs, *lw_hp, *lw_ds, *lw_list, *lw_mask;
     float *lw_in, *lw_out;
     size_t lw_cap;
     unsigned long long forwards, one_row;
@@ -69,9 +86,6 @@ typedef struct {
     float cm_lim;
     unsigned cm_epoch;            /* the tier's epoch the device tables were last built at */
     ColiCudaTensor **cm_gate;     /* every layer's gate [E][dim] (v41u_tb) */
-    CcBuf *cm_bias, *cm_tab;      /* every layer's gate bias (E floats) and table (E CcExpert), at i * E */
-    CcBuf *cm_lg, *cm_ids, *cm_w, *cm_hid, *cm_y, *cm_hy, *cm_yd;
-    CcBuf *cm_flag;
     float *cm_mbuf;               /* the batched misses' gate/up and down rows */
     int cm_batch;                 /* V41_CHAIN_MOE_BATCH (default 1): a layer's misses together; -1 unread */               /* DOWN: the frame's word once its routes are down (cc_signal), the host's misses start then */
     unsigned cm_seq;
@@ -95,6 +109,50 @@ typedef struct {
 } V41U;
 static V41U *g_v41u;
 static int g_v41u_off;   /* declined for good (set up refused, or COLI_CUDA_CHAIN=0) */
+
+/* ---- V41_CHAIN_SPLIT: the layers on two devices ------------------------------------------------
+ * V41_CHAIN_SPLIT=<layer>|auto with a second device open (COLI_VK_DEV2): the chain runs the layers before
+ * <layer> on the primary device and the ones from it on on the second. Each device holds its layers' matrices,
+ * their state (window rings, compressed rows, index keys) and, in the tier, its layers' routed experts only
+ * (VktConfig.home_split: an expert has one home, its layer's device), so two cards hold twice the residents a
+ * layer and each card half the trunk. A decode step's streams and mixes cross once, through the host (a few
+ * KB a row, no peer copy): down from the primary after its last layer, up to the second before its first.
+ * Decode steps only (one row, or V41_CHAIN_ROWS's rows): a prompt's layers stay the CPU's, as with KV_SLOTS > 1.
+ *
+ * Where a split may be (v41u_split_ok): at a kv_source layer of compress ratio 1 that is an index source. Then
+ * every layer from it on reads compressed rows and, in a decode step, index keys of layers from it on only
+ * (the layer publishes at every position), its selection is written before its attention reads the list, and
+ * the candidate mask (written at or after it) is the second device's. The layers before it may read the
+ * second device's index keys -- the ones published last, in a step where their own source does not publish:
+ * rows of earlier positions only (their ratios are above 1), which the host holds; those go up to a mirror on
+ * the primary (ikm) as far as it does not hold them. The same kernels on either device: the same bits.
+ * With one device, or unset: nothing here runs and the chain is as before. */
+static int g_v41u_split;   /* the first layer of the second device, decided at start (v41u_split_decide); 0 none */
+static int v41u_cand_on(const Cfg *c);
+static int v41u_split_ok(const Cfg *c, int s) {
+    if (s <= 0 || s >= c->n_layers || !c->kv_source[s] || c->compress_ratio[s] != 1 || !c->index_source[s]) return 0;
+    for (int i = 0; i < s; i++) if (c->index_source[i] && c->compress_ratio[i] == 1) return 0;   /* would read this step's keys */
+    if (v41u_cand_on(c) && c->candidate_source < s)   /* a mask written on the primary, read on the second */
+        for (int i = s; i < c->n_layers; i++) if (c->index_source[i] && c->compress_ratio[i] > 0) return 0;
+    return 1;
+}
+static int v41u_dev_of(const V41U *ch, int i) { return ch->split > 0 && i >= ch->split; }
+static V41UBank *v41u_bank(V41U *ch, int d) { return d == ch->dcur ? &ch->bank : &ch->bank2; }
+/* device d's chain context and bank current (0 the primary; 1 the second, V41_CHAIN_SPLIT only) */
+static void v41u_use(V41U *ch, int d) {
+    if (ch->nd < 2 || d == ch->dcur) return;
+    const V41UBank t = ch->bank; ch->bank = ch->bank2; ch->bank2 = t;
+    ch->dcur = d;
+    cc_device(ch->devs[d]);
+}
+/* a device of the chain's is lost (the current one stays current) */
+static int v41u_any_lost(V41U *ch) {
+    if (ch->nd < 2) return cc_lost();
+    int lost = 0;
+    for (int d = 0; d < ch->nd; d++) { cc_device(ch->devs[d]); lost |= cc_lost(); }
+    cc_device(ch->devs[ch->dcur]);
+    return lost;
+}
 
 /* the slot whose state the chain reads and writes: the one the Model holds (v41_mux_bind), -1 none */
 static int v41u_slot(const V41U *ch) { return ch->SL > 1 ? g_v41_mux_cur : 0; }
@@ -142,6 +200,8 @@ static void v41u_lower(Model *m, int pos) {
         for (int i = 0; i < m->c.n_layers; i++) {
             int r = m->c.compress_ratio[i];
             if (m->c.kv_source[i] && r > 0 && kvv[i] > pos / r) kvv[i] = pos / r;
+            if (ch->kvm && m->c.kv_source[i] && r > 0 && ch->kvm[(size_t)s * m->c.n_layers + i] > pos / r)
+                ch->kvm[(size_t)s * m->c.n_layers + i] = pos / r;
         }
     }
 }
@@ -242,6 +302,28 @@ static int v41u_routes_down(const V41U *ch) {
     if (v41u_mark_on()) return cc_reached();
     return *(volatile unsigned *)cc_ptr(ch->cm_flag) >= ch->cm_seq;
 }
+/* V41_CHAIN_SPLIT at start, before the dense budgets and the tier: the first layer of the second device, 0 for one
+ * device (not asked; or said why not). auto: the layer nearest the middle a split may be at (v41u_split_ok). */
+static int v41u_split_decide(const Model *m, int two_devices) {
+    const char *e = getenv("V41_CHAIN_SPLIT");
+    if (!e || !*e || !strcmp(e, "0")) return 0;
+    const Cfg *c = &m->c;
+    const char *why = NULL;
+    int s = 0;
+    if (!two_devices) why = "no second device is open (COLI_VK_DEV2 and a second entry in COLI_GPUS)";
+    else if (!v41u_native(m)) why = "the model is not the native FP8 checkpoint";
+    else if (v41u_min_rows() != 1) why = "the decode steps are not on the chain (COLI_CUDA_V41_MIN=1)";
+    else if (!strcmp(e, "auto")) {
+        for (int i = 1; i < c->n_layers; i++)
+            if (v41u_split_ok(c, i) && (!s || abs(2 * i - c->n_layers) < abs(2 * s - c->n_layers))) s = i;
+        if (!s) why = "no layer of this model can start the second device (a kv_source of ratio 1 that is an index source)";
+    } else {
+        s = atoi(e);
+        if (!v41u_split_ok(c, s)) { s = 0; why = "that layer cannot start the second device (a kv_source of ratio 1 that is an index source)"; }
+    }
+    if (why) fprintf(stderr, "[CUDA] deepseek_v41 chain: V41_CHAIN_SPLIT=%s ignored: %s; one device as before\n", e, why);
+    return s;
+}
 static void v41u_report(void) {   /* where a chain forward's time went (PLAN-scale S3) */
     { const char *fp = getenv("COLI_SYCL_FRAME_PROF"); if (fp && *fp && strcmp(fp, "0")) cc_shutdown(); }   /* its per-command books, printed once */
     const V41U *ch = g_v41u;
@@ -272,6 +354,10 @@ static void v41u_report(void) {   /* where a chain forward's time went (PLAN-sca
     if (ch->cm_layers || ch->rw_steps)
         fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: the routes' word %s (V41_CHAIN_MARK); batched steps: the host waited %.2f ms a "
                         "step for the routes\n", v41u_mark_on() ? "a mark the host polls" : "a host task", ch->rw_steps ? ch->rw_wait_ms / (double)ch->rw_steps : 0.0);
+    if (ch->split && ch->sp_steps)
+        fprintf(stderr, "[CUDA] deepseek_v41 chain (V41_CHAIN_SPLIT): %llu decode steps crossed from device %d to device %d before layer %d, "
+                        "%.3f ms each (the primary's state and the rows down, the rows up)\n", ch->sp_steps, ch->devs[0], ch->devs[1],
+                ch->split, ch->sp_ms / (double)ch->sp_steps);
     if (ch->cm_checked)
         fprintf(stderr, "[CUDA] deepseek_v41 chain MoE check: %llu pairs, max rel err %.3g, mean %.3g (the CPU's routing differed "
                         "in %llu, max route weight diff %.3g)\n", ch->cm_checked, ch->cm_err_max, ch->cm_err_sum / (double)ch->cm_checked,
@@ -315,7 +401,16 @@ static int v41u_setup(Model *m) {
     ch->cm_batch = -1;
     g_v41u = ch;
     const char *why = NULL;
-    if (!cc_init(g_cud.dev) || !cc_ready()) why = "the chain's context did not come up";
+    /* V41_CHAIN_SPLIT, in force only with the tier's home by layer at the same layer and a second dense budget */
+    ch->nd = 1; ch->dcur = 0;
+    cud_place(0);
+    ch->devs[0] = ch->devs[1] = g_cud.dev;
+    if (g_v41u_split > 0 && g_cud.two && XT(home)() == g_v41u_split && v41u_split_ok(c, g_v41u_split)) {
+        ch->split = g_v41u_split; ch->nd = 2; ch->devs[1] = g_cud.alt_dev;
+        if (!(ch->ikm = (CcBuf **)calloc((size_t)L, sizeof *ch->ikm)) || !(ch->kvm = (int *)calloc((size_t)L * SL, sizeof(int)))) why = "memory";
+        else if (!cc_init(ch->devs[1]) || !cc_ready()) why = "the chain's context on the second device did not come up";
+    }
+    if (!why && (!cc_init(g_cud.dev) || !cc_ready())) why = "the chain's context did not come up";
     size_t **offs[] = {&ch->o_an, &ch->o_fn, &ch->o_qn, &ch->o_kn, &ch->o_sink, &ch->o_hca, &ch->o_hcf, &ch->o_cn, &ch->o_ikn, &ch->o_eq, &ch->o_ek};
     for (size_t k = 0; !why && k < sizeof offs / sizeof *offs; k++) if (!(*offs[k] = (size_t *)calloc((size_t)L, sizeof(size_t)))) why = "memory";
     if (!why && (!(ch->fna = (ColiCudaTensor **)calloc((size_t)L, sizeof *ch->fna)) || !(ch->fnf = (ColiCudaTensor **)calloc((size_t)L, sizeof *ch->fnf)) ||
@@ -360,12 +455,17 @@ static int v41u_setup(Model *m) {
             memcpy(a + ch->o_ek[i], l->eng_k.w, (size_t)H * D * sizeof(float));
         }
     }
-    if (!why && !(v41u_res(&ch->prm, n, CC_DEV) && cc_begin() && cc_write(ch->prm, 0, a, n * sizeof(float)) && cc_submit(1)))
-        why = "the parameters did not reach the device";
+    for (int d = 0; !why && d < ch->nd; d++) {   /* the whole arena on each device: a layer's offsets are the same on both */
+        v41u_use(ch, d);
+        if (!(v41u_res(&ch->prm, n, CC_DEV) && cc_begin() && cc_write(ch->prm, 0, a, n * sizeof(float)) && cc_submit(1)))
+            why = "the parameters did not reach the device";
+    }
     free(a);
-    /* every layer's matrices (cu_dense.h's copies) and state */
+    /* every layer's matrices (cu_dense.h's copies) and state, on its device */
     for (int i = 0; !why && i < L; i++) {
         Layer *l = &m->L[i];
+        v41u_use(ch, v41u_dev_of(ch, i));
+        cud_place(v41u_dev_of(ch, i));
         const int r = c->compress_ratio[i], og = c->o_groups, ol = c->o_lora;
         const char *bad = NULL; int bt = -1, bo = 0, bi = 0;
         #define V41U_NEED(t_, w_, nm_) do { if (!bad && !(t_)) { bad = nm_; bt = (w_)->gx ? (w_)->gt : -1; bo = (w_)->O; bi = (w_)->I; } } while (0)
@@ -394,6 +494,8 @@ static int v41u_setup(Model *m) {
             (c->kv_source[i] && r > 1 && !(ch->ring[i] = cc_buf((size_t)SL * 2 * r * hd * sizeof(float), CC_DEV))))
             why = "device memory for the layers' state";
     }
+    v41u_use(ch, 0);
+    cud_place(0);
     if (why) {
         fprintf(stderr, "[CUDA] deepseek_v41 chain: %s; the CPU runs a prompt's layers\n", why);
         g_v41u_off = 1;
@@ -401,6 +503,10 @@ static int v41u_setup(Model *m) {
     }
     ch->ok = 1;
     atexit(v41u_report);
+    if (ch->split)
+        fprintf(stderr, "[CUDA] deepseek_v41 chain (V41_CHAIN_SPLIT): layers 0..%d on device %d, layers %d..%d on device %d, each with "
+                        "its matrices, state and resident experts; a decode step's streams cross once through the host; a prompt's "
+                        "layers on the CPU\n", ch->split - 1, ch->devs[0], ch->split, L - 1, ch->devs[1]);
     if (SL > 1) fprintf(stderr, "[CUDA] deepseek_v41 chain: %d conversations' state on the card (KV_SLOTS), their decode steps "
                                 "one row at a time; their prompts on the CPU\n", SL);
     fprintf(stderr, "[CUDA] deepseek_v41 chain: a prompt's %d layers on the card, layer by layer (%.1f MiB of parameters; "
@@ -427,12 +533,23 @@ static int v41u_cache(V41U *ch, Model *m, int i, int rows) {
         g_v41u_off = 1;   /* for good: forward_rows batches its rows on the CPU again */
         return 0;
     }
+    const int was = ch->dcur, home = v41u_dev_of(ch, i);
+    v41u_use(ch, home);
     cc_free(ch->ckv[i]); cc_free(ch->ikey[i]);
     ch->ckv[i] = cc_buf((size_t)ch->SL * cap * c->head_dim * sizeof(float), CC_DEV);
     ch->ikey[i] = cc_buf((size_t)ch->SL * cap * c->index_head_dim * sizeof(float), CC_DEV);
     for (int s = 0; s < ch->SL; s++) v41u_kvv(ch, m, s)[i] = 0;
     ch->ccap[i] = 0;
-    if (!ch->ckv[i] || !ch->ikey[i]) return 0;
+    int ok = ch->ckv[i] && ch->ikey[i];
+    if (ok && ch->split && home == 1) {   /* a second-device source's index keys mirrored on the primary, the same regions */
+        v41u_use(ch, 0);
+        cc_free(ch->ikm[i]);
+        ch->ikm[i] = cc_buf((size_t)ch->SL * cap * c->index_head_dim * sizeof(float), CC_DEV);
+        for (int s = 0; s < ch->SL; s++) ch->kvm[(size_t)s * c->n_layers + i] = 0;
+        ok = ch->ikm[i] != NULL;
+    }
+    v41u_use(ch, was);
+    if (!ok) return 0;
     ch->ccap[i] = cap;
     return 1;
 }
@@ -514,6 +631,12 @@ static int v41u_wo_a(V41U *ch, Model *m, Layer *l, int nr) {
         for (int k = 0; k < og; k++) rg[s * og + k] = (CcRegion){(size_t)s * og * ol + (size_t)k * ol, (size_t)k * nr * ol + (size_t)s * ol, (size_t)ol};
     return ok && cc_ops()->copy_regions(ch->grp, ch->heads, rg, n);
 }
+/* the index keys of layer k as layer i's device holds them: k's own buffer on its device, the mirror on the primary
+ * for a second-device source (V41_CHAIN_SPLIT); NULL where the other device's would be needed (the op refuses) */
+static CcBuf *v41u_keys(const V41U *ch, int i, int k) {
+    if (!ch->split || v41u_dev_of(ch, i) == v41u_dev_of(ch, k)) return ch->ikey[k];
+    return v41u_dev_of(ch, i) == 0 ? ch->ikm[k] : NULL;
+}
 static int v41u_attention(V41U *ch, Model *m, int i, const V41UFwd *f) {
     Cfg *c = &m->c; Layer *l = &m->L[i];
     const int hd = c->head_dim, nh = c->n_heads, rd = c->rope_dim, QL = c->q_lora, r = c->compress_ratio[i];
@@ -571,7 +694,7 @@ static int v41u_attention(V41U *ch, Model *m, int i, const V41UFwd *f) {
         for (int s = 0; ok && s < nr; s += same ? nr : 1) {
             CcDsScore sp = {same ? nr : 1, pb + s, r, IH, ID, width, s * IH * ID, IH * ID, s * IH, IH, (int)v41u_io(ch, kl[s], sl), ID, mrow,
                             (int)ch->wcap, wscale, s * (int)ch->wcap, (lr + s) * mrow};
-            ok = cc_ds_score(ch->iq, ch->ihw, ch->ikey[kl[s]], mrow ? ch->lw_mask : NULL, ch->isc, &sp);
+            ok = cc_ds_score(ch->iq, ch->ihw, v41u_keys(ch, i, kl[s]), mrow ? ch->lw_mask : NULL, ch->isc, &sp);
         }
         if (ok && cand && cs == i) {
             CcDsCand cp = {nr, pb, r, width, c->candidate_block_size, c->candidate_topk_blocks, (int)ch->wcap, (int)ch->wcap,
@@ -647,21 +770,38 @@ static void v41u_chunk_tables(const V41U *ch, const Model *m, int start, int pb,
         for (int k = W; k < LR; k++) wl[(size_t)s * LR + k] = -1;
     }
 }
-static int v41u_state_up(V41U *ch, Model *m, int start, const int *need) {
+/* the layers the current device runs: [*lo, *hi) (all of them without V41_CHAIN_SPLIT) */
+static void v41u_span(const V41U *ch, const Model *m, int *lo, int *hi) {
+    *lo = ch->split && ch->dcur == 1 ? ch->split : 0;
+    *hi = ch->split && ch->dcur == 0 ? ch->split : m->c.n_layers;
+}
+/* The bound slot's state up as far as the current device does not hold it, its layers' only (V41_CHAIN_SPLIT);
+ * needm (the primary, with a split): the rows of each second-device source's index keys its layers read, to the
+ * mirror. */
+static int v41u_state_up(V41U *ch, Model *m, int start, const int *need, const int *needm) {
     const Cfg *c = &m->c;
     const int L = c->n_layers, W = ch->W, hd = c->head_dim, sl = v41u_slot(ch);
     const size_t wo = v41u_wo(ch, sl);
     const int *kvv = v41u_kvv(ch, m, sl);
-    int ok = 1;
+    int ok = 1, lo, hi;
+    v41u_span(ch, m, &lo, &hi);
     for (int q = ch->win_valid[sl] > start - W + 1 ? ch->win_valid[sl] : start - W + 1; q < start && ok; q++) {
         if (q < 0) continue;
-        for (int i = 0; i < L && ok; i++) {
+        for (int i = lo; i < hi && ok; i++) {
             const Layer *l = &m->L[i];
             if (l->window_pos[q % W] != q) continue;
             ok = cc_write(ch->win[i], wo + (size_t)(q % ch->Wd) * hd, l->window + (size_t)(q % W) * hd, (size_t)hd * sizeof(float));
         }
     }
-    for (int i = 0; i < L && ok; i++) {
+    for (int k = ch->split; ok && ch->split && ch->dcur == 0 && needm && k < L; k++) {   /* the mirrors: rows of earlier positions, the host's */
+        if (!c->kv_source[k] || !ch->ikm[k]) continue;
+        int *km = ch->kvm + (size_t)sl * L + k;
+        const int ihd = c->index_head_dim, t0 = *km, t1 = needm[k];
+        if (t1 <= t0) continue;
+        ok = cc_write(ch->ikm[k], v41u_io(ch, k, sl) + (size_t)t0 * ihd, m->L[k].ikey + (size_t)t0 * ihd, (size_t)(t1 - t0) * ihd * sizeof(float));
+        if (ok) *km = t1;   /* a frame that fails lowers it (v41u_mirror_reset) */
+    }
+    for (int i = lo; i < hi && ok; i++) {
         if (!c->kv_source[i]) continue;
         const Layer *l = &m->L[i];
         const int r = c->compress_ratio[i], ihd = c->index_head_dim, t0 = kvv[i], t1 = need[i];
@@ -676,12 +816,20 @@ static int v41u_state_up(V41U *ch, Model *m, int start, const int *need) {
     }
     return ok;
 }
+/* a failed frame: what the bound slot's mirrors hold is not known */
+static void v41u_mirror_reset(V41U *ch, Model *m) {
+    const int sl = v41u_slot(ch);
+    if (!ch->kvm || sl < 0 || sl >= ch->SL) return;
+    memset(ch->kvm + (size_t)sl * m->c.n_layers, 0, (size_t)m->c.n_layers * sizeof(int));
+}
+/* the current device's layers' new state into its pull buffer (the plan's offsets are the same on both) */
 static int v41u_state_pull(V41U *ch, Model *m, int start, int E, const size_t *pc, size_t pw) {
     const Cfg *c = &m->c;
-    const int L = c->n_layers, W = ch->W, hd = c->head_dim, sl = v41u_slot(ch);
+    const int W = ch->W, hd = c->head_dim, sl = v41u_slot(ch);
     const size_t wo = v41u_wo(ch, sl);
-    int ok = 1;
-    for (int i = 0; i < L && ok; i++) {
+    int ok = 1, lo, hi;
+    v41u_span(ch, m, &lo, &hi);
+    for (int i = lo; i < hi && ok; i++) {
         const int q0 = E - W > start ? E - W : start, nq = E - q0;
         CcRegion *rg = (CcRegion *)malloc((size_t)nq * sizeof *rg);
         if (!rg) return 0;
@@ -701,12 +849,13 @@ static int v41u_state_pull(V41U *ch, Model *m, int start, int E, const size_t *p
  * row (keyl[i * n + t]: indexer_run, published_owner), the rows of each kv_source layer the forward
  * reads that it does not produce first (need), the last layer that publishes new keys (*last_pub, -1
  * none), and every kv_source layer's device cache for them (v41u_cache). 0: a cache refused. */
-static int v41u_plan_keys(V41U *ch, Model *m, int start, int n, int *keyl, int *need, int *last_pub) {
+static int v41u_plan_keys(V41U *ch, Model *m, int start, int n, int *keyl, int *need, int *needm, int *last_pub) {
     const Cfg *c = &m->c;
     const int L = c->n_layers, E = start + n;
     static int tidy = -1;
     if (tidy < 0) tidy = getenv("V41_INDEX_OWNER") != NULL;
     for (int i = 0; i < L; i++) need[i] = c->kv_source[i] && c->compress_ratio[i] > 0 ? start / c->compress_ratio[i] : 0;
+    if (needm) memset(needm, 0, (size_t)L * sizeof(int));   /* V41_CHAIN_SPLIT: a second-device source's rows the primary's layers read */
     int pub = m->published_index_k ? m->published_index_layer : -1, lp = -1;
     for (int i = 0; i < L; i++) {
         const int r = c->compress_ratio[i];
@@ -724,6 +873,8 @@ static int v41u_plan_keys(V41U *ch, Model *m, int start, int n, int *keyl, int *
             }
             keyl[(size_t)i * n + t] = k;
             if (c->index_source[i] && (start + t + 1) / r > need[k]) need[k] = (start + t + 1) / r;
+            if (needm && ch->split && i < ch->split && k >= ch->split && c->index_source[i] && (start + t + 1) / r > needm[k])
+                needm[k] = (start + t + 1) / r;
         }
     }
     *last_pub = lp;
@@ -732,6 +883,7 @@ static int v41u_plan_keys(V41U *ch, Model *m, int start, int n, int *keyl, int *
         if (!c->kv_source[i]) continue;
         const int r = c->compress_ratio[i], host = c->max_positions / r;
         if (need[i] > host) need[i] = host;
+        if (needm && needm[i] > host) needm[i] = host;
         const int want = need[i] > E / r ? need[i] : E / r;
         ok = v41u_cache(ch, m, i, want > 0 ? want : 1);
     }
@@ -758,9 +910,9 @@ static size_t v41u_pull_plan(const V41U *ch, const Model *m, int start, int n, s
 static void v41u_state_apply(V41U *ch, Model *m, int start, int n, const size_t *pc, size_t pw, int last_pub) {
     const Cfg *c = &m->c;
     const int L = c->n_layers, W = ch->W, hd = c->head_dim, E = start + n, sl = v41u_slot(ch);
-    const float *pl = (const float *)cc_ptr(ch->pull);
     for (int i = 0; i < L; i++) {
         Layer *l = &m->L[i];
+        const float *pl = (const float *)cc_ptr(v41u_bank(ch, v41u_dev_of(ch, i))->pull);   /* its device's */
         const int q0 = E - W > start ? E - W : start;
         for (int t = 0; t < n; t++) {
             const int p = start + t, slot = p % W;
@@ -837,14 +989,24 @@ static int v41u_cmoe_tables(V41U *ch, Model *m, int whole) {
     for (int i = 0; i < L; i++) any |= ch->cm_dirty[i];
     if (!any) { ch->cm_epoch = ep; return 1; }
     const size_t ef = sizeof(CcExpert) / sizeof(float);   /* cc_write's offsets are in floats */
-    int ok = cc_begin();
-    const int opened = ok;
-    for (int i = 0; ok && i < L; i++) {
-        if (!ch->cm_dirty[i]) continue;
-        ok = v41u_cmoe_read(ch, i) &&
-             cc_write(ch->cm_tab, (size_t)i * E * ef, ch->cm_tabh + (size_t)i * E, (size_t)E * sizeof(CcExpert));
+    const int was = ch->dcur;
+    int ok = 1;
+    for (int d = 0; ok && d < ch->nd; d++) {   /* a layer's table on its device (V41_CHAIN_SPLIT: a frame a device with dirty layers) */
+        int lo, hi, some = 0;
+        v41u_use(ch, d);
+        v41u_span(ch, m, &lo, &hi);
+        for (int i = lo; i < hi; i++) some |= ch->cm_dirty[i];
+        if (!some) continue;
+        ok = cc_begin();
+        const int opened = ok;
+        for (int i = lo; ok && i < hi; i++) {
+            if (!ch->cm_dirty[i]) continue;
+            ok = v41u_cmoe_read(ch, i) &&
+                 cc_write(ch->cm_tab, (size_t)i * E * ef, ch->cm_tabh + (size_t)i * E, (size_t)E * sizeof(CcExpert));
+        }
+        if (opened) ok = cc_submit(1) && ok;
     }
-    if (opened) ok = cc_submit(1) && ok;
+    v41u_use(ch, was);
     if (!ok) return 0;
     ch->cm_reads++;
     ch->cm_epoch = ep;
@@ -881,21 +1043,28 @@ static int v41u_cmoe_setup(V41U *ch, Model *m) {
         Layer *l = &m->L[i];
         if (!l->gate_bias.w) { why = "a layer without a gate bias"; break; }
         memcpy(bias + (size_t)i * E, l->gate_bias.w, (size_t)E * sizeof(float));
+        v41u_use(ch, v41u_dev_of(ch, i));
+        cud_place(v41u_dev_of(ch, i));
         if (!(ch->cm_gate[i] = v41u_tb(&l->gate_w))) {
             fprintf(stderr, "[CUDA] deepseek_v41 chain MoE: layer %d's gate not on the device (the dense budget %.2f of %.2f GiB used)\n",
                     i, g_cud.used / 1073741824.0, g_cud.budget / 1073741824.0);
             why = "a gate the device's dense budget does not take";
         }
     }
-    if (!why && !(v41u_res(&ch->cm_bias, (size_t)L * E, CC_DEV) &&
-                  cc_reserve(&ch->cm_tab, (size_t)L * E * sizeof(CcExpert), CC_DEV) && v41u_res(&ch->cm_lg, (size_t)E, CC_DEV) &&
-                  cc_reserve(&ch->cm_ids, (size_t)K * sizeof(int), CC_DOWN) && v41u_res(&ch->cm_w, (size_t)K, CC_DOWN) &&
-                  v41u_res(&ch->cm_hid, cc_moe_hid_floats(1, K, D, I, E), CC_DEV) && v41u_res(&ch->cm_y, (size_t)D, CC_DEV) &&
-                  v41u_res(&ch->cm_hy, (size_t)D, CC_UP) && v41u_res(&ch->cm_yd, (size_t)D, CC_DOWN) &&
-                  v41u_res(&ch->cm_flag, 16, CC_DOWN)))
-        why = "device memory for the router and the experts' rows";
-    if (!why && !(cc_begin() && cc_write(ch->cm_bias, 0, bias, (size_t)L * E * sizeof(float)) && cc_submit(1)))
-        why = "the gate biases did not reach the device";
+    cud_place(0);
+    for (int d = 0; d < ch->nd; d++) {   /* the router's and the experts' rows, every layer's bias and table, on each device */
+        v41u_use(ch, d);
+        if (!why && !(v41u_res(&ch->cm_bias, (size_t)L * E, CC_DEV) &&
+                      cc_reserve(&ch->cm_tab, (size_t)L * E * sizeof(CcExpert), CC_DEV) && v41u_res(&ch->cm_lg, (size_t)E, CC_DEV) &&
+                      cc_reserve(&ch->cm_ids, (size_t)K * sizeof(int), CC_DOWN) && v41u_res(&ch->cm_w, (size_t)K, CC_DOWN) &&
+                      v41u_res(&ch->cm_hid, cc_moe_hid_floats(1, K, D, I, E), CC_DEV) && v41u_res(&ch->cm_y, (size_t)D, CC_DEV) &&
+                      v41u_res(&ch->cm_hy, (size_t)D, CC_UP) && v41u_res(&ch->cm_yd, (size_t)D, CC_DOWN) &&
+                      v41u_res(&ch->cm_flag, 16, CC_DOWN)))
+            why = "device memory for the router and the experts' rows";
+        if (!why && !(cc_begin() && cc_write(ch->cm_bias, 0, bias, (size_t)L * E * sizeof(float)) && cc_submit(1)))
+            why = "the gate biases did not reach the device";
+    }
+    v41u_use(ch, 0);
     free(bias);
     if (!why && !v41u_cmoe_tables(ch, m, 1)) why = "the tier's tables (vkt_dev_table) refused";
     if (why) { v41u_cmoe_off(ch, why); return 0; }
@@ -1033,7 +1202,7 @@ static int v41u_cmoe_misses(V41U *ch, Model *m, int i, const float *x, const int
 static int v41u_cmoe_d2_issue(Model *m, int i, int S, int K, const float *x, const int *ids, uint8_t *want, uint8_t *taken) {
     const int draws = S * K;
     memset(taken, 0, (size_t)draws);
-    if (XT(devices)() < 2) return 0;
+    if (XT(devices)() < 2 || XT(home)() > 0) return 0;
     int idm[4 * CC_ROUTE_KMAX];
     for (int d = 0; d < draws; d++) idm[d] = want[d] ? ids[d] : -1;
     const int n = XT(issue)(v41_tier_layer(m, "layers", i), x, S, K, idm, taken);
@@ -1260,6 +1429,7 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     if (spec || T || !v41u_wanted(m, n)) return 0;
     if (!v41u_setup(m)) return 0;
     V41U *ch = g_v41u;
+    if (ch->split && n != 1) return 0;      /* V41_CHAIN_SPLIT: a decode step's one row; a prompt's layers the CPU's */
     const int sl = v41u_slot(ch);
     if (sl < 0 || sl >= ch->SL) return 0;   /* no slot bound (serve_mux binds one before every forward) */
     const double tfw = now_s();
@@ -1276,7 +1446,7 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     if (cand && (size_t)per * (size_t)E >= (size_t)0x7fffffff) return 0;   /* the mask's offsets */
     V41UFwd f = {start, n, 0, 0, rows * rd, NULL, NULL, 0, 0};
     f.keyl = (int *)malloc((size_t)L * n * sizeof(int));
-    int *need = (int *)calloc((size_t)L, sizeof(int));
+    int *need = (int *)calloc((size_t)2 * L, sizeof(int)), *needm = need && ch->split ? need + L : NULL;   /* needm: the mirrors' rows */
     size_t *pc = (size_t *)calloc((size_t)L, sizeof(size_t));
     int *wl = (int *)malloc((size_t)rows * LR * sizeof(int));
     float *cs_ = (float *)malloc((size_t)(rows + ch->rmax) * 2 * rd * sizeof(float));
@@ -1286,7 +1456,7 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     /* whose index keys each index source reads, per row (indexer_run, published_owner), and the
      * rows of each kv_source layer the forward reads that it does not produce first */
     int last_pub = -1;
-    ok = ok && v41u_plan_keys(ch, m, start, n, f.keyl, need, &last_pub);
+    ok = ok && v41u_plan_keys(ch, m, start, n, f.keyl, need, needm, &last_pub);
     /* what comes back at the end: each layer's window rows, its compressed rows, keys and group */
     const size_t pw = (size_t)(n < W ? n : W) * hd;
     const size_t pn = ok ? v41u_pull_plan(ch, m, start, n, 0, pc) : 0;
@@ -1299,6 +1469,13 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         for (size_t k = 0; k < sizeof lb / sizeof *lb; k++) { cc_free(*lb[k]); *lb[k] = NULL; }
         if (per <= 2 * rows) ok = 0;
         else per = (per / 2 + rows - 1) / rows * rows;
+    }
+    if (ok && ch->split) {   /* the same buffers on the second device (one row: one chunk, one segment) */
+        v41u_use(ch, 1);
+        ok = v41u_scratch(ch, m, rows, E) && v41u_res(&ch->pull, pn, CC_DOWN) && v41u_res(&ch->lw_list, (size_t)n * LR, CC_DEV) &&
+             v41u_res(&ch->lw_xs, (size_t)per * HD, CC_DEV) && v41u_res(&ch->lw_hp, (size_t)per * hr, CC_DEV) &&
+             v41u_res(&ch->lw_ds, (size_t)per * D, CC_DEV) && (!cand || v41u_res(&ch->lw_mask, ((size_t)per * E + 3) / 4, CC_DEV));
+        v41u_use(ch, 0);
     }
     if (ok && per < n) {
         static int said;
@@ -1323,12 +1500,16 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         return 0;
     }
     for (int s = 0; s < rows; s++) hp0[(size_t)s * hr] = 1.0f;   /* the first site collapses with [1, 0, ...] */
-    ok = cc_begin() && v41u_state_up(ch, m, start, need) && cc_submit(1);
-    for (int c0 = 0; ok && c0 < n; c0 += rows) {   /* the window halves of every row's list */
-        const int nr = n - c0 < rows ? n - c0 : rows;
-        v41u_chunk_tables(ch, m, start, start + c0, nr, f.csB, cs_, wl);
-        ok = cc_begin() && cc_write(ch->lw_list, (size_t)c0 * LR, wl, (size_t)nr * LR * sizeof(int)) && cc_submit(1);
+    for (int d = 0; ok && d < ch->nd; d++) {   /* each device its layers' state and the lists (V41_CHAIN_SPLIT: two) */
+        v41u_use(ch, d);
+        ok = cc_begin() && v41u_state_up(ch, m, start, need, needm) && cc_submit(1);
+        for (int c0 = 0; ok && c0 < n; c0 += rows) {   /* the window halves of every row's list */
+            const int nr = n - c0 < rows ? n - c0 : rows;
+            v41u_chunk_tables(ch, m, start, start + c0, nr, f.csB, cs_, wl);
+            ok = cc_begin() && cc_write(ch->lw_list, (size_t)c0 * LR, wl, (size_t)nr * LR * sizeof(int)) && cc_submit(1);
+        }
     }
+    v41u_use(ch, 0);
     /* past the cross-layer source only the chunks of the prompt's tail (v41_prefill_tail) from tf on */
     const int tail = m->ptail_rows > 0 && m->ptail_after < L - 1;
     int tf = 0;
@@ -1363,6 +1544,21 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         }
         for (int i = 0; ok && i < L; i++) {
             Layer *l = &m->L[i];
+            if (ch->split && i == ch->split) {   /* the primary's layers are through: its state back, the row's streams and mix to the second device */
+                const double th0 = now_s();
+                /* V41_CHAIN_DIRECT: the row is in the layer's buffers (xs, hpf), not in the stash; it goes to the second
+                 * device's stash either way, and that device's first layer loads it from there (loaded = 0) */
+                ok = cc_begin() && cc_copy(ch->xd, 0, direct ? ch->xs : ch->lw_xs, 0, (size_t)HD) &&
+                     cc_copy(ch->hpd, 0, direct ? ch->hpf : ch->lw_hp, 0, (size_t)hr) &&
+                     v41u_state_pull(ch, m, start, E, pc, pw) && cc_submit(1);
+                const float *x0 = (const float *)cc_ptr(ch->xd), *p0 = (const float *)cc_ptr(ch->hpd);
+                v41u_use(ch, 1);
+                ok = ok && cc_begin() && cc_write(ch->lw_xs, 0, x0, (size_t)HD * sizeof(float)) &&
+                     cc_write(ch->lw_hp, 0, p0, (size_t)hr * sizeof(float)) && cc_submit(1);
+                loaded = 0;
+                ch->sp_steps++; ch->sp_ms += (now_s() - th0) * 1e3;
+                if (!ok) break;
+            }
             const int first = tail && i > m->ptail_after && tf > s0 ? tf : s0;
             if (first >= se) continue;
             double ta = now_s();
@@ -1526,9 +1722,11 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         }
     }
     free(hp0);
+    v41u_use(ch, 0);
     if (!ok || stopped) {   /* a frame failed, or the prompt was stopped: the host state as it was, the device's stale */
         free(f.keyl); free(need); free(pc); free(wl); free(cs_); free(er); free(outs); free(pres);
         v41u_lower(m, start);
+        v41u_mirror_reset(ch, m);
         if (!ok) { *lost = 1; g_v41u_off = 1; ch->ok = 0; fprintf(stderr, "[CUDA] deepseek_v41 chain: a frame failed; the CPU runs the layers from now on\n"); }
         return 0;
     }
@@ -1641,7 +1839,7 @@ static int v41u_attention_rows(V41U *ch, Model *m, int i, int S, const int *slot
             const int sl = slots[t], pb = pos[t], width = (pb + 1) / r, kl = keyl[(size_t)t * L + i];
             CcDsScore sp = {1, pb, r, IH, ID, width, t * IH * ID, IH * ID, t * IH, IH, (int)v41u_io(ch, kl, sl), ID, mrow,
                             (int)ch->wcap, wscale, 0, t * mrow};
-            ok = cc_ds_score(ch->iq, ch->ihw, ch->ikey[kl], mrow ? ch->lw_mask : NULL, ch->isc, &sp);
+            ok = cc_ds_score(ch->iq, ch->ihw, v41u_keys(ch, i, kl), mrow ? ch->lw_mask : NULL, ch->isc, &sp);
             if (ok && cand && cs == i) {
                 CcDsCand cp = {1, pb, r, width, c->candidate_block_size, c->candidate_topk_blocks, (int)ch->wcap, (int)ch->wcap,
                                t * (int)ch->wcap};
@@ -1693,7 +1891,8 @@ static int v41u_forward_rows(Model *m, const int *slots, const int *pos, int S, 
     const int ew = eg->active ? eg->cols * eg->head_dim : 0;
     int neng = 0;
     for (int i = 0; i < L; i++) neng += m->L[i].engram_index >= 0;
-    int *keyl = (int *)malloc((size_t)S * L * sizeof(int)), *need = (int *)malloc((size_t)S * L * sizeof(int));
+    int *keyl = (int *)malloc((size_t)S * L * sizeof(int)), *need = (int *)malloc((size_t)2 * S * L * sizeof(int));
+    int *needm = need && ch->split ? need + (size_t)S * L : NULL;   /* V41_CHAIN_SPLIT: the mirrors' rows, a row's at t * L */
     int *wl = (int *)malloc((size_t)S * LR * sizeof(int)), *eng = (int *)malloc((size_t)L * sizeof(int));
     size_t *pc = (size_t *)malloc((size_t)S * L * sizeof(size_t));
     float *cs1 = (float *)malloc((size_t)(1 + rmax) * rd * sizeof(float)), *csa = (float *)malloc(ncs * sizeof(float));
@@ -1708,7 +1907,7 @@ static int v41u_forward_rows(Model *m, const int *slots, const int *pos, int S, 
     for (int t = 0; ok && t < S; t++) {
         v41_mux_bind(m, slots[t]);
         v41u_lower(m, pos[t]);   /* this step writes the slot from pos[t] */
-        ok = v41u_plan_keys(ch, m, pos[t], 1, keyl + (size_t)t * L, need + (size_t)t * L, &last_pub[t]);
+        ok = v41u_plan_keys(ch, m, pos[t], 1, keyl + (size_t)t * L, need + (size_t)t * L, needm ? needm + (size_t)t * L : NULL, &last_pub[t]);
         if (!ok) break;
         v41u_chunk_tables(ch, m, pos[t], pos[t], 1, rd, cs1, wl + (size_t)t * LR);
         memcpy(csa + (size_t)t * rd, cs1, (size_t)rd * sizeof(float));
@@ -1718,8 +1917,12 @@ static int v41u_forward_rows(Model *m, const int *slots, const int *pos, int S, 
         pn += v41u_pull_plan(ch, m, pos[t], 1, pn, pc + (size_t)t * L);
     }
     /* the step's buffers, between frames (a reserve that grows drops what the buffer held) */
-    ok = ok && v41u_scratch(ch, m, S, maxE) && v41u_res(&ch->cs, ncs, CC_DEV) && v41u_res(&ch->pull, pn, CC_DOWN) &&
-         v41u_res(&ch->lw_list, (size_t)S * LR, CC_DEV) && (!cand || v41u_res(&ch->lw_mask, ((size_t)S * ch->wcap + 3) / 4, CC_DEV));
+    for (int d = 0; ok && d < ch->nd; d++) {   /* on each device (V41_CHAIN_SPLIT: two) */
+        v41u_use(ch, d);
+        ok = v41u_scratch(ch, m, S, maxE) && v41u_res(&ch->cs, ncs, CC_DEV) && v41u_res(&ch->pull, pn, CC_DOWN) &&
+             v41u_res(&ch->lw_list, (size_t)S * LR, CC_DEV) && (!cand || v41u_res(&ch->lw_mask, ((size_t)S * ch->wcap + 3) / 4, CC_DEV));
+    }
+    v41u_use(ch, 0);
     if (ok && ch->lw_cap < (size_t)S) {
         float *a = (float *)realloc(ch->lw_in, (size_t)S * D * sizeof(float));
         if (a) ch->lw_in = a;
@@ -1735,26 +1938,51 @@ static int v41u_forward_rows(Model *m, const int *slots, const int *pos, int S, 
     cmoe = ok && v41u_cmoe_setup(ch, m);
     if (cmoe) {
         const int E = ch->cm_E, K = ch->cm_K;
-        ok = v41u_res(&ch->cm_lg, (size_t)S * E, CC_DEV) && cc_reserve(&ch->cm_ids, (size_t)S * K * sizeof(int), CC_DOWN) &&
-             v41u_res(&ch->cm_w, (size_t)S * K, CC_DOWN) && v41u_res(&ch->cm_hid, cc_moe_hid_floats(S, K, D, c->moe_inter, E), CC_DEV) &&
-             v41u_res(&ch->cm_y, (size_t)S * D, CC_DEV) && v41u_res(&ch->cm_hy, (size_t)S * D, CC_UP) &&
-             v41u_res(&ch->cm_yd, (size_t)S * D, CC_DOWN);
+        for (int d = 0; ok && d < ch->nd; d++) {
+            v41u_use(ch, d);
+            ok = v41u_res(&ch->cm_lg, (size_t)S * E, CC_DEV) && cc_reserve(&ch->cm_ids, (size_t)S * K * sizeof(int), CC_DOWN) &&
+                 v41u_res(&ch->cm_w, (size_t)S * K, CC_DOWN) && v41u_res(&ch->cm_hid, cc_moe_hid_floats(S, K, D, c->moe_inter, E), CC_DEV) &&
+                 v41u_res(&ch->cm_y, (size_t)S * D, CC_DEV) && v41u_res(&ch->cm_hy, (size_t)S * D, CC_UP) &&
+                 v41u_res(&ch->cm_yd, (size_t)S * D, CC_DOWN);
+        }
+        v41u_use(ch, 0);
         if (ok && !ch->rw_contrib) ok = (ch->rw_contrib = (float *)malloc((size_t)V41U_ROWS_MAX * CC_ROUTE_KMAX * D * sizeof(float))) != NULL;
     }
 #endif
     /* the frame that brings each slot's state up as far as the device does not hold it, the lists, the
      * RoPE rows, the streams and the first collapse's mixes */
-    if (ok) {
+    for (int d = 0; ok && d < ch->nd; d++) {   /* each device its layers' state, the lists and RoPE rows; the streams to the first */
+        v41u_use(ch, d);
         ok = cc_begin();
-        for (int t = 0; ok && t < S; t++) { v41_mux_bind(m, slots[t]); ok = v41u_state_up(ch, m, pos[t], need + (size_t)t * L); }
+        for (int t = 0; ok && t < S; t++) {
+            v41_mux_bind(m, slots[t]);
+            ok = v41u_state_up(ch, m, pos[t], need + (size_t)t * L, needm ? needm + (size_t)t * L : NULL);
+        }
         ok = ok && cc_write(ch->lw_list, 0, wl, (size_t)S * LR * sizeof(int)) && cc_write(ch->cs, 0, csa, ncs * sizeof(float)) &&
-             cc_write(ch->xs, 0, h, (size_t)S * HD * sizeof(float)) && cc_write(ch->hpf, 0, hp0, (size_t)S * hr * sizeof(float));
+             (d || (cc_write(ch->xs, 0, h, (size_t)S * HD * sizeof(float)) && cc_write(ch->hpf, 0, hp0, (size_t)S * hr * sizeof(float))));
         ok = v41u_close(ok);
     }
+    v41u_use(ch, 0);
     double dev_ms = 0.0, host_ms = 0.0, p2_ms = 0.0;
     for (int i = 0; ok && i < L; i++) {
         Layer *l = &m->L[i];
         const double ta = now_s();
+        if (ch->split && i == ch->split) {   /* the primary's layers are through: their state back (apply), the rows' streams and mixes to the second device */
+            ok = cc_begin();
+            ok = ok && cc_copy(ch->xd, 0, ch->xs, 0, (size_t)S * HD) && cc_copy(ch->hpd, 0, ch->hpf, 0, (size_t)S * hr);
+            for (int t = 0; ok && apply && t < S; t++) {
+                v41_mux_bind(m, slots[t]);
+                ok = v41u_state_pull(ch, m, pos[t], pos[t] + 1, pc + (size_t)t * L, (size_t)hd);
+            }
+            ok = v41u_close(ok);
+            const float *x0 = (const float *)cc_ptr(ch->xd), *p0 = (const float *)cc_ptr(ch->hpd);
+            v41u_use(ch, 1);
+            ok = ok && cc_begin();
+            ok = ok && cc_write(ch->xs, 0, x0, (size_t)S * HD * sizeof(float)) && cc_write(ch->hpf, 0, p0, (size_t)S * hr * sizeof(float));
+            ok = v41u_close(ok);
+            ch->sp_steps++; ch->sp_ms += (now_s() - ta) * 1e3;
+            if (!ok) break;
+        }
         XT(stream_prefetch)(i, S);
 #if V41U_CMOE
         if (cmoe && !v41u_cmoe_tables(ch, m, 0)) {   /* the tier's residents moved: this layer's frame reads the new tables */
@@ -1878,9 +2106,10 @@ static int v41u_forward_rows(Model *m, const int *slots, const int *pos, int S, 
         }
     }
     free(keyl); free(need); free(wl); free(eng); free(pc); free(cs1); free(csa); free(er); free(hp0);
+    v41u_use(ch, 0);
     if (!ok) {   /* the slots' device copies from their positions are stale; the host's state is as it was */
-        for (int t = 0; t < S; t++) { v41_mux_bind(m, slots[t]); v41u_lower(m, pos[t]); }
-        if (cc_lost()) {
+        for (int t = 0; t < S; t++) { v41_mux_bind(m, slots[t]); v41u_lower(m, pos[t]); v41u_mirror_reset(ch, m); }
+        if (v41u_any_lost(ch)) {
             *lost = 1; g_v41u_off = 1; ch->ok = 0;
             fprintf(stderr, "[CUDA] deepseek_v41 chain rows: a frame failed; the CPU runs the layers from now on\n");
         }
