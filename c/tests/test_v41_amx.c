@@ -3,7 +3,7 @@
  * with ue8m0 groups -- through the header's own decoders, and the reference decodes them independently (scalar).
  * V41_AMX=1 within the bf16 rounding of the activations, V41_AMX=2 near float32. Shapes: partial row tiles (S % 16,
  * S % 32), partial output tiles (O % 32, O % 16), the row-group split, strided x and y (the gap past O untouched).
- * Then timings: a trunk-sized product and an expert-sized one (33 rows), the case DS9 found slow.
+ * Then timings: a trunk-sized product and an expert-sized one (33 rows), the case found slow before.
  * Build: gcc -O2 -fopenmp -march=x86-64-v4 test_v41_amx.c -o test_v41_amx -lm */
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +11,6 @@
 #include <stdint.h>
 #include <math.h>
 #include <time.h>
-#include <omp.h>
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 #include "../v41_amx.h"
 
@@ -95,7 +94,7 @@ static void perf(int fmt, int S, int I, int O, const char *what) {
         const int reps = S < 256 ? 50 : 3;
         const double t0 = now_s(); for (int k = 0; k < reps; k++) wgemm(&w, y, O, x, I, S); const double t = (now_s() - t0) / reps;
         printf("perf %-7s mode %d: S %4d I %d O %d in %.3f ms, %.0f GFLOP/s (%d threads)\n", what, mode, S, I, O, t * 1e3,
-               2.0 * S * I * (double)O / t / 1e9, omp_get_max_threads());
+               2.0 * S * I * (double)O / t / 1e9, V41_AMX_NTH());
     }
     wfree(&w); free(x); free(y);
 }

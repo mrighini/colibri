@@ -19,6 +19,14 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #define V41_AMX_HAVE 1
+#ifdef _OPENMP
+#include <omp.h>
+#define V41_AMX_NTH() omp_get_max_threads()
+#define V41_AMX_INPAR() omp_in_parallel()
+#else   /* a build without OpenMP: one thread, never inside a team */
+#define V41_AMX_NTH() 1
+#define V41_AMX_INPAR() 0
+#endif
 
 /* decode(ctx, o0, O, I, dst): output rows o0..o0+31 (zeros past O) as bf16, row-major, I apart */
 typedef void (*v41_amx_decode_fn)(const void *ctx, int o0, int O, int I, uint16_t *dst);
@@ -131,7 +139,7 @@ static void v41_amx_task(float *y, int ystride, const uint16_t *xh, const uint16
 static int v41_amx_gemm(float *y, int ystride, const float *x, int xstride, int S, int I, int O,
                         v41_amx_decode_fn decode, const void *ctx) {
     const int mode = v41_amx_on();
-    if (!mode || S < g_amx_min || I < 32 || (I & 31) || O < 1 || omp_in_parallel()) return 0;
+    if (!mode || S < g_amx_min || I < 32 || (I & 31) || O < 1 || V41_AMX_INPAR()) return 0;
     const double t0 = now_s();
     const int Sp = (S + 15) & ~15, kbs = I / 32, ngr = Sp / 16;
     const size_t xn = (size_t)Sp * I;   /* the packed activations: [row group][kb][16 pairs][16 rows][2] */
@@ -154,7 +162,7 @@ static int v41_amx_gemm(float *y, int ystride, const float *x, int xstride, int 
             }
         }
     }
-    const int nob = (O + 31) / 32, nth = omp_get_max_threads();
+    const int nob = (O + 31) / 32, nth = V41_AMX_NTH();
     int nrg = 1;   /* row groups (multiples of 32 rows) when the output slabs alone would leave threads idle */
     while (nob * nrg < 2 * nth && (nrg + 1) * 32 <= Sp) nrg++;
     const int rows_per = ((Sp + nrg - 1) / nrg + 31) & ~31;
@@ -211,7 +219,7 @@ static void v41_amx_warm(void) {
     if (pz < 0) pz = 0;
     if (pz > 5000) pz = 5000;
     enum { WI = 1024, WS = 32 };   /* a pass: 32 outputs x 1024 inputs x 32 rows */
-    const int nth = omp_get_max_threads();
+    const int nth = V41_AMX_NTH();
     const size_t xn = (size_t)WS * WI;
     uint16_t *xh = aligned_alloc(64, xn * 2), *xl = mode == 2 ? aligned_alloc(64, xn * 2) : NULL;
     if (!xh || (mode == 2 && !xl)) { free(xh); free(xl); return; }
