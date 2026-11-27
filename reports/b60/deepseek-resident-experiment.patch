@@ -1,0 +1,222 @@
+--- a/c/Makefile.deepseek-v4
++++ b/c/Makefile.deepseek-v4
+@@ -264,6 +264,8 @@
+ sycl/dsv4/test_backend: sycl/dsv4/test_backend.cpp sycl/dsv4/test_args.hpp \
+ 	sycl/dsv4/test_lifetime.hpp $(V4_SYCL_FAT_OBJS)
+ 	"$(ICPX)" $(V4_SYCL_FLAGS) $< $(V4_SYCL_FAT_OBJS) -o $@
++sycl/dsv4/test_resident_ref: sycl/dsv4/test_resident_ref.cpp $(V4_SYCL_FAT_OBJS)
++	"$(ICPX)" $(V4_SYCL_FLAGS) $< $(V4_SYCL_FAT_OBJS) -o $@
+ endif
+ 
+ # ---- Vulkan (opt-in): VK=1 ---------------------------------------------------
+--- a/c/backend_cuda_dsv4.h
++++ b/c/backend_cuda_dsv4.h
+@@ -65,6 +65,13 @@
+ int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
+                              int rows,int cols,int packed_rows8,const float *x,
+                              int tokens,float *y);
++#ifdef COLI_SYCL
++/* CPU-order packed-rows arithmetic using the tensor's resident row-major
++ * weight bytes. Scales point to the selected host row block. */
++int dsv4_sycl_fp8_resident_ref(Dsv4CudaTensor *t,const float *bscale,
++                                int row_offset,int rows,const float *x,
++                                int tokens,float *y);
++#endif
+ /* Build/GPU compatibility (loader DLL selection). */
+ int dsv4_cuda_backend_arch_ok(int device);
+ const char *dsv4_cuda_backend_name(void);
+--- a/c/deepseek_v4.c
++++ b/c/deepseek_v4.c
+@@ -12199,6 +12199,23 @@
+     return setting && !strcmp(setting, "1");
+ }
+ 
++/* Experimental: retain CPU-order arithmetic while reading the existing
++ * device weight mirror. Kept opt-in until model-level accuracy is qualified. */
++static int v4_sycl_dense_resident_ref(void) {
++    const char *setting = getenv("DSV4_SYCL_DENSE_RESIDENT_REF");
++    return setting && !strcmp(setting, "1");
++}
++
++static int v4_sycl_ref_resident(Dsv4CudaTensor *tensor, const float *scales,
++                                int offset, int rows, const float *input,
++                                int tokens, float *output) {
++    if (!v4_sycl_dense_resident_ref() ||
++        !dsv4_sycl_fp8_resident_ref(tensor, scales, offset, rows, input, tokens, output)) return 0;
++    static int reported;
++    if (!reported) { reported = 1; fprintf(stderr, "v4_gpu sycl-dense-resident-cpu-order=executed\n"); }
++    return 1;
++}
++
+ /* Host expert entrypoints preserve the raw primitive ABI. CPU routed FP4
+  * and shared FP8 experts both QDQ their initial activations per 128, so the
+  * engine supplies that same input here. Activation-buffer MoE already does
+@@ -12234,9 +12251,9 @@
+         w->block_columns == 128 && w->rows > 0 && w->rows % 8 == 0 &&
+         w->columns > 0 && w->columns % 128 == 0 && w->data && w->scales) {
+         int device = dsv4_cuda_tensor_device(tensor);
+-        if (device < 0 || !dsv4_cuda_fp8_ref_matmul(
++        if (device < 0 || (!v4_sycl_ref_resident(tensor, w->scales, 0, (int)w->rows, input, 1, output) && !dsv4_cuda_fp8_ref_matmul(
+                 device, w->data, w->scales, (int)w->rows, (int)w->columns,
+-                1, input, 1, output)) return -1;
++                1, input, 1, output))) return -1;
+         static int reported;
+         if (!reported) { reported = 1; fprintf(stderr, "v4_gpu sycl-dense-cpu-order=executed\n"); }
+         return 0;
+@@ -12296,7 +12313,9 @@
+         for (int group = 0; group < groups; group++) {
+             const uint8_t *data = (const uint8_t *)w->data + (size_t)group * rows * cols;
+             const float *scales = (const float *)w->scales + (size_t)group * (rows / 128) * (cols / 128);
+-            if (!dsv4_cuda_fp8_ref_matmul(device, data, scales, rows, (int)cols,
++            if (!v4_sycl_ref_resident(tensor, scales, group * rows, rows,
++                                      input + (size_t)group * cols, 1, output + (size_t)group * rows) &&
++                !dsv4_cuda_fp8_ref_matmul(device, data, scales, rows, (int)cols,
+                                           1, input + (size_t)group * cols, 1,
+                                           output + (size_t)group * rows)) return -1;
+         }
+@@ -12329,9 +12348,9 @@
+         w->columns > 0 && w->columns % 128 == 0 && batch <= 128 &&
+         w->data && w->scales) {
+         int ref_device = dsv4_cuda_tensor_device(tensor);
+-        if (ref_device < 0 || !dsv4_cuda_fp8_ref_matmul(
++        if (ref_device < 0 || (!v4_sycl_ref_resident(tensor, w->scales, 0, (int)w->rows, inputs, batch, outputs) && !dsv4_cuda_fp8_ref_matmul(
+                 ref_device, w->data, w->scales, (int)w->rows, (int)w->columns,
+-                1, inputs, batch, outputs)) return -1;
++                1, inputs, batch, outputs))) return -1;
+         static int reported;
+         if (!reported) { reported = 1; fprintf(stderr, "v4_gpu sycl-dense-cpu-order-batch=executed batch=%d\n", batch); }
+         return 0;
+--- a/c/sycl/dsv4/backend.cpp
++++ b/c/sycl/dsv4/backend.cpp
+@@ -2177,6 +2177,56 @@
+     }
+     y[(long long)t*rows+o]=sum;
+ }
++
++/* The same operation order as the packed CPU-reference kernel above, but
++ * address the already uploaded row-major mirror. No weight transfer occurs. */
++void fp8_ref_matmul_resident_kernel(float*y,const uint8_t*w,const float*bscale,
++        const float*x,int rows,int cols,int tokens){
++    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
++    int t=item.get_local_id(2), o=item.get_group(2);
++    if(t>=tokens||o>=rows)return;
++    const float *xs=x+(long long)t*cols;
++    const uint8_t *wr=w+(long long)o*cols;
++    const float *scl=bscale+(long long)(o/128)*(cols/128);
++    float sum=0.f;
++    for(int base=0;base<cols;base+=128){
++        float sc=scl[base/128];
++        for(int i=base;i<base+128;i++){
++            float v=e4m3_dev(wr[i]);
++            sum=sum+xs[i]*v*sc;
++        }
++    }
++    y[(long long)t*rows+o]=sum;
++}
++
++extern "C" int dsv4_sycl_fp8_resident_ref(Dsv4CudaTensor *t,const float *bscale,
++        int row_offset,int rows,const float *x,int tokens,float *y) try {
++    if(!t||!t->w||!bscale||!x||!y||(t->fmt!=8&&t->fmt!=9)||
++       row_offset<0||row_offset%128||rows<1||rows>t->O||row_offset>t->O-rows||
++       t->I<1||t->I%128||tokens<1||tokens>1024)return 0;
++    Dev *c=ctx(t->device); if(!c)return 0;
++    const int cols=t->I;
++    size_t sb=(size_t)((rows+127)/128)*(cols/128)*sizeof(float),
++           xb=(size_t)tokens*cols*sizeof(float), yb=(size_t)tokens*rows*sizeof(float);
++    if(!ok(DSV4_CHECK(dsv4_sycl::select_device(t->device)),"select resident fp8 ref device")||
++       !buf((void**)&c->aux1,&c->aux1cap,sb)||!buf((void**)&c->p2,&c->p2cap,xb)||
++       !buf((void**)&c->p4,&c->p4cap,yb)||
++       !ok(DSV4_CHECK(dsv4_sycl::copy(*c->stream,c->aux1,bscale,sb)),"resident fp8 ref scales")||
++       !ok(DSV4_CHECK(dsv4_sycl::copy(*c->stream,c->p2,x,xb)),"resident fp8 ref input"))return 0;
++    int threads=tokens<32?32:((tokens+31)/32)*32;
++    if((size_t)threads>dsv4_sycl::max_work_group_size())return 0;
++    auto w=(const uint8_t*)t->w+(size_t)row_offset*cols;
++    auto *out=c->p4; const auto *sc=c->aux1; const auto *in=c->p2;
++    c->stream->submit([&](sycl::handler &h){
++        h.parallel_for(sycl::nd_range<3>(sycl::range<3>(1,1,rows)*sycl::range<3>(1,1,threads),
++                                         sycl::range<3>(1,1,threads)),
++                       [=](sycl::nd_item<3>){ fp8_ref_matmul_resident_kernel(out,w,sc,in,rows,cols,tokens); });
++    });
++    return ok(DSV4_CHECK(dsv4_sycl::copy(*c->stream,y,c->p4,yb)),"resident fp8 ref result") &&
++           ok(DSV4_CHECK(c->stream->wait_and_throw()),"resident fp8 ref sync");
++}
++catch(const std::exception &exc) { dsv4_sycl::report(exc);return 0; }
++catch(...) { dsv4_sycl::report("unknown exception");return 0; }
+ 
+ extern "C" int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w,
+                                         const float *bscale, int rows, int cols,
+--- a/c/sycl/dsv4/test_dense_input.c
++++ b/c/sycl/dsv4/test_dense_input.c
+@@ -42,6 +42,22 @@
+     if (ref_failed) return 0;
+     memcpy(captured + captured_count, x, (size_t)cols*tokens*sizeof(float));
+     captured_count += (size_t)cols*tokens; ref_calls++;
++    memset(y,0,(size_t)rows*tokens*sizeof(float));
++    return 1;
++}
++/* The resident-reference experiment has the same QDQ and grouped offsets;
++ * exercise this mock with DSV4_SYCL_DENSE_RESIDENT_REF=1. */
++int dsv4_sycl_fp8_resident_ref(Dsv4CudaTensor *t, const float *s,
++                                int offset, int rows, const float *x,
++                                int tokens, float *y) {
++    if (!t || rows != ref_rows || t->columns != ref_columns ||
++        offset != ref_calls * rows || offset < 0 || rows > t->rows - offset ||
++        s != ref_scales + (size_t)ref_calls * (rows/128) * (t->columns/128) ||
++        tokens < 1 || tokens > 128 ||
++        captured_count + (size_t)t->columns * tokens > DSV4_INPUT_TEST_CAP) ref_failed = 1;
++    if (ref_failed) return 0;
++    memcpy(captured + captured_count, x, (size_t)t->columns*tokens*sizeof(float));
++    captured_count += (size_t)t->columns*tokens; ref_calls++;
+     memset(y,0,(size_t)rows*tokens*sizeof(float));
+     return 1;
+ }
+--- /dev/null
++++ b/c/sycl/dsv4/test_resident_ref.cpp
+@@ -0,0 +1,47 @@
++/* Compare the experimental resident reference with the existing packed
++ * reference, for full tensors, grouped row offsets, and decode/prefill. */
++#define COLI_SYCL 1
++#include "../../backend_cuda_dsv4.h"
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++int main(int argc, char **argv) {
++    if(argc!=4 || std::strcmp(argv[1],"--device") || std::strcmp(argv[2],"0"))return 64;
++    int rows=256,cols=256;
++    if(!std::strcmp(argv[3],"--native")){rows=2048;cols=4096;}
++    else if(std::strcmp(argv[3],"--tiny"))return 64;
++    const size_t n=(size_t)rows*cols, ns=(size_t)(rows/128)*(cols/128);
++    std::vector<uint8_t> row(n),packed(n),scale(ns,127);
++    std::vector<float> scales(ns),x((size_t)5*cols),oldout((size_t)5*rows),newout((size_t)5*rows);
++    uint32_t seed=1938187;
++    for(size_t i=0;i<n;i++){
++        seed=seed*1664525u+1013904223u; uint8_t v=(uint8_t)(seed>>24);
++        row[i]=(v&127)==127?(uint8_t)(v^1):v;
++    }
++    for(int o=0;o<rows;o++)for(int i=0;i<cols;i++)
++        packed[((size_t)(o/8)*cols+i)*8+o%8]=row[(size_t)o*cols+i];
++    for(size_t i=0;i<ns;i++)scales[i]=std::ldexp(1.0f,(int)(i%9)-4);
++    for(float &v:x){seed=seed*1664525u+1013904223u;v=((int)(seed>>16)-32768)*0.0000137f;}
++    int device=0; Dsv4CudaTensor *t=nullptr;
++    if(!dsv4_cuda_init(&device,1)||!dsv4_cuda_upload_fp8(&t,row.data(),scale.data(),rows,cols,device))return 1;
++    int fail=0;
++    for(int tokens : {1,5}) for(int part=0;part<3;part++) {
++        int start=part==0?0:(part-1)*(rows/2), count=part==0?rows:rows/2;
++        const uint8_t *wp=packed.data()+(size_t)start*cols;
++        const float *sp=scales.data()+(size_t)(start/128)*(cols/128);
++        if(!dsv4_cuda_fp8_ref_matmul(device,wp,sp,count,cols,1,x.data(),tokens,oldout.data()) ||
++           !dsv4_sycl_fp8_resident_ref(t,sp,start,count,x.data(),tokens,newout.data())){fail=1;break;}
++        size_t mismatch=0;
++        for(size_t i=0;i<(size_t)tokens*count;i++)
++            mismatch+=!std::isfinite(oldout[i])||std::memcmp(&oldout[i],&newout[i],sizeof(float))!=0;
++        std::printf("resident-ref rows=%d cols=%d offset=%d tokens=%d mismatches=%zu\n",count,cols,start,tokens,mismatch);
++        if(mismatch)fail=1;
++    }
++    if(dsv4_sycl_fp8_resident_ref(t,scales.data(),1,128,x.data(),1,newout.data()) ||
++       dsv4_sycl_fp8_resident_ref(t,scales.data(),rows,128,x.data(),1,newout.data()))fail=1;
++    dsv4_cuda_tensor_free(t); dsv4_cuda_shutdown();
++    std::printf("resident-ref %s\n",fail?"FAIL":"PASS"); return fail;
++}

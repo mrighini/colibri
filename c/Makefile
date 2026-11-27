@@ -3600,6 +3600,9 @@ tests/test_qwen38_pg_percard$(EXE): tests/test_qwen38_pg_percard.c
 tests/test_qwen36_tier_autoplace$(EXE): tests/test_qwen36_tier_autoplace.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+tests/test_qwen36_b60_place$(EXE): tests/test_qwen36_b60_place.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA -DCOLI_SYCL $< -o $@ $(LDFLAGS)
+
 # Failed tier startup must release host storage and initialized synchronization.
 tests/test_qwen36_tier_init_failure$(EXE): tests/test_qwen36_tier_init_failure.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)

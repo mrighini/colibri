@@ -1,0 +1,206 @@
+--- a/c/qwen36_tier.c
++++ b/c/qwen36_tier.c
+@@ -15,6 +15,9 @@
+ #endif
+ #include "qwen36_tier.h"
+ #include "backend_cuda.h"
++#ifdef COLI_SYCL
++#include "sycl/s4_staged.h"
++#endif
+ #include "tier.h"
+ 
+ #define QT_MAX_DEV 8
+@@ -162,6 +165,9 @@
+  * allocations and two waited copies each (coli_cuda_slot_fill_s4, coli_cuda_tensor_at_g). */
+ static int G_nat_arena;
+ static size_t G_aoff_s;
++#ifdef COLI_SYCL
++static int G_sycl_staged_onecopy;   /* experimental, only a complete pinned staging slot */
++#endif
+ /* The fp8-e4m3 experts (Qwen3.8; always copy mode) in the same arena, under the same switch. A slot is the
+  * staging's own layout: gate | up | down, a byte an element, then the three block-scale tables (gate, up,
+  * down) from G_aoff_s. An expert goes up as ONE copy of its slot (coli_cuda_pipe_upload) and three views
+@@ -526,8 +532,17 @@
+                 /* the expert into its slot: the three matrices in one copy, the scales in one more, one wait */
+                 char *b=(char *)G_arena[home2(layer,eid)] + (size_t)(aslot<0?0:aslot)*G_aslot;
+                 float *bs=(float *)(b + G_aoff_s);
++#ifdef COLI_SYCL
++                int onecopy = G_sycl_staged_onecopy && G_aoff_s==3*mb && qt_stg_owns(w) &&
++                              (const uint8_t *)sc==w+G_aoff_s;
++                int filled = aslot>=0 && (onecopy
++                    ? coli_sycl_slot_fill_s4_staged(dv, b, w, 3*mb, 2*G.sc_gu+G.sc_d)
++                    : coli_cuda_slot_fill_s4(dv, b, w, 3*mb, bs, sc, 2*G.sc_gu+G.sc_d));
++                ok = filled
++#else
+                 ok = aslot>=0
+                   && coli_cuda_slot_fill_s4(dv, b, w, 3*mb, bs, sc, 2*G.sc_gu + G.sc_d)
++#endif
+                   && coli_cuda_tensor_at_g(&tg, b,      bs,             G.D,  G.Ih, dv, G.egs)
+                   && coli_cuda_tensor_at_g(&tu, b+mb,   bs+G.sc_gu,     G.D,  G.Ih, dv, G.egs)
+                   && coli_cuda_tensor_at_g(&td, b+2*mb, bs+2*G.sc_gu,   G.Ih, G.D,  dv, G.egs);
+@@ -1138,6 +1153,9 @@
+                 + 2*dev_alloc_footprint(G.sc_gu*sizeof(float))
+                 + dev_alloc_footprint(G.sc_d*sizeof(float));
+     G_nat_arena = 0;
++#ifdef COLI_SYCL
++    { const char *e=getenv("COLI_SYCL_S4_ONECOPY"); G_sycl_staged_onecopy=e && !strcmp(e,"1"); }
++#endif
+     {   /* the native int4 format's arena: matrices of whole 256 bytes and scale blocks of whole 64 lie in a
+          * slot at the offsets the device allocator gave them one by one */
+         const int int4_ok = G.wfmt==4 && G.egs>0 && !G_trunk_only && mat_bytes%256==0 && (G.sc_gu*sizeof(float))%64==0;
+--- a/c/sycl/backend_cuda.dp.cpp
++++ b/c/sycl/backend_cuda.dp.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "backend_gpu_compat.h"
+ #include "coli_sycl.h"    /* the profile, the per-device queues and arena, the SG dispatch, the XMX GEMMs */
++#include "s4_staged.h"
+ #include "coli_sycl_matmul_plan.h"
+ #include "fp8_host_silu.h"
+ #include "backend_sycl.h"  /* the error protocol, the shuffles, the SG launch: shared with cuda_bd.dp.hpp and cu_xb */
+@@ -28,6 +29,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <cerrno>
++#include <climits>
+ #include <chrono>
+ #include <atomic>
+ #include <condition_variable>
+@@ -2210,6 +2212,22 @@
+     return 1;
+ }
+ catch (sycl::exception const &exc) { return sycl_caught(exc, "coli_cuda_slot_fill_s4"); }
++/* The tier's pinned staging slot has the exact destination layout. Copy both
++ * parts in one command, then convert only the weight bytes in place. */
++extern "C" int coli_sycl_slot_fill_s4_staged(int device, void *dst, const void *src, size_t nw, size_t ns) try {
++    DeviceContext *ctx = find_ctx(device);
++    if (!dst || !src || !nw || !ns || ns > (SIZE_MAX - nw) / sizeof(float) ||
++        nw > (size_t)UINT_MAX * 256 - 255 || !select_ctx(ctx)) return 0;
++    sycl::queue &q = dq();
++    q.memcpy(dst, src, nw + ns * sizeof(float));
++    uint8_t *nib = (uint8_t *)dst; const size_t n = nw;
++    q.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((n + 255) / 256)) * sycl::range<3>(1, 1, 256),
++                                     sycl::range<3>(1, 1, 256)),
++                   [=](sycl::nd_item<3>) { offset_to_signed_s4(nib, n); });
++    q.wait_and_throw();
++    return 1;
++}
++catch (sycl::exception const &exc) { return sycl_caught(exc, "coli_sycl_slot_fill_s4_staged"); }
+ /* a tensor of that format (fmt 4, gs elements a scale group) over device memory the caller owns and
+  * has filled: no allocation and no copy here; coli_cuda_tensor_free leaves both ranges, and their
+  * bytes are counted where they were allocated (as coli_cuda_tensor_upload_at's) */
+--- /dev/null
++++ b/c/sycl/s4_staged.h
+@@ -0,0 +1,13 @@
++#ifndef COLI_SYCL_S4_STAGED_H
++#define COLI_SYCL_S4_STAGED_H
++#include <stddef.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* Both pointers address one complete allocation containing nw weight bytes
++ * followed by ns scale floats. The caller owns both allocations. */
++int coli_sycl_slot_fill_s4_staged(int device, void *dst, const void *src, size_t nw, size_t ns);
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/c/sycl/tests/test_sycl_s4_staged.cpp
+@@ -0,0 +1,46 @@
++/* The one-copy staged int4 upload must match the two-copy ABI byte for byte,
++ * preserve the source and leave the bytes beyond the slot untouched. */
++#define COLI_SYCL 1
++#include "../../backend_cuda.h"
++#include "../s4_staged.h"
++#include "sycl_test_args.h"
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++static void need(bool ok, const char *what) {
++    if (!ok) { std::fprintf(stderr,"S4 staged FAIL: %s\n",what); std::exit(1); }
++}
++static void shape(int dev, size_t nw, size_t ns) {
++    const size_t bytes=nw+ns*sizeof(float), total=bytes+64;
++    auto *src=(uint8_t*)coli_cuda_host_alloc(dev,total);
++    auto *dst=(uint8_t*)coli_cuda_pipe_alloc(dev,total);
++    auto *control=(uint8_t*)coli_cuda_pipe_alloc(dev,total);
++    need(src&&dst&&control,"allocate");
++    std::vector<uint8_t> initial(total,0xa5), saved(total), got(total), old(total);
++    for(size_t i=0;i<total;i++)src[i]=(uint8_t)(i*17u+31u);
++    std::memcpy(saved.data(),src,total);
++    need(coli_cuda_pipe_upload(dev,dst,initial.data(),total),"initialize destination");
++    need(coli_cuda_pipe_upload(dev,control,initial.data(),total),"initialize control");
++    need(coli_sycl_slot_fill_s4_staged(dev,dst,src,nw,ns),"staged upload");
++    need(coli_cuda_slot_fill_s4(dev,control,src,nw,(float*)(control+nw),
++                                 (const float*)(src+nw),ns),"two-copy upload");
++    need(coli_cuda_pipe_download(dev,dst,got.data(),total),"download staged");
++    need(coli_cuda_pipe_download(dev,control,old.data(),total),"download control");
++    need(!std::memcmp(got.data(),old.data(),total),"matches original upload");
++    need(!std::memcmp(src,saved.data(),total),"source retained");
++    for(size_t i=0;i<nw;i++)need(got[i]==(uint8_t)(saved[i]^0x88),"weight conversion");
++    for(size_t i=nw;i<bytes;i++)need(got[i]==saved[i],"scales retained");
++    for(size_t i=bytes;i<total;i++)need(got[i]==0xa5,"slot tail retained");
++    coli_cuda_pipe_free(dev,control); coli_cuda_pipe_free(dev,dst); coli_cuda_host_free(dev,src);
++}
++int main(int argc,char **argv) {
++    int dev[1],n=sycl_test_devices(argc,argv,dev,1); if(n<0)return 0;
++    need(n==1&&coli_cuda_init(dev,n),"device init");
++    shape(dev[0],256,13); shape(dev[0],768,128); shape(dev[0],1572864,49152);
++    need(!coli_sycl_slot_fill_s4_staged(dev[0],nullptr,nullptr,256,1),"null refused");
++    need(!coli_sycl_slot_fill_s4_staged(dev[0],(void*)1,(void*)1,256,SIZE_MAX),"overflow refused");
++    coli_cuda_shutdown(); std::puts("S4 staged PASS"); return 0;
++}
+--- a/c/tests/qwen36_fake_cuda.h
++++ b/c/tests/qwen36_fake_cuda.h
+@@ -186,6 +186,14 @@
+     fake_slot_fills++;
+     return 1;
+ }
++#ifdef COLI_SYCL
++static int fake_s4_onecopy;
++int coli_sycl_slot_fill_s4_staged(int device, void *dst, const void *src, size_t nw, size_t ns) {
++    (void)device;
++    if (!dst || !src || !nw || !ns || ns > (SIZE_MAX-nw)/sizeof(float)) return 0;
++    memcpy(dst,src,nw+ns*sizeof(float)); fake_slot_fills++; fake_s4_onecopy++; return 1;
++}
++#endif
+ int coli_cuda_tensor_at_g(ColiCudaTensor **t, void *dev_w, float *dev_s, int I, int O, int device, int gs) {
+     if (!t || *t || !dev_w || !dev_s) return 0;
+     if (!upload_common(t, dev_w, dev_s, 4, I, O, device, gs)) return 0;
+--- a/c/tests/test_qwen36_tier_int4_arena.c
++++ b/c/tests/test_qwen36_tier_int4_arena.c
+@@ -121,6 +121,9 @@
+ }
+ static int up(const char *what) {
+     fake_uploads = 0; fake_slot_fills = 0; fake_host_allocs = 0;
++#ifdef COLI_SYCL
++    fake_s4_onecopy = 0;
++#endif
+     if (!qt_init(NL, NE, D, IH, NE, TOPK, GS, 1 /* int4 */)) { printf("  FAIL: the tier should start (%s)\n", what); fails++; return 0; }
+     return 1;
+ }
+@@ -176,6 +179,10 @@
+     stage_all(0);
+     check(residents() == NL * NE, "2: every expert resident when the wait returns, none queued");
+     check(fake_slot_fills == NL * NE, "2: one fill an expert");
++#ifdef COLI_SYCL
++    { const char *e=getenv("COLI_SYCL_S4_ONECOPY");
++      check(fake_s4_onecopy == (e && !strcmp(e,"1") ? NL * NE : 0), "2: the staged one-copy setting is honored"); }
++#endif
+     check(G_stg_used == NL * NE, "2: every expert staged through the pool");
+     check(G_stg_nfree[0] == QT_STG_N, "2: every buffer back in the pool after the warm start");
+     check(G.inflight == 0 && G.qn == 0, "2: nothing in flight, the queue empty");
+@@ -215,6 +222,9 @@
+     stage_all(1);
+     check(residents() == NL * NE, "pool refused: every expert resident");
+     check(fake_slot_fills == NL * NE && G_stg_used == 0, "pool refused: one fill an expert, none through the pool");
++#ifdef COLI_SYCL
++    check(fake_s4_onecopy == 0, "pool refused: separate buffers use the original upload");
++#endif
+     check_slots("pool refused");
+     qt_shutdown();
+ 

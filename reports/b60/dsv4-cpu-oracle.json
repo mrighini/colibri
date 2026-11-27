@@ -1,0 +1,12 @@
+{
+  "source": "coli-self",
+  "model": "/home/mrighini/models/deepseek-v4-flash-reap",
+  "prompt": "Explain GPU memory in one sentence.",
+  "comparison": {
+    "top1_token": "exact",
+    "logits": "not required for coli-self fixtures"
+  },
+  "prompt_ids": [0, 128803, 65106, 54186, 6464, 295, 834, 10175, 16, 128804, 128822],
+  "full_ids": [0, 128803, 65106, 54186, 6464, 295, 834, 10175, 16, 128804, 128822, 90738, 6464, 344, 270, 377, 63290, 722, 41033],
+  "tf_pred": [201, 201, 270, 14051, 14, 6271, 15363, 16, 128822, 90738, 90738, 6464, 344, 270, 377, 63290, 722, 41033, 4130]
+}
