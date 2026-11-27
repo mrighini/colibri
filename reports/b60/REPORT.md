@@ -44,6 +44,12 @@ all 10,240 experts resident. Rates are the engine's generation rates.
 | 2 B60s, manual trunk co-location, no arena | host API | 16.8 s / 17.0 s | 35.27 / 37.43 tok/s | 0.669 / 0.562 s | `qwen-colocate-2gpu-r1/r2` |
 | 2 B60s, B60 defaults: co-location and arena | host API | 12.1 s / 12.1 s | 55.98 / 56.11 tok/s | 0.194 / 0.189 s | `qwen-candidate-2gpu-r1/r2` |
 
+The one- and two-card generation rates above use different tracing modes and
+must not be compared directly. In a subsequent matched host-traced 128-token
+test, one B60 reached 77.99 / 78.04 tok/s and two B60s reached 62.26 / 61.63
+tok/s. See [`QWEN-MATCHED-TRACE-20261127.md`](QWEN-MATCHED-TRACE-20261127.md)
+for the device-tracing comparison and the limits of these results.
+
 The old two-card placement split the dense trunk and disabled the device chain.
 The arena also cut single-card Level Zero device-allocation calls from 61,917
 to 478 in these traced runs. The identical generated-text hash was verified on
