@@ -1,0 +1,2 @@
+positions=74 top1_matches=74 identical_nll=74 max_abs_nll=0
+cpu_continuation_nll=3.0072612801903484 gpu_continuation_nll=3.0072612801903484

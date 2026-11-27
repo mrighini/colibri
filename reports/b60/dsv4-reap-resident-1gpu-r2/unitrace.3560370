@@ -1,0 +1,90 @@
+
+=== API Timing Summary ===
+
+             Total Execution Time (ns):          43267666706
+    Total API Time for L0 backend (ns):          13996773824
+
+== L0 Backend ==
+
+                                    Function,        Calls,            Time (ns),      Time (%),         Average (ns),             Min (ns),             Max (ns)
+               zeCommandListAppendMemoryCopy,        16944,           8368974291,     59.792168,               493919,                11174,             14867871
+                              zeModuleCreate,            1,           4920566957,     35.155006,           4920566957,           4920566957,           4920566957
+                      zeEventHostSynchronize,        16944,            282045244,      2.015073,                16645,                  260,              2354822
+                 zeContextMakeMemoryResident,          359,            141174816,      1.008624,               393244,                44749,               855637
+zeCommandListAppendLaunchKernelWithArguments,         5418,            134093084,      0.958029,                24749,                 4049,              8743890
+                                zeMemFreeExt,          365,            112309506,      0.802396,               307697,                15979,               782137
+                            zeMemAllocDevice,          359,             25238935,      0.180320,                70303,                17947,               352744
+                zeCommandListHostSynchronize,         7492,              4589497,      0.032790,                  612,                  169,                12275
+                zeCommandListCreateImmediate,            2,              3922850,      0.028027,              1961425,               525508,              3397342
+                        zeKernelSetGroupSize,         5418,              1614640,      0.011536,                  298,                   69,                16440
+                             zeModuleDestroy,            1,              1395064,      0.009967,              1395064,              1395064,              1395064
+                            zeMemAllocShared,            4,               328414,      0.002346,                82103,                48028,               132477
+                              zeMemAllocHost,            2,               175432,      0.001253,                87716,                55181,               120251
+                    zeDeviceGetP2PProperties,            2,               116521,      0.000832,                58260,                  241,               116280
+              zeDriverGetExtensionProperties,           14,                76197,      0.000544,                 5442,                  491,                16496
+                 zexCounterBasedEventCreate2,           64,                25215,      0.000180,                  393,                  210,                 6828
+                        zeCommandListDestroy,            2,                20790,      0.000149,                10395,                 9438,                11352
+                       zeDeviceGetProperties,           15,                19945,      0.000142,                 1329,                  211,                 4861
+         zeDriverGetExtensionFunctionAddress,            7,                14534,      0.000104,                 2076,                  181,                 7067
+                              zeEventDestroy,           64,                13536,      0.000097,                  211,                   90,                 1053
+                              zeKernelCreate,            1,                 9553,      0.000068,                 9553,                 9553,                 9553
+                             zeContextCreate,            1,                 7262,      0.000052,                 7262,                 7262,                 7262
+                               zeInitDrivers,            5,                 7148,      0.000051,                 1429,                  155,                 5527
+                                 zeDriverGet,           20,                 6144,      0.000044,                  307,                   35,                 3058
+                         zeDeviceSynchronize,            1,                 5886,      0.000042,                 5886,                 5886,                 5886
+                                 zeDeviceGet,           22,                 3413,      0.000024,                  155,                   34,                  448
+                             zeKernelDestroy,            1,                 2373,      0.000017,                 2373,                 2373,                 2373
+                     zeMemGetAllocProperties,            8,                 2098,      0.000015,                  262,                  139,                  600
+                  zeDeviceGetCacheProperties,            6,                 1853,      0.000013,                  308,                  157,                  458
+                 zeDeviceGetModuleProperties,            2,                 1768,      0.000013,                  884,                  311,                 1457
+           zeDeviceGetMemoryAccessProperties,            1,                 1756,      0.000013,                 1756,                 1756,                 1756
+                            zeContextDestroy,            1,                 1547,      0.000011,                 1547,                 1547,                 1547
+      zeDeviceGetCommandQueueGroupProperties,            4,                 1468,      0.000010,                  367,                  116,                  855
+                       zeDeviceGetSubDevices,            5,                 1115,      0.000008,                  223,                   30,                  834
+                       zeModuleGetProperties,            1,                  966,      0.000007,                  966,                  966,                  966
+                     zeModuleBuildLogDestroy,            1,                  889,      0.000006,                  889,                  889,                  889
+                       zeDeviceGetRootDevice,           14,                  763,      0.000005,                   54,                   26,                  272
+                             zeKernelGetName,            2,                  425,      0.000003,                  212,                  172,                  253
+                   zeKernelSetIndirectAccess,            1,                  422,      0.000003,                  422,                  422,                  422
+                       zeDeviceCanAccessPeer,            2,                  356,      0.000003,                  178,                   57,                  299
+                       zeDriverGetProperties,            3,                  325,      0.000002,                  108,                   27,                  232
+                  zeDeviceGetImageProperties,            2,                  260,      0.000002,                  130,                   37,                  223
+                       zeKernelGetProperties,            1,                  224,      0.000002,                  224,                  224,                  224
+                zeDeviceGetComputeProperties,            1,                  192,      0.000001,                  192,                  192,                  192
+                       zeDriverGetApiVersion,            1,                  150,      0.000001,                  150,                  150,                  150
+
+
+
+=== Device Timing Summary ===
+
+                Total Execution Time (ns):          43267666706
+    Total Device Time for L0 backend (ns):           7575769396
+
+== L0 Backend ==
+
+                                                                                                                                 Kernel,        Calls,            Time (ns),     Time (%),         Average (ns),             Min (ns),             Max (ns)
+"dsv4_sycl_fp8_resident_ref::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<3>)#1}",         5418,           5935826679,    78.352783,              1095575,               443125,              7216354
+                                                                                                   "zeCommandListAppendMemoryCopy(M2D)",        11526,           1401958592,    18.505825,               121634,                 4843,              6866458
+                                                                                                   "zeCommandListAppendMemoryCopy(D2M)",         5418,            237984125,     3.141386,                43924,                10885,              2227864
+
+
+=== Kernel Properties ===
+
+                                                                                                                                 Kernel, Compiled, SIMD, Number of Arguments, SLM Per Work Group, Private Memory Per Thread, Spill Memory Per Thread, Register File Size Per Thread
+"dsv4_sycl_fp8_resident_ref::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<3>)#1}",      JIT,   32,                   7,                  0,                         0,                       0,                           128
+
+
+
+=== Kernel Submission Summary ===
+
+                Total Execution Time (ns):          43267666706
+    Total Device Time for L0 backend (ns):           7575769396
+
+== L0 Backend ==
+
+                                                                                                                                 Kernel,        Calls,          Append (ns),  Append (%),          Submit (ns),  Submit (%),         Execute (ns),  Execute (%)
+"dsv4_sycl_fp8_resident_ref::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<3>)#1}",         5418,                    0,        -nan,            157076555,    2.147181,           5935826679,    78.352783
+                                                                                                   "zeCommandListAppendMemoryCopy(M2D)",        11526,                    0,        -nan,            366027188,    5.003462,           1401958592,    18.505825
+                                                                                                   "zeCommandListAppendMemoryCopy(D2M)",         5418,                    0,        -nan,           6792375273,   92.849358,            237984125,     3.141386
+
+

@@ -1,0 +1,1 @@
+Explain how GPUs and CPUs cooperate when generating text with a large language model. Include three practical performance considerations.

@@ -1,0 +1,2 @@
+position,target,top1,target_nll,max_logit,target_logit,logsumexp
+17,760,623,4.2329441656749802,17.3772774,14.6689472,1.5246140112560351
