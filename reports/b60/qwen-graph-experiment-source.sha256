@@ -1,0 +1,23 @@
+b400c209ae7279382cac5fd3bca6693c387fc845ef85f7ae776e014c0d02263a  c/qwen36_cuda_chain.h
+d12d426451053d92570261d32a0a7c704d85577e2901d45877a8b450be58ebb8  c/sycl/cuda_chain.dp.cpp
+a2e93a4b9a31e79943b78df281eb4475f21093f8140f11cf1eb22a86e2c378ba  reports/b60/qwen36-nll-diagnostic.c
+3a2fce7f6f8c2cdf4f896e3b70ae96e8493fb2ed2276108fecd5f0a7af716336  reports/b60/qwen-quality-320.json
+6161a51acd7dcaafd03515fa460da6b4342f808aeb7b6045cfabb6f7523cb0a2  reports/b60/qwen-chain_greedy-128.json
+d362f684b9179e732fdec3c31dd8ce4d9d4423a54291f1cca0bf271d7007121d  reports/b60/run-qwen-graph-baseline.sh
+1c4905173d39ed3cda233ee9a11ea1ff7059ddd0bac7e749c401e87c24533567  reports/b60/qwen-graph-shared-experiment.patch
+9c3a7ae901bcdf51cbc673a2e1c5303768821a3022c2e54de62a6f1c39961a33  reports/b60/qwen-graph-dn-experiment.patch
+3c1f3644f8bddd256f1791837224611c7bb2329325148fd1ca0d4c7a02a1bf8d  reports/b60/qwen-graph-safe-experiment.patch
+# Generated sandbox source, retained locally: f7dc2c9ea0f7fd70ce8a4748e94ef222ec0c4c0e057a13260d904bd995b5e8d9  reports/b60/qwen-graph-sandbox/qwen36_cuda_chain.h
+# Generated sandbox source, retained locally: 29a1f960afa5932e722362515618495a6966cf5df79a92b1b7941e403ffbf195  reports/b60/qwen-graph-sandbox/cuda_chain-graph.dp.cpp
+33f49c18ff4158d6620731891af86b57e10eb76b12e6c83b1312c1ce82d62454  reports/b60/qwen-graph-sandbox/run-compare.sh
+e80e3b9f571195addd2f7bfce1be67ee210d0cf39d132194988db367064051cd  reports/b60/qwen-graph-sandbox/run-smoke.sh
+# Generated sandbox source, retained locally: 996ac566e873f70e3980e67069edf0c5db883b490d3fd69eeef8b96255ac2d6f  reports/b60/qwen-graph-dn-sandbox/qwen36_cuda_chain.h
+# Generated sandbox source, retained locally: aea9ac22500aab0f5dcfd167a8bed927c9dd7f05a729e8d2ccbdf82206f86eb5  reports/b60/qwen-graph-dn-sandbox/cuda_chain-graph.dp.cpp
+0c5a6b571b97846a4876c135965f94514b6fdcc6ffa6f7801d431dcd7b6f3fbc  reports/b60/qwen-graph-dn-sandbox/run-compare.sh
+d38941b7570430de633893a3f4eb288c195aaf2e4a2cf242e4ff2bce75ccad65  reports/b60/qwen-graph-dn-sandbox/run-long-repeat.sh
+ec9737cbdbd0ccbe126b411fabcb9cf26fa582124befd6f263bdfcf58d90ef78  reports/b60/qwen-graph-dn-sandbox/run-long.sh
+5ed0db1fd27624a899b7a189e30ff2d7e97ae8a36ca958ea858bc5421685af59  reports/b60/qwen-graph-dn-sandbox/run-single-fallback.sh
+053548df02400b64307e0e5e1045435679ed6e878c30d18b5aae02ab8c81ee46  reports/b60/qwen-graph-dn-sandbox/run-smoke.sh
+# Generated sandbox source, retained locally: 4db51a629c777bda1f339af56b459eca163a936bd45b7986fbd7e0c881ce0c7f  reports/b60/qwen-graph-safe-sandbox/qwen36_cuda_chain.h
+c70980e083cb716c73b256deb6f1e2ef57e1022c54d59e5a27e8247e5910654f  reports/b60/qwen-graph-safe-sandbox/run-checks.sh
+d41b3dae0c0da212e68721bda7f5153db0bffe1a33b3f2ce5f9f5a8fa2ee3814  reports/b60/qwen-graph-safe-sandbox/run-peer-fallback.sh

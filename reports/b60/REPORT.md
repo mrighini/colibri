@@ -73,6 +73,10 @@ The tested model had every expert resident, so storage-prefetching missing
 experts was not a relevant explanation for this result. The tested Qwen SYCL
 path did not exercise a command graph; graph capture and hardware prefetching
 need separate workload-specific measurements and correctness checks.
+Subsequent standalone and Qwen graph experiments are documented in
+[`GRAPH-PROBE-20261127.md`](GRAPH-PROBE-20261127.md) and
+[`QWEN-GRAPH-EXPERIMENT.md`](QWEN-GRAPH-EXPERIMENT.md). Graph replay remains
+an experimental patch rather than an enabled production path.
 
 ### Separating the Qwen numerical paths
 
